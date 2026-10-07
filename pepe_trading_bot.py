@@ -6,25 +6,25 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTAHANDLOWEGO
+# KONFIGURACJA BOTA HANDLOWEGO (INTERWAŁ 1-GODZINNY: 1H)
 # ==============================================================================
 
 # 1. Klucze Bybit API (Uzyskane w panelu Bybit -> Profile -> API)
 BYBIT_API_KEY = "qFUYjYvjxptqpI5CBU"
 BYBIT_API_SECRET = "6ylxNJoW3qaB71BneLorAXfACLGWRixtcKmG"
-TESTNET = False  # Ustaw na True, jeśli testujesz na koncie demo/testnet Bybit
+TESTNET = False  # Ustaw True tylko dla środowiska testowego (testnet.bybit.com)
 
 # 2. Parametry handlowe dla PEPEUSDT
 SYMBOL = "PEPEUSDT"
 CATEGORY = "linear"  # Kontrakty USDT Perpetual
-INTERVAL = "D"       # Interwał 1D (Świece dzienne)
+INTERVAL = "60"      # Interwał 1H: na Bybit V5 "60" oznacza 60 minut (1 godzinę)
 LEVERAGE = 3         # Dźwignia (np. 3x)
 POSITION_SIZE_USDT = 50.0  # Kwota w USDT przeznaczona na pojedynczą pozycję
 
-# 3. Parametry strategii EMA
-LIMIT_CANDLES = 200  # Liczba świec potrzebna do precyzyjnego wyliczenia EMA 89
-SL_PERCENT = 0.05    # Stop Loss = 5% od ceny wejścia
-TP_PERCENT = 0.10    # Take Profit = 10% od ceny wejścia
+# 3. Parametry strategii EMA dla interwału 1H
+LIMIT_CANDLES = 200  # Liczba świec do precyzyjnego wyliczenia EMA 89
+SL_PERCENT = 0.02    # Stop Loss = 2% od ceny wejścia (dostosowany do świec 1H)
+TP_PERCENT = 0.04    # Take Profit = 4% od ceny wejścia (stosunek R:R = 1:2)
 
 # ==============================================================================
 # KONFIGURACJA DZIENNIKA ZDARZEŃ (LOGÓW)
@@ -39,7 +39,7 @@ logging.basicConfig(
     ]
 )
 
-# Inicjalizacja klienta Bybit V5 API
+# Inicjalizacja klienta Bybit V5 API (Render z lokalizacją we Frankfurcie łączy się bezpośrednio)
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
@@ -55,9 +55,8 @@ def set_leverage():
             buyLeverage=str(LEVERAGE),
             sellLeverage=str(LEVERAGE)
         )
-        logging.info(f"Dźwignia dla {SYMBOL} została ustawiona na {LEVERAGE}x.")
+        logging.info(f"Dźwignia dla {SYMBOL} została potwierdzona na {LEVERAGE}x.")
     except Exception as e:
-        # Kod 110043 oznacza, że dźwignia jest już ustawiona na ten poziom
         if "110043" in str(e):
             logging.info(f"Dźwignia {LEVERAGE}x jest już skonfigurowana.")
         else:
@@ -75,10 +74,10 @@ def has_active_position():
         return False
     except Exception as e:
         logging.error(f"Błąd podczas sprawdzania otwartych pozycji: {e}")
-        return True  # Bezpiecznik: w przypadku błędu zakładamy, że pozycja może istnieć
+        return True  # Bezpiecznik: w przypadku błędu blokujemy składanie nowych zleceń
 
 def get_market_data():
-    """Pobiera historyczne świece z Bybit i oblicza wskaźniki EMA 21 oraz EMA 89."""
+    """Pobiera historyczne świece 1H z Bybit i oblicza wskaźniki EMA 21 oraz EMA 89."""
     response = session.get_kline(
         category=CATEGORY,
         symbol=SYMBOL,
@@ -87,35 +86,31 @@ def get_market_data():
     )
     candles = response.get("result", {}).get("list", [])
     if not candles:
-        raise Exception("Nie udało się pobrać danych rynkowych z Bybit.")
+        raise Exception("Nie udało się pobrać danych rynkowych 1H z Bybit.")
 
-    # Bybit zwraca świece od najnowszej do najstarszej — odwracamy kolejność
+    # Odwracamy kolejność świec (od najstarszej do najnowszej)
     df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
     df = df.iloc[::-1].reset_index(drop=True)
 
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
 
-    # Wskaźniki EMA
+    # Wskaźniki EMA dla interwału 1-godzinnego
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
     df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
 
     return df
 
 def execute_trade(side, close_price):
-    """
-    Wylicza wielkość pozycji, Stop Loss, Take Profit oraz wysyła zlecenie na giełdę Bybit.
-    """
-    # Sprawdzenie kroku wielkości pozycji (qty step) dla PEPEUSDT
-    # PEPE na Bybit ma zazwyczaj krok 100 lub 1000 sztuk
+    """Kalkuluje wielkość zlecenia, poziomy SL i TP oraz wysyła zlecenie na Bybit."""
     raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / close_price
-    qty = int(raw_qty // 100) * 100  # Zaokrąglenie w dół do pełnych setek
+    qty = int(raw_qty // 100) * 100  # Zaokrąglenie do pełnych setek (wymóg lot size PEPE)
 
     if qty <= 0:
         logging.error("Wyliczona wielkość pozycji wynosi 0. Zwiększ POSITION_SIZE_USDT.")
         return
 
-    # Kalkulacja Poziomów SL i TP
+    # Kalkulacja Stop Loss i Take Profit pod interwał 1H
     if side == "Buy":  # LONG
         sl_price = round(close_price * (1 - SL_PERCENT), 8)
         tp_price = round(close_price * (1 + TP_PERCENT), 8)
@@ -123,7 +118,7 @@ def execute_trade(side, close_price):
         sl_price = round(close_price * (1 + SL_PERCENT), 8)
         tp_price = round(close_price * (1 - TP_PERCENT), 8)
 
-    logging.info(f"Otwieranie pozycji {side} | Zlecenie: {qty} PEPE | Cena: {close_price} | SL: {sl_price} | TP: {tp_price}")
+    logging.info(f"Otwieranie pozycji {side} (1H) | Rozmiar: {qty} PEPE | Cena: {close_price} | SL: {sl_price} | TP: {tp_price}")
 
     try:
         order = session.place_order(
@@ -138,26 +133,26 @@ def execute_trade(side, close_price):
             slOrderType="Market",
             tpOrderType="Market"
         )
-
+        
         logging.info(f"SUCCESS: Zlecenie złożone pomyślnie! ID Zlecenia: {order['result']['orderId']}")
-        logging.info("Aplikacja Bybit na Twoim telefonie wyśle Ci natychmiastowe powiadomienie Push.")
+        logging.info("Aplikacja Bybit na telefonie wyśle potwierdzenie w powiadomieniu PUSH.")
 
     except Exception as e:
         logging.error(f"Błąd składania zlecenia na Bybit: {e}")
 
 def run_bot():
-    """Główna logika analizy rynkowej i egzekucji strategii."""
-    logging.info("=== ROZPOCZĘCIE ANALIZY DZIENNEJ (PEPE 1D) ===")
-
+    """Główna pętla analizy świecy 1H i egzekucji strategii EMA."""
+    logging.info("=== ROZPOCZĘCIE ANALIZY ŚWIECY GODZINOWEJ (PEPE 1H) ===")
+    
     set_leverage()
 
     if has_active_position():
-        logging.info("Zakończono: Pozycja jest już otwarta na koncie.")
+        logging.info("Zakończono: Aktywna pozycja już istnieje na koncie.")
         return
 
     df = get_market_data()
 
-    # Ostatnia ZAMKNIĘTA świeca dzienna (iloc[-2]), iloc[-1] to świeca w trakcie formowania
+    # Ostatnia ZAMKNIĘTA świeca 1H (indeks -2). Indeks -1 to świeca w trakcie formowania
     candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
 
@@ -165,17 +160,17 @@ def run_bot():
     c_high, c_low = candle['high'], candle['low']
     ema21, ema89 = candle['ema21'], candle['ema89']
 
-    logging.info(f"Ostatnia zamknięta świeca D1 -> Cena: {c_close:.8f} | EMA21: {ema21:.8f} | EMA89: {ema89:.8f}")
+    logging.info(f"Ostatnia zamknięta świeca 1H -> Zamknięcie: {c_close:.8f} | EMA21: {ema21:.8f} | EMA89: {ema89:.8f}")
 
-    # 1. Określenie Trendu
+    # 1. Określenie kierunku trendu na 1H
     bullish_trend = ema21 > ema89
     bearish_trend = ema21 < ema89
 
-    # 2. Test Strefy Wartości (Pullback)
+    # 2. Test strefy wartości (Pullback do średnich)
     in_value_zone_long = (c_low <= max(ema21, ema89)) and (c_low >= min(ema21, ema89))
     in_value_zone_short = (c_high >= min(ema21, ema89)) and (c_high <= max(ema21, ema89))
 
-    # 3. Formacje Świecowe
+    # 3. Formacje reakcyjne świecy 1H (Pinbar lub Objęcie)
     bullish_pinbar = (c_close > c_open) and ((c_open - c_low) > (c_close - c_open) * 1.5)
     bullish_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
     bullish_candle = bullish_pinbar or bullish_engulfing
@@ -184,17 +179,17 @@ def run_bot():
     bearish_engulfing = (c_close < c_open) and (prev_candle['close'] > prev_candle['open']) and (c_close < prev_candle['open'])
     bearish_candle = bearish_pinbar or bearish_engulfing
 
-    # 4. Decyzja o otwarciu transakcji
+    # 4. Egzekucja sygnału
     if bullish_trend and in_value_zone_long and bullish_candle:
-        logging.info("Sygnał KUPNA (LONG) spełniony! Wykonuję zlecenie...")
+        logging.info("Sygnał KUPNA (LONG na 1H) potwierdzony! Składanie zlecenia...")
         execute_trade("Buy", c_close)
 
     elif bearish_trend and in_value_zone_short and bearish_candle:
-        logging.info("Sygnał SPRZEDAŻY (SHORT) spełniony! Wykonuję zlecenie...")
+        logging.info("Sygnał SPRZEDAŻY (SHORT na 1H) potwierdzony! Składanie zlecenia...")
         execute_trade("Sell", c_close)
 
     else:
-        logging.info("Brak spełnionych warunków wejścia w pozycję. Czekamy na kolejną świecę dzienną.")
+        logging.info("Brak sygnału na świecy 1H. Oczekiwanie na kolejną godzinę.")
 
 if __name__ == "__main__":
     run_bot()
