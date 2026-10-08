@@ -19,19 +19,19 @@ LEVERAGE = 3
 
 # --- 1. USTAWIENIA STRATEGII EMA TREND (Świece 1H) ---
 ASSETS_EMA = {
-    "1000PEPEUSDT": {"risk_pct": 0.25, "scale": 1000, "qty_decimals": 0}, # 25% salda
-    "ETHUSDT":      {"risk_pct": 0.12, "scale": 1,    "qty_decimals": 3}, # 12% salda
-    "SOLUSDT":      {"risk_pct": 0.13, "scale": 1,    "qty_decimals": 1}  # 13% salda
+    "1000PEPEUSDT": {"risk_pct": 0.25, "scale": 1000, "qty_decimals": 0},
+    "ETHUSDT":      {"risk_pct": 0.12, "scale": 1,    "qty_decimals": 3},
+    "SOLUSDT":      {"risk_pct": 0.13, "scale": 1,    "qty_decimals": 1}
 }
-SL_PCT_EMA = 0.02  # Stop Loss 2%
-TP_PCT_EMA = 0.04  # Take Profit 4%
+SL_PCT_EMA = 0.02
+TP_PCT_EMA = 0.04
 
 # --- 2. USTAWIENIA STRATEGII TOP DIP HUNTER (Świece 15M + Trailing Stop) ---
-RISK_PCT_DIP = 0.10            # 10% salda na pozycję
-TOP_DIPS_COUNT = 4             # 4 monety z największym spadkiem 24h
-SL_PCT_DIP = 0.025             # Początkowy Stop Loss 2.5%
-TRAILING_ACT_PCT_DIP = 0.030   # Aktywacja Trailing Stopa od +3.0% zysku
-TRAILING_DIST_PCT_DIP = 0.015  # Dystans śledzenia (Callback) = 1.5%
+RISK_PCT_DIP = 0.10
+TOP_DIPS_COUNT = 4
+SL_PCT_DIP = 0.025
+TRAILING_ACT_PCT_DIP = 0.030
+TRAILING_DIST_PCT_DIP = 0.015
 
 APP_URL = "https://pepe-trading-bot-ujqx.onrender.com"
 
@@ -53,7 +53,8 @@ session = HTTP(
 )
 
 def get_available_balance():
-    """Pobiera dostępne wolne saldo w USDT / USDC z konta UTA."""
+    """Pobiera dostępne wolne saldo wspierając konta UNIFIED oraz CONTRACT."""
+    # Próba dla UNIFIED (UTA)
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -62,26 +63,43 @@ def get_available_balance():
                 equity = float(coin.get("equity", 0.0))
                 if equity > 0:
                     return equity
+    except Exception:
+        pass
+
+    # Próba dla klasycznego konta CONTRACT / Derivatives
+    try:
+        res = session.get_wallet_balance(accountType="CONTRACT")
+        coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
+        for coin in coins:
+            if coin.get("coin") in ["USDT", "USDC"]:
+                equity = float(coin.get("equity", 0.0))
+                if equity > 0:
+                    return equity
     except Exception as e:
-        logging.error(f"Błąd pobierania salda z Bybit: {e}")
-    return 100.0
+        logging.error(f"Nie udało się pobrać salda z Bybit: {e}")
+
+    return 100.0  # Domyślna wartość w przypadku braku odczytu
 
 def get_market_data(symbol, interval, limit=100):
-    """Pobiera świece i przelicza wskaźniki techniczne."""
-    response = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
-    candles = response.get("result", {}).get("list", [])
-    if not candles:
+    """Pobiera dane rynkowe z Bybit."""
+    try:
+        response = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
+        candles = response.get("result", {}).get("list", [])
+        if not candles:
+            return None
+
+        df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ["open", "high", "low", "close"]:
+            df[col] = df[col].astype(float)
+
+        df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
+        return df
+    except Exception as e:
+        logging.error(f"Błąd pobierania świec dla {symbol}: {e}")
         return None
-
-    df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
-    df = df.iloc[::-1].reset_index(drop=True)
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-    df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
-    return df
 
 # ==============================================================================
 # STRATEGIA 1: EMA TREND (PEPE / ETH / SOL - 1H)
@@ -95,7 +113,7 @@ def run_ema_bot():
             
             candle, prev_candle = df.iloc[-2], df.iloc[-3]
             c_open, c_close = candle['open'], candle['close']
-            c_high, c_low = candle['high'], candle['low']
+            c_high, c_low = candle['low'], candle['low']
             ema21, ema89 = candle['ema21'], candle['ema89']
 
             bullish_trend = ema21 > ema89
@@ -121,7 +139,8 @@ def run_ema_bot():
                 session.place_order(
                     category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str,
                     stopLoss=str(sl_price), takeProfit=str(tp_price),
-                    tpslMode="Full", slOrderType="Market", tpOrderType="Market"
+                    tpslMode="Full", slOrderType="Market", tpOrderType="Market",
+                    positionIdx=0
                 )
                 logging.info(f"🔥 [EMA] ZŁOŻONO ZLECENIE DLA {symbol} | Ilość: {qty_str} | Margin: {margin:.2f} USD")
             else:
@@ -171,9 +190,16 @@ def run_dip_bot():
                 act_price = round(c_close * (1 + TRAILING_ACT_PCT_DIP), 6)
                 dist_val = round(c_close * TRAILING_DIST_PCT_DIP, 6)
 
-                session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str, stopLoss=str(sl_price), tpslMode="Full", slOrderType="Market")
+                session.place_order(
+                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str,
+                    stopLoss=str(sl_price), tpslMode="Full", slOrderType="Market",
+                    positionIdx=0
+                )
                 time.sleep(1)
-                session.set_trading_stop(category=CATEGORY, symbol=symbol, trailingStop=str(dist_val), activePrice=str(act_price), positionIdx=0)
+                session.set_trading_stop(
+                    category=CATEGORY, symbol=symbol, trailingStop=str(dist_val),
+                    activePrice=str(act_price), positionIdx=0
+                )
                 logging.info(f"🔥 [DIP HUNTER] ZŁOŻONO ZLECENIE DLA {symbol} z Trailing Stopem | Margin: {margin:.2f} USD")
             else:
                 logging.info(f"[DIP - {symbol}] Brak sygnału odbicia.")
@@ -187,10 +213,8 @@ def bot_loop():
     last_ema_check = 0
     while True:
         try:
-            # Strategia 2 (Dip Hunter) wywołuje się co 15 minut
             run_dip_bot()
             
-            # Strategia 1 (EMA Trend) wywołuje się raz na godzinę
             current_time = time.time()
             if current_time - last_ema_check >= 3600:
                 run_ema_bot()
@@ -199,7 +223,7 @@ def bot_loop():
         except Exception as e:
             logging.error(f"Błąd głównej pętli bota: {e}")
             
-        time.sleep(15 * 60) # Co 15 minut
+        time.sleep(15 * 60)
 
 def self_ping_loop():
     while True:
