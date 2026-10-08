@@ -8,17 +8,17 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA HANDLOWEGO (1H - 1000PEPEUSDT)
+# KONFIGURACJA BOTA HANDLOWEGO (1H - PEPEUSDC)
 # ==============================================================================
 BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
 BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
 TESTNET = False
 
-SYMBOL = "1000PEPEUSDT"
+SYMBOL = "PEPEUSDC"
 CATEGORY = "linear"  
-INTERVAL = "60"       # 1H (Zmień na "15" jeśli wolisz interwał 15-minutowy)
+INTERVAL = "60"       # 1H
 LEVERAGE = 3         
-POSITION_SIZE_USDT = 50.0  
+POSITION_SIZE_USDT = 50.0  # Wartość pozycji w USDC
 
 LIMIT_CANDLES = 200  
 SL_PERCENT = 0.02    # Stop Loss = 2%
@@ -64,7 +64,8 @@ def get_market_data():
     return df
 
 def execute_trade(side, close_price):
-    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / (close_price * 1000)
+    # Dla PEPEUSDC obliczamy bezpośrednio liczbę monet PEPE
+    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / close_price
     qty = int(raw_qty)
 
     if qty <= 0:
@@ -136,9 +137,8 @@ def bot_loop():
         time.sleep(sleep_time)
 
 def self_ping_loop():
-    """Wysyła zapytanie HTTP do samego siebie co 5 minut, aby zapobiec uśpieniu na Renderze."""
     while True:
-        time.sleep(300) # Co 5 minut
+        time.sleep(300)
         try:
             requests.get(APP_URL, timeout=10)
         except Exception:
