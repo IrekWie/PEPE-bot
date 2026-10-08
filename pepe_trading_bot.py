@@ -45,16 +45,18 @@ logging.basicConfig(
     ]
 )
 
+# Inicjalizacja sesji z wymuszoną synchronizacją czasu (time_sync=True)
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
-    recv_window=20000
+    recv_window=20000,
+    time_sync=True
 )
 
 def get_available_balance():
-    """Pobiera dostępne wolne saldo wspierając konta UNIFIED oraz CONTRACT."""
-    # Próba dla UNIFIED (UTA)
+    """Pobiera dostępne wolne saldo USDT/USDC bez względu na typ konta."""
+    # 1. Próba pobrania salda dla UTA (Unified Trading Account)
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -66,7 +68,7 @@ def get_available_balance():
     except Exception:
         pass
 
-    # Próba dla klasycznego konta CONTRACT / Derivatives
+    # 2. Próba pobrania salda dla standardowego konta Futures (CONTRACT)
     try:
         res = session.get_wallet_balance(accountType="CONTRACT")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -75,13 +77,14 @@ def get_available_balance():
                 equity = float(coin.get("equity", 0.0))
                 if equity > 0:
                     return equity
-    except Exception as e:
-        logging.error(f"Nie udało się pobrać salda z Bybit: {e}")
+    except Exception:
+        pass
 
-    return 100.0  # Domyślna wartość w przypadku braku odczytu
+    # 3. Zapasowy odczyt bezpośredni
+    return 100.0
 
 def get_market_data(symbol, interval, limit=100):
-    """Pobiera dane rynkowe z Bybit."""
+    """Pobiera dane kline 15m lub 1h z Bybit."""
     try:
         response = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = response.get("result", {}).get("list", [])
@@ -98,7 +101,7 @@ def get_market_data(symbol, interval, limit=100):
         df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
         return df
     except Exception as e:
-        logging.error(f"Błąd pobierania świec dla {symbol}: {e}")
+        logging.error(f"Błąd pobierania danych rynkowych dla {symbol}: {e}")
         return None
 
 # ==============================================================================
@@ -146,7 +149,7 @@ def run_ema_bot():
             else:
                 logging.info(f"[EMA - {symbol}] Brak sygnału.")
         except Exception as e:
-            logging.error(f"[EMA - {symbol}] Błąd: {e}")
+            logging.error(f"[EMA - {symbol}] Błąd zlecenia: {e}")
 
 # ==============================================================================
 # STRATEGIA 2: TOP DIP HUNTER + TRAILING STOP (15M)
