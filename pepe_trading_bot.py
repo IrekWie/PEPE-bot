@@ -8,17 +8,17 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA HANDLOWEGO (1H - PEPEUSDC)
+# KONFIGURACJA BOTA HANDLOWEGO (1H - 1000PEPEUSDT)
 # ==============================================================================
 BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
 BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
 TESTNET = False
 
-SYMBOL = "PEPEUSDC"
+SYMBOL = "1000PEPEUSDT"
 CATEGORY = "linear"  
 INTERVAL = "60"       # 1H
 LEVERAGE = 3         
-POSITION_SIZE_USDT = 50.0  # Wartość pozycji w USDC
+POSITION_SIZE_USDT = 50.0  # Pozycja za 50 USD/USDC
 
 LIMIT_CANDLES = 200  
 SL_PERCENT = 0.02    # Stop Loss = 2%
@@ -64,8 +64,7 @@ def get_market_data():
     return df
 
 def execute_trade(side, close_price):
-    # Dla PEPEUSDC obliczamy bezpośrednio liczbę monet PEPE
-    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / close_price
+    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / (close_price * 1000)
     qty = int(raw_qty)
 
     if qty <= 0:
