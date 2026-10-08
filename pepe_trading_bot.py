@@ -11,8 +11,8 @@ from pybit.unified_trading import HTTP
 # KONFIGURACJA BOTA HANDLOWEGO (1H - PEPEUSDT)
 # ==============================================================================
 # Pobieranie kluczy ze zmiennych środowiskowych Rendera
-BYBIT_API_KEY = "yohJd2jn10wGNKe4NL"
-BYBIT_API_SECRET = "zpgEZxnPBl4812U2HnYjglbZMvXlQqZpRxNy"
+BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
+BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
 TESTNET = False  
 
 SYMBOL = "PEPEUSDT"
