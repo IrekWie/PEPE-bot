@@ -7,14 +7,26 @@ import pandas as pd
 import requests
 from pybit.unified_trading import HTTP
 
-# Odczyt kluczy ze zmiennych środowiskowych Rendera
-BYBIT_API_KEY = os.environ.get("1DUKhuFk2sZbu4jpqQ", "").strip()
-BYBIT_API_SECRET = os.environ.get("PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl", "").strip()
+# ==============================================================================
+# KONFIGURACJA KLUCZY API BYBIT
+# ==============================================================================
+# Jeśli nie używasz Environment Variables na Renderze, wklej klucze poniżej:
+FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
+FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
+
+# Pobranie kluczy (z Rendera lub zapasowych z kodu)
+RAW_KEY = os.environ.get("1DUKhuFk2sZbu4jpqQ", FALLBACK_KEY)
+RAW_SECRET = os.environ.get("PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl", FALLBACK_SECRET)
+
+# Czyszczenie ze spacji i niewidocznych znaków (\n)
+BYBIT_API_KEY = RAW_KEY.strip()
+BYBIT_API_SECRET = RAW_SECRET.strip()
 
 TESTNET = False
 CATEGORY = "linear"
 LEVERAGE = 3
 
+# --- STRATEGIA 1: EMA TREND (1H) ---
 ASSETS_EMA = {
     "1000PEPEUSDT": {"risk_pct": 0.25, "scale": 1000, "qty_decimals": 0},
     "ETHUSDT":      {"risk_pct": 0.12, "scale": 1,    "qty_decimals": 3},
@@ -23,6 +35,7 @@ ASSETS_EMA = {
 SL_PCT_EMA = 0.02
 TP_PCT_EMA = 0.04
 
+# --- STRATEGIA 2: TOP DIP HUNTER (15M) ---
 RISK_PCT_DIP = 0.10
 TOP_DIPS_COUNT = 4
 SL_PCT_DIP = 0.025
@@ -37,10 +50,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Weryfikacja załadowania kluczy ze środowiska Rendera
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    logging.error("❌ KRITYCZNY BŁĄD: Brak kluczy BYBIT_API_KEY lub BYBIT_API_SECRET w zmiennych środowiskowych Rendera!")
-
+# Inicjalizacja sesji handlowej Bybit
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
@@ -49,7 +59,7 @@ session = HTTP(
 )
 
 def get_available_balance():
-    """Pobiera wolne saldo USDT/USDC z giełdy."""
+    """Pobiera wolne saldo USDT/USDC z konta Bybit."""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -71,9 +81,9 @@ def get_available_balance():
     return 100.0
 
 def get_market_data(symbol, interval, limit=100):
-    """Pobiera świece z giełdy z pauzą zapobiegającą API Rate Limit."""
+    """Pobiera dane rynkowe z pauzą chroniącą przed API Rate Limit."""
     try:
-        time.sleep(0.3)  # Ochrona przed błędem ErrCode 10006 (Rate Limit)
+        time.sleep(0.3)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
         if not candles: return None
