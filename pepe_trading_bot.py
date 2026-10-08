@@ -4,6 +4,7 @@ import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
+import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
@@ -15,13 +16,15 @@ TESTNET = False
 
 SYMBOL = "1000PEPEUSDT"
 CATEGORY = "linear"  
-INTERVAL = "60"       # 1H
+INTERVAL = "60"       # 1H (Zmień na "15" jeśli wolisz interwał 15-minutowy)
 LEVERAGE = 3         
 POSITION_SIZE_USDT = 50.0  
 
 LIMIT_CANDLES = 200  
 SL_PERCENT = 0.02    # Stop Loss = 2%
 TP_PERCENT = 0.04    # Take Profit = 4%
+
+APP_URL = "https://pepe-trading-bot-ujqx.onrender.com"
 
 LOG_FILE = "trade_history.log"
 logging.basicConfig(
@@ -92,7 +95,7 @@ def execute_trade(side, close_price):
         logging.error(f"Błąd zlecenia: {e}")
 
 def run_bot():
-    logging.info("=== ANALIZA ŚWIECY GODZINOWEJ (1000PEPE 1H) ===")
+    logging.info(f"=== ANALIZA ŚWIECY ({SYMBOL} {INTERVAL}m) ===")
 
     df = get_market_data()
     candle = df.iloc[-2]
@@ -121,15 +124,25 @@ def run_bot():
     elif bearish_trend and in_value_zone_short and bearish_candle:
         execute_trade("Sell", c_close)
     else:
-        logging.info("Brak sygnału. Czekam na kolejną świecę 1H.")
+        logging.info("Brak sygnału. Czekam na kolejną świecę.")
 
 def bot_loop():
+    sleep_time = int(INTERVAL) * 60
     while True:
         try:
             run_bot()
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
-        time.sleep(3600)
+        time.sleep(sleep_time)
+
+def self_ping_loop():
+    """Wysyła zapytanie HTTP do samego siebie co 5 minut, aby zapobiec uśpieniu na Renderze."""
+    while True:
+        time.sleep(300) # Co 5 minut
+        try:
+            requests.get(APP_URL, timeout=10)
+        except Exception:
+            pass
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -148,6 +161,10 @@ def run_health_server():
     httpd.serve_forever()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
+    t_bot = threading.Thread(target=bot_loop, daemon=True)
+    t_bot.start()
+
+    t_ping = threading.Thread(target=self_ping_loop, daemon=True)
+    t_ping.start()
+
     run_health_server()
