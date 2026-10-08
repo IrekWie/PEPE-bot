@@ -13,8 +13,8 @@ from pybit.unified_trading import HTTP
 # ==============================================================================
 
 # 1. Klucze Bybit API (Wklej swoje prawdziwe klucze między cudzysłowami)
-BYBIT_API_KEY = "qFUYjYvjxptqpI5CBU"
-BYBIT_API_SECRET = "6ylxNJoW3qaB71BneLorAXfACLGWRixtcKmG"
+BYBIT_API_KEY = "yohJd2jn10wGNKe4NL"
+BYBIT_API_SECRET = "zpgEZxnPBl4812U2HnYjglbZMvXlQqZpRxNy"
 TESTNET = False  # Ustaw True tylko dla środowiska testowego (testnet.bybit.com)
 
 # 2. Parametry handlowe dla PEPEUSDT
