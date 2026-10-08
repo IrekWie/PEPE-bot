@@ -18,11 +18,10 @@ CATEGORY = "linear"
 INTERVAL = "60"       # Świeca 1H
 LEVERAGE = 3         # Dźwignia 3x
 
-# Alokacja procentowa wolnego salda UTA dla poszczególnych aktyw:
 ASSETS_CONFIG = {
-    "1000PEPEUSDT": {"risk_pct": 0.50, "scale": 1000, "qty_decimals": 0}, # 50% salda
-    "ETHUSDT":      {"risk_pct": 0.25, "scale": 1,    "qty_decimals": 3}, # 25% salda
-    "SOLUSDT":      {"risk_pct": 0.25, "scale": 1,    "qty_decimals": 1}  # 25% salda
+    "1000PEPEUSDT": {"risk_pct": 0.50, "scale": 1000, "qty_decimals": 0},
+    "ETHUSDT":      {"risk_pct": 0.25, "scale": 1,    "qty_decimals": 3},
+    "SOLUSDT":      {"risk_pct": 0.25, "scale": 1,    "qty_decimals": 1}
 }
 
 LIMIT_CANDLES = 200  
@@ -48,7 +47,6 @@ session = HTTP(
 )
 
 def get_available_balance():
-    """Pobiera dostępne saldo w USDC lub USDT z konta ujednoliconego (UTA)."""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -89,10 +87,8 @@ def execute_trade(symbol, side, close_price):
     available_balance = get_available_balance()
     position_margin = available_balance * config["risk_pct"]
     
-    # Przeliczanie ilości zależnie od skali monety (1000PEPE vs ETH/SOL)
     raw_qty = (position_margin * LEVERAGE) / (close_price * config["scale"])
     
-    # Zaokrąglanie do dozwolonej dokładności po przecinku Bybit
     decimals = config["qty_decimals"]
     if decimals == 0:
         qty_str = str(int(raw_qty))
@@ -167,18 +163,19 @@ def bot_loop():
         try:
             for symbol in ASSETS_CONFIG.keys():
                 run_bot_for_symbol(symbol)
-                time.sleep(2) # Krótka pauza między zapytaniami o różne symbole
+                time.sleep(2)
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
         time.sleep(sleep_time)
 
 def self_ping_loop():
     while True:
-        time.sleep(300)
+        time.sleep(300)  # Co 5 minut
         try:
             requests.get(APP_URL, timeout=10)
-        except Exception:
-            pass
+            logging.info("PING: Serwer aktywny (Render Keep-Alive OK)")
+        except Exception as e:
+            logging.error(f"PING BŁĄD: {e}")
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
