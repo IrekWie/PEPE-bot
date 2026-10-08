@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 from pybit.unified_trading import HTTP
 
-# Pobieranie kluczy ze zmiennych środowiskowych Rendera
+# Odczyt kluczy ze zmiennych środowiskowych Rendera
 BYBIT_API_KEY = os.environ.get("1DUKhuFk2sZbu4jpqQ", "").strip()
 BYBIT_API_SECRET = os.environ.get("PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl", "").strip()
 
@@ -37,7 +37,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Inicjalizacja sesji z kluczami z Environment Variables
+# Weryfikacja załadowania kluczy ze środowiska Rendera
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    logging.error("❌ KRITYCZNY BŁĄD: Brak kluczy BYBIT_API_KEY lub BYBIT_API_SECRET w zmiennych środowiskowych Rendera!")
+
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
@@ -45,18 +48,8 @@ session = HTTP(
     recv_window=20000
 )
 
-def run_test_order():
-    logging.info("=== [TEST HANDLOWY] PRÓBA WYKONANIA ZLECENIA NA BYBIT ===")
-    try:
-        res = session.place_order(
-            category=CATEGORY, symbol="ETHUSDT", side="Buy", orderType="Market",
-            qty="0.003", stopLoss="1500", tpslMode="Full", slOrderType="Market", positionIdx=0
-        )
-        logging.info(f"✅ TEST ZAKUPU UDANY! Bybit przyjął zlecenie: {res.get('result')}")
-    except Exception as e:
-        logging.error(f"❌ TEST ZAKUPU RESULT: {e}")
-
 def get_available_balance():
+    """Pobiera wolne saldo USDT/USDC z giełdy."""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -65,10 +58,22 @@ def get_available_balance():
                 return float(coin.get("equity", 0.0))
     except Exception:
         pass
+
+    try:
+        res = session.get_wallet_balance(accountType="CONTRACT")
+        coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
+        for coin in coins:
+            if coin.get("coin") in ["USDT", "USDC"]:
+                return float(coin.get("equity", 0.0))
+    except Exception:
+        pass
+
     return 100.0
 
 def get_market_data(symbol, interval, limit=100):
+    """Pobiera świece z giełdy z pauzą zapobiegającą API Rate Limit."""
     try:
+        time.sleep(0.3)  # Ochrona przed błędem ErrCode 10006 (Rate Limit)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
         if not candles: return None
@@ -180,7 +185,6 @@ def run_dip_bot():
         logging.error(f"[DIP HUNTER] Błąd: {e}")
 
 def bot_loop():
-    run_test_order()
     last_ema_check = 0
     while True:
         try:
