@@ -36,7 +36,8 @@ logging.basicConfig(
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
+    api_secret=BYBIT_API_SECRET,
+    domain="bybit" # lub przełącznik dla kont unijnych/globalnych
 )
 
 def set_leverage():
