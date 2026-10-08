@@ -1,29 +1,20 @@
 import os
 import time
-import json
-import hmac
-import hashlib
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import requests
+from pybit.unified_trading import HTTP
 
-# ==============================================================================
-# KONFIGURACJA BOTA MULTI-STRATEGY (BYBIT V5 REST API)
-# ==============================================================================
-RAW_API_KEY = "1DUKhuFk2sZbu4jpqQ"
-RAW_API_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
+# Pobieranie kluczy ze zmiennych środowiskowych Rendera
+BYBIT_API_KEY = os.environ.get("1DUKhuFk2sZbu4jpqQ", "").strip()
+BYBIT_API_SECRET = os.environ.get("PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl", "").strip()
 
-# Czyszczenie z ukrytych spacji i znaków nowej linii (\n)
-BYBIT_API_KEY = RAW_API_KEY.strip()
-BYBIT_API_SECRET = RAW_API_SECRET.strip()
-
-BASE_URL = "https://api.bybit.com"
+TESTNET = False
 CATEGORY = "linear"
 LEVERAGE = 3
 
-# --- 1. STRATEGIA EMA TREND (1H) ---
 ASSETS_EMA = {
     "1000PEPEUSDT": {"risk_pct": 0.25, "scale": 1000, "qty_decimals": 0},
     "ETHUSDT":      {"risk_pct": 0.12, "scale": 1,    "qty_decimals": 3},
@@ -32,7 +23,6 @@ ASSETS_EMA = {
 SL_PCT_EMA = 0.02
 TP_PCT_EMA = 0.04
 
-# --- 2. STRATEGIA TOP DIP HUNTER (15M) ---
 RISK_PCT_DIP = 0.10
 TOP_DIPS_COUNT = 4
 SL_PCT_DIP = 0.025
@@ -47,109 +37,41 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# ==============================================================================
-# POPRAWIONY MODUŁ SZYFROWANIA I PODPISU REST API BYBIT V5
-# ==============================================================================
-def get_server_time():
-    """Pobiera dokładny czas z serwera Bybit w ms."""
-    try:
-        res = requests.get(f"{BASE_URL}/v5/market/time", timeout=5).json()
-        return str(res["result"]["timeNano"][:13])
-    except Exception:
-        return str(int(time.time() * 1000))
-
-def send_signed_request(method, endpoint, params=None):
-    """Generuje matematycznie czysty podpis HMAC-SHA256 bez spacji w JSON."""
-    if params is None:
-        params = {}
-        
-    timestamp = get_server_time()
-    recv_window = "20000"
-    
-    if method.upper() == "GET":
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-        payload = timestamp + BYBIT_API_KEY + recv_window + query_string
-        url = f"{BASE_URL}{endpoint}" + (f"?{query_string}" if query_string else "")
-        data_to_send = None
-    else:
-        # Bardzo ważne: separators=(',', ':') eliminuje spacje wewnątrz formatu JSON
-        payload_json = json.dumps(params, separators=(',', ':'))
-        payload = timestamp + BYBIT_API_KEY + recv_window + payload_json
-        url = f"{BASE_URL}{endpoint}"
-        data_to_send = payload_json
-
-    signature = hmac.new(
-        BYBIT_API_SECRET.encode('utf-8'),
-        payload.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json"
-    }
-
-    if method.upper() == "GET":
-        return requests.get(url, headers=headers, timeout=10).json()
-    else:
-        return requests.post(url, headers=headers, data=data_to_send, timeout=10).json()
+# Inicjalizacja sesji z kluczami z Environment Variables
+session = HTTP(
+    testnet=TESTNET,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+    recv_window=20000
+)
 
 def run_test_order():
-    """Testowy zakup ETHUSDT uruchamiany przy starcie bota."""
-    logging.info("=== [TEST REST API] PRÓBA SKŁADANIA ZLECENIA NA BYBIT ===")
-    payload = {
-        "category": CATEGORY,
-        "symbol": "ETHUSDT",
-        "side": "Buy",
-        "orderType": "Market",
-        "qty": "0.003",
-        "stopLoss": "1500",
-        "tpslMode": "Full",
-        "slOrderType": "Market",
-        "positionIdx": 0
-    }
-    res = send_signed_request("POST", "/v5/order/create", payload)
-    if res.get("retCode") == 0:
+    logging.info("=== [TEST HANDLOWY] PRÓBA WYKONANIA ZLECENIA NA BYBIT ===")
+    try:
+        res = session.place_order(
+            category=CATEGORY, symbol="ETHUSDT", side="Buy", orderType="Market",
+            qty="0.003", stopLoss="1500", tpslMode="Full", slOrderType="Market", positionIdx=0
+        )
         logging.info(f"✅ TEST ZAKUPU UDANY! Bybit przyjął zlecenie: {res.get('result')}")
-    else:
-        logging.error(f"❌ TEST ZAKUPU RESULT: {res}")
+    except Exception as e:
+        logging.error(f"❌ TEST ZAKUPU RESULT: {e}")
 
 def get_available_balance():
-    """Pobiera wolne saldo USDT/USDC bezpośrednio przez REST API."""
     try:
-        res = send_signed_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-        if res.get("retCode") == 0:
-            coins = res["result"]["list"][0].get("coin", [])
-            for coin in coins:
-                if coin.get("coin") in ["USDT", "USDC"]:
-                    return float(coin.get("equity", 0.0))
+        res = session.get_wallet_balance(accountType="UNIFIED")
+        coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
+        for coin in coins:
+            if coin.get("coin") in ["USDT", "USDC"]:
+                return float(coin.get("equity", 0.0))
     except Exception:
         pass
-
-    try:
-        res = send_signed_request("GET", "/v5/account/wallet-balance", {"accountType": "CONTRACT"})
-        if res.get("retCode") == 0:
-            coins = res["result"]["list"][0].get("coin", [])
-            for coin in coins:
-                if coin.get("coin") in ["USDT", "USDC"]:
-                    return float(coin.get("equity", 0.0))
-    except Exception:
-        pass
-
     return 100.0
 
 def get_market_data(symbol, interval, limit=100):
-    """Pobiera świece z giełdy Bybit."""
     try:
-        url = f"{BASE_URL}/v5/market/kline?category={CATEGORY}&symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=10).json()
+        res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
-        if not candles:
-            return None
+        if not candles: return None
 
         df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
         df = df.iloc[::-1].reset_index(drop=True)
@@ -164,9 +86,6 @@ def get_market_data(symbol, interval, limit=100):
         logging.error(f"Błąd świec {symbol}: {e}")
         return None
 
-# ==============================================================================
-# STRATEGIA 1: EMA TREND (1H)
-# ==============================================================================
 def run_ema_bot():
     logging.info("=== [STRATEGIA 1] ANALIZA EMA TREND (1H) ===")
     for symbol, config in ASSETS_EMA.items():
@@ -176,12 +95,11 @@ def run_ema_bot():
             
             candle, prev_candle = df.iloc[-2], df.iloc[-3]
             c_open, c_close = candle['open'], candle['close']
-            c_high, c_low = candle['low'], candle['low']
+            c_low = candle['low']
             ema21, ema89 = candle['ema21'], candle['ema89']
 
             bullish_trend = ema21 > ema89
             in_value_zone = (c_low <= max(ema21, ema89)) and (c_low >= min(ema21, ema89))
-            
             bullish_pinbar = (c_close > c_open) and ((c_open - c_low) > (c_close - c_open) * 1.5)
             bullish_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
 
@@ -189,7 +107,6 @@ def run_ema_bot():
                 available_balance = get_available_balance()
                 margin = available_balance * config["risk_pct"]
                 raw_qty = (margin * LEVERAGE) / (c_close * config["scale"])
-                
                 decimals = config["qty_decimals"]
                 qty_str = str(int(raw_qty)) if decimals == 0 else f"{round(raw_qty, decimals):.{decimals}f}"
 
@@ -198,26 +115,21 @@ def run_ema_bot():
                 sl_price = str(round(c_close * (1 - SL_PCT_EMA), 6))
                 tp_price = str(round(c_close * (1 + TP_PCT_EMA), 6))
 
-                payload = {
-                    "category": CATEGORY, "symbol": symbol, "side": "Buy", "orderType": "Market", "qty": qty_str,
-                    "stopLoss": sl_price, "takeProfit": tp_price, "tpslMode": "Full",
-                    "slOrderType": "Market", "tpOrderType": "Market", "positionIdx": 0
-                }
-                res = send_signed_request("POST", "/v5/order/create", payload)
+                res = session.place_order(
+                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str,
+                    stopLoss=sl_price, takeProfit=tp_price, tpslMode="Full",
+                    slOrderType="Market", tpOrderType="Market", positionIdx=0
+                )
                 logging.info(f"🔥 [EMA] ZŁOŻONO ZLECENIE DLA {symbol} | Wynik: {res}")
             else:
                 logging.info(f"[EMA - {symbol}] Brak sygnału.")
         except Exception as e:
             logging.error(f"[EMA - {symbol}] Błąd: {e}")
 
-# ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER (15M)
-# ==============================================================================
 def run_dip_bot():
     logging.info("=== [STRATEGIA 2] SKANOWANIE TOP SPADKÓW (15M) ===")
     try:
-        res = requests.get(f"{BASE_URL}/v5/market/tickers?category={CATEGORY}", timeout=10).json()
-        tickers = res.get("result", {}).get("list", [])
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
         sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("price24hPcnt", 0.0)))
         top_losers = [t["symbol"] for t in sorted_tickers[:TOP_DIPS_COUNT]]
@@ -252,45 +164,33 @@ def run_dip_bot():
                 act_price = str(round(c_close * (1 + TRAILING_ACT_PCT_DIP), 6))
                 dist_val = str(round(c_close * TRAILING_DIST_PCT_DIP, 6))
 
-                payload_order = {
-                    "category": CATEGORY, "symbol": symbol, "side": "Buy", "orderType": "Market", "qty": qty_str,
-                    "stopLoss": sl_price, "tpslMode": "Full", "slOrderType": "Market", "positionIdx": 0
-                }
-                res_order = send_signed_request("POST", "/v5/order/create", payload_order)
-                
+                res_order = session.place_order(
+                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str,
+                    stopLoss=sl_price, tpslMode="Full", slOrderType="Market", positionIdx=0
+                )
                 time.sleep(1)
-                
-                payload_stop = {
-                    "category": CATEGORY, "symbol": symbol, "trailingStop": dist_val,
-                    "activePrice": act_price, "positionIdx": 0
-                }
-                send_signed_request("POST", "/v5/position/trading-stop", payload_stop)
-                
+                session.set_trading_stop(
+                    category=CATEGORY, symbol=symbol, trailingStop=dist_val,
+                    activePrice=act_price, positionIdx=0
+                )
                 logging.info(f"🔥 [DIP HUNTER] ZŁOŻONO ZLECENIE DLA {symbol} | Wynik: {res_order}")
             else:
                 logging.info(f"[DIP - {symbol}] Brak sygnału odbicia.")
     except Exception as e:
         logging.error(f"[DIP HUNTER] Błąd: {e}")
 
-# ==============================================================================
-# PĘTLA GŁÓWNA I SERWER HEALTH-CHECK
-# ==============================================================================
 def bot_loop():
     run_test_order()
-    
     last_ema_check = 0
     while True:
         try:
             run_dip_bot()
-            
             current_time = time.time()
             if current_time - last_ema_check >= 3600:
                 run_ema_bot()
                 last_ema_check = current_time
-
         except Exception as e:
             logging.error(f"Błąd głównej pętli bota: {e}")
-            
         time.sleep(15 * 60)
 
 def self_ping_loop():
@@ -307,22 +207,18 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Multi-Strategy Trading Bot is Running 24/7!")
-
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
+    httpd = HTTPServer(('', port), SimpleHTTPRequestHandler)
     httpd.serve_forever()
 
 if __name__ == "__main__":
     t_bot = threading.Thread(target=bot_loop, daemon=True)
     t_bot.start()
-
     t_ping = threading.Thread(target=self_ping_loop, daemon=True)
     t_ping.start()
-
     run_health_server()
