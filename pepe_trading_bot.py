@@ -36,34 +36,8 @@ logging.basicConfig(
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
-    domain="bybit" # lub przełącznik dla kont unijnych/globalnych
+    api_secret=BYBIT_API_SECRET
 )
-
-def set_leverage():
-    try:
-        session.set_leverage(
-            category=CATEGORY,
-            symbol=SYMBOL,
-            buyLeverage=str(LEVERAGE),
-            sellLeverage=str(LEVERAGE)
-        )
-    except Exception as e:
-        if "110043" not in str(e):
-            logging.warning(f"Informacja o dźwigni: {e}")
-
-def has_active_position():
-    try:
-        response = session.get_positions(category=CATEGORY, symbol=SYMBOL)
-        positions = response.get("result", {}).get("list", [])
-        for pos in positions:
-            if float(pos.get("size", 0)) > 0:
-                logging.info(f"Wykryto aktywną pozycję na {SYMBOL}. Pomijam.")
-                return True
-        return False
-    except Exception as e:
-        logging.error(f"Błąd sprawdzania pozycji: {e}")
-        return False
 
 def get_market_data():
     response = session.get_kline(
@@ -119,10 +93,6 @@ def execute_trade(side, close_price):
 
 def run_bot():
     logging.info("=== ANALIZA ŚWIECY GODZINOWEJ (1000PEPE 1H) ===")
-    set_leverage()
-
-    if has_active_position():
-        return
 
     df = get_market_data()
     candle = df.iloc[-2]
