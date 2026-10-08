@@ -8,17 +8,22 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA HANDLOWEGO (1H - 1000PEPEUSDT)
+# KONFIGURACJA BOTA MULTI-ASSET (1H - PEPE, ETH, SOL)
 # ==============================================================================
 BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
 BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
 TESTNET = False
 
-SYMBOL = "1000PEPEUSDT"
 CATEGORY = "linear"  
-INTERVAL = "60"       # 1H
-LEVERAGE = 3         
-POSITION_SIZE_USDT = 50.0  # Pozycja za 50 USD/USDC
+INTERVAL = "60"       # Świeca 1H
+LEVERAGE = 3         # Dźwignia 3x
+
+# Alokacja procentowa wolnego salda UTA dla poszczególnych aktyw:
+ASSETS_CONFIG = {
+    "1000PEPEUSDT": {"risk_pct": 0.50, "scale": 1000, "qty_decimals": 0}, # 50% salda
+    "ETHUSDT":      {"risk_pct": 0.25, "scale": 1,    "qty_decimals": 3}, # 25% salda
+    "SOLUSDT":      {"risk_pct": 0.25, "scale": 1,    "qty_decimals": 1}  # 25% salda
+}
 
 LIMIT_CANDLES = 200  
 SL_PERCENT = 0.02    # Stop Loss = 2%
@@ -42,16 +47,32 @@ session = HTTP(
     api_secret=BYBIT_API_SECRET
 )
 
-def get_market_data():
+def get_available_balance():
+    """Pobiera dostępne saldo w USDC lub USDT z konta ujednoliconego (UTA)."""
+    try:
+        res = session.get_wallet_balance(accountType="UNIFIED")
+        coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
+        for coin in coins:
+            coin_name = coin.get("coin")
+            if coin_name in ["USDC", "USDT"]:
+                wallet_equity = float(coin.get("equity", 0.0))
+                if wallet_equity > 0:
+                    return wallet_equity
+    except Exception as e:
+        logging.error(f"Błąd pobierania salda z Bybit: {e}")
+    
+    return 50.0
+
+def get_market_data(symbol):
     response = session.get_kline(
         category=CATEGORY,
-        symbol=SYMBOL,
+        symbol=symbol,
         interval=INTERVAL,
         limit=LIMIT_CANDLES
     )
     candles = response.get("result", {}).get("list", [])
     if not candles:
-        raise Exception("Brak danych kline z Bybit.")
+        raise Exception(f"Brak danych kline dla {symbol} z Bybit.")
 
     df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
     df = df.iloc[::-1].reset_index(drop=True)
@@ -63,11 +84,25 @@ def get_market_data():
     df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
     return df
 
-def execute_trade(side, close_price):
-    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / (close_price * 1000)
-    qty = int(raw_qty)
+def execute_trade(symbol, side, close_price):
+    config = ASSETS_CONFIG[symbol]
+    available_balance = get_available_balance()
+    position_margin = available_balance * config["risk_pct"]
+    
+    # Przeliczanie ilości zależnie od skali monety (1000PEPE vs ETH/SOL)
+    raw_qty = (position_margin * LEVERAGE) / (close_price * config["scale"])
+    
+    # Zaokrąglanie do dozwolonej dokładności po przecinku Bybit
+    decimals = config["qty_decimals"]
+    if decimals == 0:
+        qty_str = str(int(raw_qty))
+        qty_num = float(qty_str)
+    else:
+        qty_num = round(raw_qty, decimals)
+        qty_str = f"{qty_num:.{decimals}f}"
 
-    if qty <= 0:
+    if qty_num <= 0:
+        logging.warning(f"[{symbol}] Wyliczona ilość ({qty_str}) jest za mała na otwarcie zlecenia.")
         return
 
     if side == "Buy":
@@ -80,24 +115,24 @@ def execute_trade(side, close_price):
     try:
         session.place_order(
             category=CATEGORY,
-            symbol=SYMBOL,
+            symbol=symbol,
             side=side,
             orderType="Market",
-            qty=str(qty),
+            qty=qty_str,
             stopLoss=str(sl_price),
             takeProfit=str(tp_price),
             tpslMode="Full",
             slOrderType="Market",
             tpOrderType="Market"
         )
-        logging.info(f"SUKCES: Złożono zlecenie {side} dla {SYMBOL}!")
+        logging.info(f"SUKCES: Złożono zlecenie {side} dla {symbol} | Ilość: {qty_str} | Depozyt: {position_margin:.2f} USD")
     except Exception as e:
-        logging.error(f"Błąd zlecenia: {e}")
+        logging.error(f"[{symbol}] Błąd zlecenia: {e}")
 
-def run_bot():
-    logging.info(f"=== ANALIZA ŚWIECY ({SYMBOL} {INTERVAL}m) ===")
+def run_bot_for_symbol(symbol):
+    logging.info(f"=== ANALIZA ŚWIECY ({symbol} {INTERVAL}m) ===")
 
-    df = get_market_data()
+    df = get_market_data(symbol)
     candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
 
@@ -120,17 +155,19 @@ def run_bot():
     bearish_candle = bearish_pinbar or bearish_engulfing
 
     if bullish_trend and in_value_zone_long and bullish_candle:
-        execute_trade("Buy", c_close)
+        execute_trade(symbol, "Buy", c_close)
     elif bearish_trend and in_value_zone_short and bearish_candle:
-        execute_trade("Sell", c_close)
+        execute_trade(symbol, "Sell", c_close)
     else:
-        logging.info("Brak sygnału. Czekam na kolejną świecę.")
+        logging.info(f"[{symbol}] Brak sygnału. Czekam na kolejną świecę.")
 
 def bot_loop():
     sleep_time = int(INTERVAL) * 60
     while True:
         try:
-            run_bot()
+            for symbol in ASSETS_CONFIG.keys():
+                run_bot_for_symbol(symbol)
+                time.sleep(2) # Krótka pauza między zapytaniami o różne symbole
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
         time.sleep(sleep_time)
@@ -147,7 +184,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Pepe Trading Bot is Running 24/7!")
+        self.wfile.write(b"Multi-Asset Trading Bot is Running 24/7!")
 
     def do_HEAD(self):
         self.send_response(200)
