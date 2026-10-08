@@ -48,7 +48,8 @@ logging.basicConfig(
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
+    api_secret=BYBIT_API_SECRET,
+    recv_window=20000
 )
 
 def get_available_balance():
