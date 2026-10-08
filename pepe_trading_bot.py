@@ -12,7 +12,7 @@ from pybit.unified_trading import HTTP
 BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
 BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
 
-SYMBOL = "PEPEUSDT"
+SYMBOL = "1000PEPEUSDT"
 CATEGORY = "linear"  
 INTERVAL = "60"       # 1H
 LEVERAGE = 3         
@@ -36,7 +36,7 @@ logging.basicConfig(
 session = HTTP(
     testnet=False,
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
+    api_secret=BYBIT_API_SECRET
 )
 
 def set_leverage():
@@ -87,8 +87,8 @@ def get_market_data():
     return df
 
 def execute_trade(side, close_price):
-    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / close_price
-    qty = int(raw_qty // 100) * 100  
+    raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / (close_price * 1000)
+    qty = int(raw_qty)  
 
     if qty <= 0:
         return
@@ -112,6 +112,10 @@ def execute_trade(side, close_price):
             tpslMode="Full",
             slOrderType="Market",
             tpOrderType="Market"
+        )
+        logging.info(f"SUKCES: Złożono zlecenie {side} dla {SYMBOL}!")
+    except Exception as e:
+        logging.error(f"Błąd zlecenia: {e}")
         )
         logging.info(f"SUKCES: Złożono zlecenie {side} dla PEPE!")
     except Exception as e:
