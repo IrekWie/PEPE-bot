@@ -4,16 +4,13 @@ import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
-import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA HANDLOWEGO (1H - PEPEUSDT)
+# KLUCZE API I KONFIGURACJA
 # ==============================================================================
-# Pobieranie kluczy ze zmiennych środowiskowych Rendera
 BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
 BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
-TESTNET = False  
 
 SYMBOL = "PEPEUSDT"
 CATEGORY = "linear"  
@@ -22,8 +19,8 @@ LEVERAGE = 3
 POSITION_SIZE_USDT = 50.0  
 
 LIMIT_CANDLES = 200  
-SL_PERCENT = 0.02    # Stop Loss = 2%
-TP_PERCENT = 0.04    # Take Profit = 4%
+SL_PERCENT = 0.02    
+TP_PERCENT = 0.04    
 
 LOG_FILE = "trade_history.log"
 logging.basicConfig(
@@ -35,10 +32,11 @@ logging.basicConfig(
     ]
 )
 
+# Inicjalizacja sesji z jawnym określeniem konta UTA
 session = HTTP(
-    testnet=TESTNET,
+    testnet=False,
     api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
+    api_secret=BYBIT_API_SECRET,
 )
 
 def set_leverage():
@@ -50,8 +48,9 @@ def set_leverage():
             sellLeverage=str(LEVERAGE)
         )
     except Exception as e:
+        # Kod 110043 oznacza, że dźwignia jest już ustawiona na 3x
         if "110043" not in str(e):
-            logging.warning(f"Dźwignia: {e}")
+            logging.warning(f"Informacja o dźwigni: {e}")
 
 def has_active_position():
     try:
@@ -64,7 +63,7 @@ def has_active_position():
         return False
     except Exception as e:
         logging.error(f"Błąd sprawdzania pozycji: {e}")
-        return True
+        return False
 
 def get_market_data():
     response = session.get_kline(
