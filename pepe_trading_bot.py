@@ -8,39 +8,30 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA KLUCZY API BYBIT
+# KONFIGURACJA BOTA NA RYNEK SPOT (DLA UŻYTKOWNIKÓW Z UE / MiFID II)
 # ==============================================================================
-# Jeśli nie używasz Environment Variables na Renderze, wklej klucze poniżej:
 FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
 FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
 
-# Pobranie kluczy (z Rendera lub zapasowych z kodu)
 RAW_KEY = os.environ.get("1DUKhuFk2sZbu4jpqQ", FALLBACK_KEY)
 RAW_SECRET = os.environ.get("PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl", FALLBACK_SECRET)
 
-# Czyszczenie ze spacji i niewidocznych znaków (\n)
 BYBIT_API_KEY = RAW_KEY.strip()
 BYBIT_API_SECRET = RAW_SECRET.strip()
 
 TESTNET = False
-CATEGORY = "linear"
-LEVERAGE = 3
+CATEGORY = "spot"  # Przełączono na SPOT z uwagi na regulacje EU
 
 # --- STRATEGIA 1: EMA TREND (1H) ---
 ASSETS_EMA = {
-    "1000PEPEUSDT": {"risk_pct": 0.25, "scale": 1000, "qty_decimals": 0},
-    "ETHUSDT":      {"risk_pct": 0.12, "scale": 1,    "qty_decimals": 3},
-    "SOLUSDT":      {"risk_pct": 0.13, "scale": 1,    "qty_decimals": 1}
+    "PEPEUSDT": {"risk_pct": 0.25, "qty_decimals": 0},
+    "ETHUSDT":  {"risk_pct": 0.12, "qty_decimals": 4},
+    "SOLUSDT":  {"risk_pct": 0.13, "qty_decimals": 2}
 }
-SL_PCT_EMA = 0.02
-TP_PCT_EMA = 0.04
 
 # --- STRATEGIA 2: TOP DIP HUNTER (15M) ---
 RISK_PCT_DIP = 0.10
 TOP_DIPS_COUNT = 4
-SL_PCT_DIP = 0.025
-TRAILING_ACT_PCT_DIP = 0.030
-TRAILING_DIST_PCT_DIP = 0.015
 
 APP_URL = "https://pepe-trading-bot-ujqx.onrender.com"
 
@@ -50,7 +41,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Inicjalizacja sesji handlowej Bybit
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
@@ -59,29 +49,19 @@ session = HTTP(
 )
 
 def get_available_balance():
-    """Pobiera wolne saldo USDT/USDC z konta Bybit."""
+    """Pobiera dostępne wolne saldo USDT z konta SPOT / UTA."""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
         for coin in coins:
-            if coin.get("coin") in ["USDT", "USDC"]:
+            if coin.get("coin") == "USDT":
                 return float(coin.get("equity", 0.0))
     except Exception:
         pass
-
-    try:
-        res = session.get_wallet_balance(accountType="CONTRACT")
-        coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
-        for coin in coins:
-            if coin.get("coin") in ["USDT", "USDC"]:
-                return float(coin.get("equity", 0.0))
-    except Exception:
-        pass
-
     return 100.0
 
 def get_market_data(symbol, interval, limit=100):
-    """Pobiera dane rynkowe z pauzą chroniącą przed API Rate Limit."""
+    """Pobiera świece dla rynku SPOT."""
     try:
         time.sleep(0.3)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
@@ -102,7 +82,7 @@ def get_market_data(symbol, interval, limit=100):
         return None
 
 def run_ema_bot():
-    logging.info("=== [STRATEGIA 1] ANALIZA EMA TREND (1H) ===")
+    logging.info("=== [STRATEGIA 1] ANALIZA EMA TREND SPOT (1H) ===")
     for symbol, config in ASSETS_EMA.items():
         try:
             df = get_market_data(symbol, interval="60")
@@ -120,29 +100,24 @@ def run_ema_bot():
 
             if bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing):
                 available_balance = get_available_balance()
-                margin = available_balance * config["risk_pct"]
-                raw_qty = (margin * LEVERAGE) / (c_close * config["scale"])
+                order_value = available_balance * config["risk_pct"]
+                raw_qty = order_value / c_close
                 decimals = config["qty_decimals"]
                 qty_str = str(int(raw_qty)) if decimals == 0 else f"{round(raw_qty, decimals):.{decimals}f}"
 
                 if float(qty_str) <= 0: continue
 
-                sl_price = str(round(c_close * (1 - SL_PCT_EMA), 6))
-                tp_price = str(round(c_close * (1 + TP_PCT_EMA), 6))
-
                 res = session.place_order(
-                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str,
-                    stopLoss=sl_price, takeProfit=tp_price, tpslMode="Full",
-                    slOrderType="Market", tpOrderType="Market", positionIdx=0
+                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str
                 )
-                logging.info(f"🔥 [EMA] ZŁOŻONO ZLECENIE DLA {symbol} | Wynik: {res}")
+                logging.info(f"🔥 [EMA SPOT] ZŁOŻONO ZLECENIE DLA {symbol} | Wynik: {res}")
             else:
-                logging.info(f"[EMA - {symbol}] Brak sygnału.")
+                logging.info(f"[EMA SPOT - {symbol}] Brak sygnału.")
         except Exception as e:
-            logging.error(f"[EMA - {symbol}] Błąd: {e}")
+            logging.error(f"[EMA SPOT - {symbol}] Błąd: {e}")
 
 def run_dip_bot():
-    logging.info("=== [STRATEGIA 2] SKANOWANIE TOP SPADKÓW (15M) ===")
+    logging.info("=== [STRATEGIA 2] SKANOWANIE TOP SPADKÓW SPOT (15M) ===")
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
@@ -164,35 +139,20 @@ def run_dip_bot():
 
             if is_pinbar or is_engulfing or is_above_ema:
                 balance = get_available_balance()
-                margin = balance * RISK_PCT_DIP
-                scale = 1000 if symbol.startswith("1000") else 1
-                raw_qty = (margin * LEVERAGE) / (c_close * scale)
-                
-                if scale == 1000 or "SHIB" in symbol or "PEPE" in symbol:
-                    qty_str = str(int(raw_qty))
-                else:
-                    qty_str = f"{round(raw_qty, 2):.2f}"
+                order_value = balance * RISK_PCT_DIP
+                raw_qty = order_value / c_close
+                qty_str = f"{round(raw_qty, 2):.2f}"
 
                 if float(qty_str) <= 0: continue
 
-                sl_price = str(round(c_close * (1 - SL_PCT_DIP), 6))
-                act_price = str(round(c_close * (1 + TRAILING_ACT_PCT_DIP), 6))
-                dist_val = str(round(c_close * TRAILING_DIST_PCT_DIP, 6))
-
                 res_order = session.place_order(
-                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str,
-                    stopLoss=sl_price, tpslMode="Full", slOrderType="Market", positionIdx=0
+                    category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str
                 )
-                time.sleep(1)
-                session.set_trading_stop(
-                    category=CATEGORY, symbol=symbol, trailingStop=dist_val,
-                    activePrice=act_price, positionIdx=0
-                )
-                logging.info(f"🔥 [DIP HUNTER] ZŁOŻONO ZLECENIE DLA {symbol} | Wynik: {res_order}")
+                logging.info(f"🔥 [DIP HUNTER SPOT] ZŁOŻONO ZLECENIE DLA {symbol} | Wynik: {res_order}")
             else:
-                logging.info(f"[DIP - {symbol}] Brak sygnału odbicia.")
+                logging.info(f"[DIP SPOT - {symbol}] Brak sygnału odbicia.")
     except Exception as e:
-        logging.error(f"[DIP HUNTER] Błąd: {e}")
+        logging.error(f"[DIP HUNTER SPOT] Błąd: {e}")
 
 def bot_loop():
     last_ema_check = 0
@@ -220,7 +180,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Multi-Strategy Trading Bot is Running 24/7!")
+        self.wfile.write(b"Multi-Strategy Trading Bot SPOT (EU) is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
