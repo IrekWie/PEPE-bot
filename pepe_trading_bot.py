@@ -7,10 +7,11 @@ import pandas as pd
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KLUCZE API I KONFIGURACJA
+# KONFIGURACJA BOTA HANDLOWEGO (1H - 1000PEPEUSDT)
 # ==============================================================================
 BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
 BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
+TESTNET = False
 
 SYMBOL = "1000PEPEUSDT"
 CATEGORY = "linear"  
@@ -19,8 +20,8 @@ LEVERAGE = 3
 POSITION_SIZE_USDT = 50.0  
 
 LIMIT_CANDLES = 200  
-SL_PERCENT = 0.02    
-TP_PERCENT = 0.04    
+SL_PERCENT = 0.02    # Stop Loss = 2%
+TP_PERCENT = 0.04    # Take Profit = 4%
 
 LOG_FILE = "trade_history.log"
 logging.basicConfig(
@@ -32,9 +33,8 @@ logging.basicConfig(
     ]
 )
 
-# Inicjalizacja sesji z jawnym określeniem konta UTA
 session = HTTP(
-    testnet=False,
+    testnet=TESTNET,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET
 )
@@ -48,7 +48,6 @@ def set_leverage():
             sellLeverage=str(LEVERAGE)
         )
     except Exception as e:
-        # Kod 110043 oznacza, że dźwignia jest już ustawiona na 3x
         if "110043" not in str(e):
             logging.warning(f"Informacja o dźwigni: {e}")
 
@@ -88,7 +87,7 @@ def get_market_data():
 
 def execute_trade(side, close_price):
     raw_qty = (POSITION_SIZE_USDT * LEVERAGE) / (close_price * 1000)
-    qty = int(raw_qty)  
+    qty = int(raw_qty)
 
     if qty <= 0:
         return
@@ -116,13 +115,9 @@ def execute_trade(side, close_price):
         logging.info(f"SUKCES: Złożono zlecenie {side} dla {SYMBOL}!")
     except Exception as e:
         logging.error(f"Błąd zlecenia: {e}")
-        )
-        logging.info(f"SUKCES: Złożono zlecenie {side} dla PEPE!")
-    except Exception as e:
-        logging.error(f"Błąd zlecenia: {e}")
 
 def run_bot():
-    logging.info("=== ANALIZA ŚWIECY GODZINOWEJ (PEPE 1H) ===")
+    logging.info("=== ANALIZA ŚWIECY GODZINOWEJ (1000PEPE 1H) ===")
     set_leverage()
 
     if has_active_position():
