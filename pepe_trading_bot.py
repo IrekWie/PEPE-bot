@@ -45,7 +45,7 @@ logging.basicConfig(
     ]
 )
 
-# Inicjalizacja sesji z wymuszoną synchronizacją czasu (time_sync=True)
+# Inicjalizacja sesji Bybit
 session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
@@ -53,9 +53,27 @@ session = HTTP(
     recv_window=60000
 )
 
+def run_test_order():
+    """Wykonywane jednorazowo przy starcie w celu weryfikacji możliwości składania zleceń."""
+    logging.info("=== [TEST HANDLOWY] PRÓBA WYKONANIA TESTOWEGO ZAKUPU ETHUSDT ===")
+    try:
+        res = session.place_order(
+            category=CATEGORY,
+            symbol="ETHUSDT",
+            side="Buy",
+            orderType="Market",
+            qty="0.003",  # Wartość pozycji ok. 8-10 USD (wymagany depozyt ok. 3 USD przy dźwigni x3)
+            stopLoss="1500",
+            tpslMode="Full",
+            slOrderType="Market",
+            positionIdx=0
+        )
+        logging.info(f"✅ TEST ZAKUPU UDANY! Zlecenie na ETHUSDT zostało złożone na Bybit. Wynik: {res}")
+    except Exception as e:
+        logging.error(f"❌ TEST ZAKUPU NIEUDANY: {e}")
+
 def get_available_balance():
-    """Pobiera dostępne wolne saldo USDT/USDC bez względu na typ konta."""
-    # 1. Próba pobrania salda dla UTA (Unified Trading Account)
+    """Pobiera dostępne wolne saldo USDT/USDC z konta Bybit."""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -67,7 +85,6 @@ def get_available_balance():
     except Exception:
         pass
 
-    # 2. Próba pobrania salda dla standardowego konta Futures (CONTRACT)
     try:
         res = session.get_wallet_balance(accountType="CONTRACT")
         coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
@@ -79,11 +96,10 @@ def get_available_balance():
     except Exception:
         pass
 
-    # 3. Zapasowy odczyt bezpośredni
     return 100.0
 
 def get_market_data(symbol, interval, limit=100):
-    """Pobiera dane kline 15m lub 1h z Bybit."""
+    """Pobiera dane rynkowe z Bybit."""
     try:
         response = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = response.get("result", {}).get("list", [])
@@ -100,7 +116,7 @@ def get_market_data(symbol, interval, limit=100):
         df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
         return df
     except Exception as e:
-        logging.error(f"Błąd pobierania danych rynkowych dla {symbol}: {e}")
+        logging.error(f"Błąd pobierania danych dla {symbol}: {e}")
         return None
 
 # ==============================================================================
@@ -148,7 +164,7 @@ def run_ema_bot():
             else:
                 logging.info(f"[EMA - {symbol}] Brak sygnału.")
         except Exception as e:
-            logging.error(f"[EMA - {symbol}] Błąd zlecenia: {e}")
+            logging.error(f"[EMA - {symbol}] Błąd: {e}")
 
 # ==============================================================================
 # STRATEGIA 2: TOP DIP HUNTER + TRAILING STOP (15M)
@@ -212,6 +228,9 @@ def run_dip_bot():
 # PĘTLA GŁÓWNA I SERWER HEALTH-CHECK
 # ==============================================================================
 def bot_loop():
+    # Wykonaj jednorazowy test zakupu przy uruchomieniu bota
+    run_test_order()
+    
     last_ema_check = 0
     while True:
         try:
