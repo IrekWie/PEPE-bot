@@ -10,12 +10,16 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# KONFIGURACJA BOTA MULTI-STRATEGY (DIRECT BYBIT V5 REST API)
+# KONFIGURACJA BOTA MULTI-STRATEGY (BYBIT V5 REST API)
 # ==============================================================================
-BYBIT_API_KEY = "1DUKhuFk2sZbu4jpqQ"
-BYBIT_API_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
-BASE_URL = "https://api.bybit.com"
+RAW_API_KEY = "1DUKhuFk2sZbu4jpqQ"
+RAW_API_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
 
+# Czyszczenie z ukrytych spacji i znaków nowej linii (\n)
+BYBIT_API_KEY = RAW_API_KEY.strip()
+BYBIT_API_SECRET = RAW_API_SECRET.strip()
+
+BASE_URL = "https://api.bybit.com"
 CATEGORY = "linear"
 LEVERAGE = 3
 
@@ -44,7 +48,7 @@ logging.basicConfig(
 )
 
 # ==============================================================================
-# SZYFROWANIE I KOMUNIKACJA Z API BYBIT V5
+# POPRAWIONY MODUŁ SZYFROWANIA I PODPISU REST API BYBIT V5
 # ==============================================================================
 def get_server_time():
     """Pobiera dokładny czas z serwera Bybit w ms."""
@@ -55,7 +59,7 @@ def get_server_time():
         return str(int(time.time() * 1000))
 
 def send_signed_request(method, endpoint, params=None):
-    """Tworzy i wysyła autoryzowane zapytanie REST z podpisem HMAC-SHA256."""
+    """Generuje matematycznie czysty podpis HMAC-SHA256 bez spacji w JSON."""
     if params is None:
         params = {}
         
@@ -68,6 +72,7 @@ def send_signed_request(method, endpoint, params=None):
         url = f"{BASE_URL}{endpoint}" + (f"?{query_string}" if query_string else "")
         data_to_send = None
     else:
+        # Bardzo ważne: separators=(',', ':') eliminuje spacje wewnątrz formatu JSON
         payload_json = json.dumps(params, separators=(',', ':'))
         payload = timestamp + BYBIT_API_KEY + recv_window + payload_json
         url = f"{BASE_URL}{endpoint}"
@@ -82,6 +87,7 @@ def send_signed_request(method, endpoint, params=None):
     headers = {
         "X-BAPI-API-KEY": BYBIT_API_KEY,
         "X-BAPI-SIGN": signature,
+        "X-BAPI-SIGN-TYPE": "2",
         "X-BAPI-TIMESTAMP": timestamp,
         "X-BAPI-RECV-WINDOW": recv_window,
         "Content-Type": "application/json"
@@ -110,7 +116,7 @@ def run_test_order():
     if res.get("retCode") == 0:
         logging.info(f"✅ TEST ZAKUPU UDANY! Bybit przyjął zlecenie: {res.get('result')}")
     else:
-        logging.error(f"❌ TEST ZAKUPU NIEUDANY: {res}")
+        logging.error(f"❌ TEST ZAKUPU RESULT: {res}")
 
 def get_available_balance():
     """Pobiera wolne saldo USDT/USDC bezpośrednio przez REST API."""
@@ -170,7 +176,7 @@ def run_ema_bot():
             
             candle, prev_candle = df.iloc[-2], df.iloc[-3]
             c_open, c_close = candle['open'], candle['close']
-            c_high, c_low = candle['high'], candle['low']
+            c_high, c_low = candle['low'], candle['low']
             ema21, ema89 = candle['ema21'], candle['ema89']
 
             bullish_trend = ema21 > ema89
