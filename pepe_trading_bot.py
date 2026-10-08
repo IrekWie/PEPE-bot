@@ -10,8 +10,8 @@ from pybit.unified_trading import HTTP
 # ==============================================================================
 # KONFIGURACJA HYBRYDOWEGO BOTA MULTI-STRATEGY (BYBIT V5 UTA)
 # ==============================================================================
-BYBIT_API_KEY = "reD4jltbDxVY9UI2Wb"
-BYBIT_API_SECRET = "ImYwIW5B59XBf59JePHtn8agsXSaoVm7g6Uu"
+BYBIT_API_KEY = "1DUKhuFk2sZbu4jpqQ"
+BYBIT_API_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
 TESTNET = False
 
 CATEGORY = "linear"
