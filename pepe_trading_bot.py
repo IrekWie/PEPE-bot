@@ -9,7 +9,7 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (EMA TREND - MARKET SCANNER)
+# KONFIGURACJA BOTA SPOT (EMA TREND - TOP CAPITALIZATION SCANNER)
 # ==============================================================================
 FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
 FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
@@ -23,7 +23,8 @@ BYBIT_API_SECRET = RAW_SECRET.strip()
 TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (Zgodny z Bybit EU)
 
-# --- USTAWIENIA SKANERA RYNKU ---
+# --- USTAWIENIA SKANERA RYNKU TOP VOLUME/CAP ---
+TOP_MARKETS_COUNT = 50       # Skanuj TOP 50 par o największym wolumenie/kapitalizacji
 MAX_ACTIVE_POSITIONS = 5     # Maksymalnie 5 otwartych pozycji jednocześnie
 RISK_PCT_PER_TRADE = 0.10    # 10% wolnego salda na każdą nową pozycję
 TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od szczytu (Trailing Up)
@@ -67,7 +68,7 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE I POBIERANIE LISTY AKTYWÓW
+# FUNKCJE POMOCNICZE I SELEKCJA TOP KAPITALIZACJI
 # ==============================================================================
 def get_available_balance():
     """Pobiera wolne saldo USDT na koncie SPOT / UNIFIED."""
@@ -81,15 +82,19 @@ def get_available_balance():
         pass
     return 0.0
 
-def get_all_spot_usdt_symbols():
-    """Pobiera wszystkie aktywne pary handlowe USDT z rynku SPOT."""
+def get_top_volume_spot_usdt_symbols(limit_count=TOP_MARKETS_COUNT):
+    """Pobiera pary USDT z rynku SPOT posortowane po największym 24-godzinnym wolumenie obrotu."""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
-        return symbols
+        usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
+        
+        # Sortowanie wg obrotu 24h (turnover24h = cena * wolumen) malejąco
+        sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("turnover24h", 0.0)), reverse=True)
+        top_symbols = [t["symbol"] for t in sorted_tickers[:limit_count]]
+        return top_symbols
     except Exception as e:
-        logging.error(f"Błąd pobierania listy symboli: {e}")
-        return ["PEPEUSDT", "ETHUSDT", "SOLUSDT", "BTCUSDT"]
+        logging.error(f"Błąd pobierania top symboli: {e}")
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "XRPUSDT"]
 
 def get_market_data(symbol, interval="15", limit=100):
     """Pobiera świece i wylicza wskaźniki EMA."""
@@ -112,19 +117,19 @@ def get_market_data(symbol, interval="15", limit=100):
         return None
 
 # ==============================================================================
-# SKANER CAŁEGO RYNKU POD KĄTEM SYGNAŁU EMA (15M)
+# SKANER TOP KAPITALIZACJI POD KĄTEM SYGNAŁU EMA (15M)
 # ==============================================================================
-def scan_market_for_ema_signals():
+def scan_top_market_for_ema_signals():
     global active_positions
 
     if len(active_positions) >= MAX_ACTIVE_POSITIONS:
-        logging.info(f"=== [EMA MARKET SCANNER] Osiągnięto limit {MAX_ACTIVE_POSITIONS} aktywnych pozycji. Pomijam skanowanie. ===")
+        logging.info(f"=== [EMA TOP SCANNER] Osiągnięto limit {MAX_ACTIVE_POSITIONS} aktywnych pozycji. Pomijam skanowanie. ===")
         return
 
-    symbols = get_all_spot_usdt_symbols()
-    logging.info(f"=== [EMA MARKET SCANNER] Rozpoczynam skanowanie {len(symbols)} par SPOT (Interwał: 15M) ===")
+    top_symbols = get_top_volume_spot_usdt_symbols()
+    logging.info(f"=== [EMA TOP SCANNER] Skanowanie TOP {len(top_symbols)} największych par SPOT (15M) ===")
 
-    for symbol in symbols:
+    for symbol in top_symbols:
         if symbol in active_positions: continue
         if len(active_positions) >= MAX_ACTIVE_POSITIONS: break
 
@@ -148,13 +153,12 @@ def scan_market_for_ema_signals():
             if buy_signal:
                 balance = get_available_balance()
                 if balance < 5.0:
-                    logging.warning("Brak wystarczającego salda USDT na otworzenie pozycji.")
+                    logging.warning("Brak wystarczającego salda USDT na otwarcie pozycji.")
                     break
 
                 order_val = balance * RISK_PCT_PER_TRADE
                 raw_qty = order_val / c_close
 
-                # Dostosowanie zaokrąglenia dla kryptowalut memowych / z niską ceną
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
                 if float(qty_str) <= 0: continue
@@ -167,7 +171,7 @@ def scan_market_for_ema_signals():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [EMA MARKET KUPNO] Wykryto sygnał na {symbol}! Kupiono za 10% salda | Ilość: {qty_str} po cenie {c_close}")
+                    logging.info(f"🔥 [EMA TOP KUPNO] Wykryto sygnał na {symbol}! Kupiono za 10% salda | Ilość: {qty_str} po cenie {c_close}")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
@@ -233,7 +237,7 @@ def monitor_and_close_positions():
 def bot_loop():
     while True:
         try:
-            scan_market_for_ema_signals()
+            scan_top_market_for_ema_signals()
             monitor_and_close_positions()
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
@@ -252,7 +256,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit SPOT Full Market EMA Scanner Bot is Running 24/7!")
+        self.wfile.write(b"Bybit SPOT Top Volume EMA Scanner Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
