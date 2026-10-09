@@ -9,7 +9,7 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (EMA TOP 150 + DIP + PUMP z RSI & VOL)
+# KONFIGURACJA BOTA SPOT (PUMP FULL MARKET + EMA TOP 150 + DIP HUNTER)
 # ==============================================================================
 FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
 FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
@@ -24,7 +24,7 @@ TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
 
 # --- USTAWIENIA SKANOWANIA ---
-TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par o największym wolumenie
+TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par pod kątem EMA Trend
 TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
 MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
 MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
@@ -91,7 +91,17 @@ def get_available_balance():
         pass
     return 0.0
 
+def get_all_spot_usdt_symbols():
+    """Pobiera WSZYSTKIE dostępne pary USDT z rynku SPOT."""
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        return [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
+    except Exception as e:
+        logging.error(f"Błąd pobierania wszystkich symboli: {e}")
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "STRKUSDT"]
+
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
+    """Pobiera TOP 150 par USDT z rynku SPOT posortowanych po wolumenie obrotu."""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
@@ -112,7 +122,6 @@ def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
         return []
 
 def calculate_rsi(series, period=14):
-    """Wylicza wskaźnik RSI z podanego szeregu cen zamknięcia."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -120,9 +129,8 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def get_market_data(symbol, interval="15", limit=100):
-    """Pobiera świece, wylicza EMA, RSI oraz Średni Wolumen."""
     try:
-        time.sleep(0.12)
+        time.sleep(0.08)  # Optymalizacja dla szybkiego skanowania
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
         if not candles: return None
@@ -132,7 +140,6 @@ def get_market_data(symbol, interval="15", limit=100):
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
 
-        # Wskaźniki
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
@@ -145,7 +152,7 @@ def get_market_data(symbol, interval="15", limit=100):
         return None
 
 # ==============================================================================
-# STRATEGIA 1: MOMENTUM PUMP HUNTER (Z RSI & VOL - TOP 150)
+# STRATEGIA 1: MOMENTUM PUMP HUNTER (FULL MARKET SCAN)
 # ==============================================================================
 def scan_for_pumps():
     global active_positions
@@ -154,10 +161,11 @@ def scan_for_pumps():
     if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
         return
 
-    symbols = get_top_volume_symbols()
-    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (TOP {len(symbols)} - Wybicia z RSI & VOL) ===")
+    # Skanowanie CAŁEJ giełdy SPOT
+    all_symbols = get_all_spot_usdt_symbols()
+    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (SKANOWANIE CAŁEJ GIEŁDY: {len(all_symbols)} PAR) ===")
 
-    for symbol in symbols:
+    for symbol in all_symbols:
         if symbol in active_positions: continue
         if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
@@ -165,7 +173,7 @@ def scan_for_pumps():
             df = get_market_data(symbol, interval="15")
             if df is None or len(df) < 25: continue
 
-            candle = df.iloc[-2]  # Ostatnia zamknięta świeca
+            candle = df.iloc[-2]
             c_open, c_close = candle['open'], candle['close']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
             c_rsi = candle['rsi']
@@ -260,7 +268,7 @@ def run_dip_hunter_strategy():
             logging.error(f"Błąd analizy dipu {symbol}: {e}")
 
 # ==============================================================================
-# STRATEGIA 3: EMA TREND SCANNER (Z RSI & VOL - TOP 150)
+# STRATEGIA 3: EMA TREND SCANNER (TOP 150)
 # ==============================================================================
 def scan_top150_for_ema_signals():
     global active_positions
@@ -381,13 +389,13 @@ def monitor_and_close_positions():
 def bot_loop():
     while True:
         try:
-            scan_for_pumps()               # 1. Szukaj pomp w TOP 150
+            scan_for_pumps()               # 1. Szukaj pomp na CAŁEJ GIEŁDZIE SPOT
             run_dip_hunter_strategy()      # 2. Szukaj 4 największych spadków
             scan_top150_for_ema_signals()  # 3. Skanuj TOP 150 pod kątem EMA
             monitor_and_close_positions()  # 4. Prowadź pozycje
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
-        time.sleep(3 * 60) # Skanowanie co 3 minuty
+        time.sleep(3 * 60)
 
 def self_ping_loop():
     while True:
@@ -402,7 +410,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit SPOT Triple-Strategy Bot (TOP 150 + RSI/VOL) is Running 24/7!")
+        self.wfile.write(b"Bybit SPOT Full Market Pump + EMA TOP 150 Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
