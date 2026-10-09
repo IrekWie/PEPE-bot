@@ -24,7 +24,7 @@ TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (Zgodny z Bybit EU)
 
 # --- USTAWIENIA SKANERA RYNKU TOP VOLUME/CAP ---
-TOP_MARKETS_COUNT = 50       # Skanuj TOP 50 par o największym wolumenie/kapitalizacji
+TOP_MARKETS_COUNT = 100       # Skanuj TOP 1000 par o największym wolumenie/kapitalizacji
 MAX_ACTIVE_POSITIONS = 5     # Maksymalnie 5 otwartych pozycji jednocześnie
 RISK_PCT_PER_TRADE = 0.10    # 10% wolnego salda na każdą nową pozycję
 TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od szczytu (Trailing Up)
