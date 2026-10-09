@@ -9,7 +9,7 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (EMA TREND 15M + TOP DIP HUNTER TRAILING UP)
+# KONFIGURACJA BOTA SPOT (EMA TREND - MARKET SCANNER)
 # ==============================================================================
 FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
 FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
@@ -21,20 +21,13 @@ BYBIT_API_KEY = RAW_KEY.strip()
 BYBIT_API_SECRET = RAW_SECRET.strip()
 
 TESTNET = False
-CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
+CATEGORY = "spot"  # Rynek SPOT (Zgodny z Bybit EU)
 
-# --- 1. USTAWIENIA EMA TREND (15M) - DOKŁADNE PROCENTY ---
-ASSETS_EMA = {
-    "PEPEUSDT": {"risk_pct": 0.25, "qty_decimals": 0},  # 25% salda
-    "ETHUSDT":  {"risk_pct": 0.12, "qty_decimals": 4},  # 12% salda
-    "SOLUSDT":  {"risk_pct": 0.13, "qty_decimals": 2}   # 13% salda
-}
-
-# --- 2. USTAWIENIA TOP DIP HUNTER SPOT (15M) ---
-TOP_DIPS_COUNT = 4           # Maksymalnie 4 monety o największej stracie 24h
-RISK_PCT_DIP = 0.10          # Dokładnie 10% salda na każdą monetę w spadek (łącznie do 40%)
-TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od najwyższego szczytu (Trailing Stop)
-HARD_STOP_LOSS_PCT = 0.02    # Sztywny Stop Loss -2% od ceny wejścia
+# --- USTAWIENIA SKANERA RYNKU ---
+MAX_ACTIVE_POSITIONS = 5     # Maksymalnie 5 otwartych pozycji jednocześnie
+RISK_PCT_PER_TRADE = 0.10    # 10% wolnego salda na każdą nową pozycję
+TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od szczytu (Trailing Up)
+HARD_STOP_LOSS_PCT = 0.02    # Sztywny Stop Loss -2% od ceny zakupu
 
 APP_URL = "https://pepe-trading-bot-ujqx.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
@@ -74,7 +67,7 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE
+# FUNKCJE POMOCNICZE I POBIERANIE LISTY AKTYWÓW
 # ==============================================================================
 def get_available_balance():
     """Pobiera wolne saldo USDT na koncie SPOT / UNIFIED."""
@@ -88,10 +81,20 @@ def get_available_balance():
         pass
     return 0.0
 
-def get_market_data(symbol, interval="15", limit=100):
-    """Pobiera świece i wylicza EMA."""
+def get_all_spot_usdt_symbols():
+    """Pobiera wszystkie aktywne pary handlowe USDT z rynku SPOT."""
     try:
-        time.sleep(0.2)
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
+        return symbols
+    except Exception as e:
+        logging.error(f"Błąd pobierania listy symboli: {e}")
+        return ["PEPEUSDT", "ETHUSDT", "SOLUSDT", "BTCUSDT"]
+
+def get_market_data(symbol, interval="15", limit=100):
+    """Pobiera świece i wylicza wskaźniki EMA."""
+    try:
+        time.sleep(0.15)  # Pauza chroniąca przed API Rate Limit
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
         if not candles: return None
@@ -101,22 +104,30 @@ def get_market_data(symbol, interval="15", limit=100):
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
 
-        df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
         return df
     except Exception as e:
-        logging.error(f"Błąd danych {symbol}: {e}")
+        logging.error(f"Błąd pobierania danych dla {symbol}: {e}")
         return None
 
 # ==============================================================================
-# STRATEGIA 1: EMA TREND (15M) - DLA PEPE (25%), ETH (12%), SOL (13%)
+# SKANER CAŁEGO RYNKU POD KĄTEM SYGNAŁU EMA (15M)
 # ==============================================================================
-def run_ema_strategy():
+def scan_market_for_ema_signals():
     global active_positions
-    logging.info("=== [STRATEGIA 1] ANALIZA EMA TREND SPOT (PEPE 25%, ETH 12%, SOL 13% - 15M) ===")
 
-    for symbol, config in ASSETS_EMA.items():
+    if len(active_positions) >= MAX_ACTIVE_POSITIONS:
+        logging.info(f"=== [EMA MARKET SCANNER] Osiągnięto limit {MAX_ACTIVE_POSITIONS} aktywnych pozycji. Pomijam skanowanie. ===")
+        return
+
+    symbols = get_all_spot_usdt_symbols()
+    logging.info(f"=== [EMA MARKET SCANNER] Rozpoczynam skanowanie {len(symbols)} par SPOT (Interwał: 15M) ===")
+
+    for symbol in symbols:
+        if symbol in active_positions: continue
+        if len(active_positions) >= MAX_ACTIVE_POSITIONS: break
+
         try:
             df = get_market_data(symbol, interval="15")
             if df is None or len(df) < 5: continue
@@ -126,6 +137,7 @@ def run_ema_strategy():
             c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
             ema21, ema89 = candle['ema21'], candle['ema89']
 
+            # Warunki sygnału EMA Trend
             bullish_trend = ema21 > ema89
             in_value_zone = (c_low <= max(ema21, ema89)) and (c_low >= min(ema21, ema89))
             bullish_pinbar = (c_close > c_open) and ((c_open - c_low) > (c_close - c_open) * 1.5)
@@ -133,70 +145,16 @@ def run_ema_strategy():
 
             buy_signal = bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing)
 
-            # KUPNO EMA
-            if symbol not in active_positions and buy_signal:
+            if buy_signal:
                 balance = get_available_balance()
-                if balance < 5.0: continue
+                if balance < 5.0:
+                    logging.warning("Brak wystarczającego salda USDT na otworzenie pozycji.")
+                    break
 
-                order_val = balance * config["risk_pct"]
+                order_val = balance * RISK_PCT_PER_TRADE
                 raw_qty = order_val / c_close
-                decimals = config["qty_decimals"]
-                qty_str = str(int(raw_qty)) if decimals == 0 else f"{round(raw_qty, decimals):.{decimals}f}"
 
-                if float(qty_str) <= 0: continue
-
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
-                if res.get("retCode") == 0:
-                    active_positions[symbol] = {
-                        "strategy": "EMA",
-                        "buy_price": c_close,
-                        "peak_price": c_close,
-                        "qty": qty_str
-                    }
-                    save_positions(active_positions)
-                    logging.info(f"🔥 [EMA KUPNO 15M - {symbol}] Kupiono za {config['risk_pct']*100}% salda | Ilość: {qty_str} po {c_close}")
-                else:
-                    logging.error(f"❌ Błąd zakupu {symbol}: {res}")
-            else:
-                logging.info(f"[EMA - {symbol}] Brak sygnału kupna.")
-
-        except Exception as e:
-            logging.error(f"[EMA - {symbol}] Błąd: {e}")
-
-# ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER SPOT (4 TOP SPADKI - 10% SALDA / POZYCJA)
-# ==============================================================================
-def run_dip_hunter_strategy():
-    global active_positions
-    logging.info("=== [STRATEGIA 2] TOP DIP HUNTER SPOT (4 TOP SPADKI - 10% SALDA / POZYCJA) ===")
-
-    try:
-        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("price24hPcnt", 0.0)))
-        top_losers = [t["symbol"] for t in sorted_tickers[:TOP_DIPS_COUNT]]
-
-        for symbol in top_losers:
-            if symbol in active_positions: continue
-
-            df = get_market_data(symbol, interval="15")
-            if df is None or len(df) < 5: continue
-
-            candle, prev_candle = df.iloc[-2], df.iloc[-3]
-            c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
-
-            body = abs(c_close - c_open)
-            lower_wick = min(c_open, c_close) - c_low
-            is_pinbar = lower_wick > (body * 2.0) and (c_close > c_open)
-            is_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
-            is_above_ema = (c_close > candle['ema9']) and (prev_candle['close'] <= prev_candle['ema9'])
-
-            if is_pinbar or is_engulfing or is_above_ema:
-                balance = get_available_balance()
-                if balance < 5.0: continue
-
-                order_val = balance * RISK_PCT_DIP
-                raw_qty = order_val / c_close
+                # Dostosowanie zaokrąglenia dla kryptowalut memowych / z niską ceną
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
                 if float(qty_str) <= 0: continue
@@ -204,21 +162,20 @@ def run_dip_hunter_strategy():
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
                 if res.get("retCode") == 0:
                     active_positions[symbol] = {
-                        "strategy": "DIP_TRAILING",
                         "buy_price": c_close,
                         "peak_price": c_close,
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [DIP HUNTER KUPNO - {symbol}] Kupiono za 10% salda | Ilość: {qty_str} po {c_close}")
-            else:
-                logging.info(f"[DIP - {symbol}] Brak sygnału odbicia.")
+                    logging.info(f"🔥 [EMA MARKET KUPNO] Wykryto sygnał na {symbol}! Kupiono za 10% salda | Ilość: {qty_str} po cenie {c_close}")
+                else:
+                    logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
-    except Exception as e:
-        logging.error(f"[DIP HUNTER] Błąd: {e}")
+        except Exception as e:
+            logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (TRAILING UP LOGIC)
+# MONITOROWANIE I SPRZEDAŻ (TRAILING UP)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -237,17 +194,16 @@ def monitor_and_close_positions():
             peak_price = pos.get("peak_price", buy_price)
             qty_to_sell = pos["qty"]
 
-            # 1. Aktualizacja najwyższego szczytu pozycji (Trailing Up)
+            # Aktualizacja szczytu cenowego
             if current_price > peak_price:
                 pos["peak_price"] = current_price
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt pozycji: {current_price} USDT")
 
-            # 2. Wyliczenie odchyleń cenowych
             drop_from_peak = (pos["peak_price"] - current_price) / pos["peak_price"]
             total_pnl = (current_price - buy_price) / buy_price
 
-            # 3. Warunki sprzedaży SPOT
+            # Warunki sprzedaży SPOT
             trailing_sell = drop_from_peak >= TRAILING_DROP_PCT and current_price > buy_price
             stop_loss_sell = total_pnl <= -HARD_STOP_LOSS_PCT
 
@@ -256,7 +212,7 @@ def monitor_and_close_positions():
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
 
                 if res.get("retCode") == 0:
-                    logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Sprzedano | Powód: {reason} | Wynik PnL: {total_pnl*100:.2f}%")
+                    logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Sprzedano | Powód: {reason} | PnL: {total_pnl*100:.2f}%")
                     symbols_to_delete.append(symbol)
                 else:
                     logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
@@ -277,8 +233,7 @@ def monitor_and_close_positions():
 def bot_loop():
     while True:
         try:
-            run_dip_hunter_strategy()
-            run_ema_strategy()
+            scan_market_for_ema_signals()
             monitor_and_close_positions()
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
@@ -297,7 +252,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit SPOT Multi-Strategy Bot + Trailing Up is Active 24/7!")
+        self.wfile.write(b"Bybit SPOT Full Market EMA Scanner Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
