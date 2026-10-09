@@ -9,7 +9,7 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (EMA TREND + TOP DIP HUNTER TRAILING UP)
+# KONFIGURACJA BOTA SPOT (EMA TREND 15M + TOP DIP HUNTER TRAILING UP)
 # ==============================================================================
 FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
 FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
@@ -23,7 +23,7 @@ BYBIT_API_SECRET = RAW_SECRET.strip()
 TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
 
-# --- 1. USTAWIENIA EMA TREND (1H) - DOKŁADNE PROCENTY ---
+# --- 1. USTAWIENIA EMA TREND (15M) - DOKŁADNE PROCENTY ---
 ASSETS_EMA = {
     "PEPEUSDT": {"risk_pct": 0.25, "qty_decimals": 0},  # 25% salda
     "ETHUSDT":  {"risk_pct": 0.12, "qty_decimals": 4},  # 12% salda
@@ -32,7 +32,7 @@ ASSETS_EMA = {
 
 # --- 2. USTAWIENIA TOP DIP HUNTER SPOT (15M) ---
 TOP_DIPS_COUNT = 4           # Maksymalnie 4 monety o największej stracie 24h
-RISK_PCT_DIP = 0.10          # Dokładnie 10% salda na każdą monete w spadek (łącznie do 40%)
+RISK_PCT_DIP = 0.10          # Dokładnie 10% salda na każdą monetę w spadek (łącznie do 40%)
 TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od najwyższego szczytu (Trailing Stop)
 HARD_STOP_LOSS_PCT = 0.02    # Sztywny Stop Loss -2% od ceny wejścia
 
@@ -110,15 +110,15 @@ def get_market_data(symbol, interval="15", limit=100):
         return None
 
 # ==============================================================================
-# STRATEGIA 1: EMA TREND (1H) - DLA PEPE (25%), ETH (12%), SOL (13%)
+# STRATEGIA 1: EMA TREND (15M) - DLA PEPE (25%), ETH (12%), SOL (13%)
 # ==============================================================================
 def run_ema_strategy():
     global active_positions
-    logging.info("=== [STRATEGIA 1] ANALIZA EMA TREND SPOT (PEPE 25%, ETH 12%, SOL 13%) ===")
+    logging.info("=== [STRATEGIA 1] ANALIZA EMA TREND SPOT (PEPE 25%, ETH 12%, SOL 13% - 15M) ===")
 
     for symbol, config in ASSETS_EMA.items():
         try:
-            df = get_market_data(symbol, interval="60")
+            df = get_market_data(symbol, interval="15")
             if df is None or len(df) < 5: continue
 
             candle = df.iloc[-2]
@@ -154,7 +154,7 @@ def run_ema_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [EMA KUPNO - {symbol}] Kupiono za {config['risk_pct']*100}% salda | Ilość: {qty_str} po {c_close}")
+                    logging.info(f"🔥 [EMA KUPNO 15M - {symbol}] Kupiono za {config['risk_pct']*100}% salda | Ilość: {qty_str} po {c_close}")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
             else:
@@ -164,7 +164,7 @@ def run_ema_strategy():
             logging.error(f"[EMA - {symbol}] Błąd: {e}")
 
 # ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER SPOT (4 TOP SPADKI - KAŻDY PO 10% SALDA)
+# STRATEGIA 2: TOP DIP HUNTER SPOT (4 TOP SPADKI - 10% SALDA / POZYCJA)
 # ==============================================================================
 def run_dip_hunter_strategy():
     global active_positions
@@ -195,7 +195,7 @@ def run_dip_hunter_strategy():
                 balance = get_available_balance()
                 if balance < 5.0: continue
 
-                order_val = balance * RISK_PCT_DIP  # Exactly 10% per dip position
+                order_val = balance * RISK_PCT_DIP
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
