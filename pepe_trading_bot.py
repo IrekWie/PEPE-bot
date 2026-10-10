@@ -61,7 +61,8 @@ try:
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
-        recv_window=20000  # Zwiększona tolerancja czasu serwera do 20 sekund (kluczowe dla Render)
+        recv_window=60000,  # Maksymalna dopuszczalna tolerancja czasu (60 sekund)
+        base_url="https://api.bytick.com"  # Alternatywna, oficjalna domena Bybit omijająca główne filtry IP
     )
 except Exception as e:
     logging.error(f"Błąd inicjalizacji sesji Bybit: {e}")
