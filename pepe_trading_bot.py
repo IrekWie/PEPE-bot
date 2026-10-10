@@ -58,7 +58,7 @@ session = HTTP(
     testnet=TESTNET,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
-    recv_window=20000
+    recv_window=20000  # Zwiększona tolerancja czasu serwera do 20 sekund
 )
 
 # ==============================================================================
