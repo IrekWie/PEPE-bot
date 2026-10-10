@@ -24,6 +24,29 @@ BYBIT_API_SECRET = RAW_SECRET.strip()
 print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
 print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
 
+import hmac
+import hashlib
+
+print("--- START RAW DIAGNOSTIC ---", flush=True)
+try:
+    timestamp = str(int(time.time() * 1000))
+    recv_window_str = "60000"
+    params = "accountType=UNIFIED"
+    param_str = timestamp + BYBIT_API_KEY + recv_window_str + params
+    signature = hmac.new(bytes(BYBIT_API_SECRET, "utf-8"), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window_str
+    }
+    raw_res = requests.get("https://api.bybit.com/v5/account/wallet-balance?accountType=UNIFIED", headers=headers)
+    print(f"🔥 RAW BYBIT RESPONSE: {raw_res.status_code} -> {raw_res.text}", flush=True)
+except Exception as e:
+    print(f"DIAGNOSTIC ERROR: {e}", flush=True)
+print("--- END RAW DIAGNOSTIC ---", flush=True)
+
 TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
 
