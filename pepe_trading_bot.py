@@ -9,13 +9,14 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (PUMP FULL MARKET + EMA TOP 150 + DIP HUNTER)
+# KONFIGURACJA BOTA SPOT 
 # ==============================================================================
-FALLBACK_KEY = "1DUKhuFk2sZbu4jpqQ"
-FALLBACK_SECRET = "PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl"
+FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
+FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
 
-RAW_KEY = os.environ.get("1DUKhuFk2sZbu4jpqQ", FALLBACK_KEY)
-RAW_SECRET = os.environ.get("PrhWFT0KFql7RHQWtAhN5kBOFfyjRyXJb8Yl", FALLBACK_SECRET)
+# Poniżej mają być słowa "BYBIT_API_KEY", a nie Twój właściwy klucz!
+RAW_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY)
+RAW_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET)
 
 BYBIT_API_KEY = RAW_KEY.strip()
 BYBIT_API_SECRET = RAW_SECRET.strip()
