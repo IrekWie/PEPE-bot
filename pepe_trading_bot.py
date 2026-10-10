@@ -20,8 +20,10 @@ RAW_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET)
 
 BYBIT_API_KEY = RAW_KEY.strip()
 BYBIT_API_SECRET = RAW_SECRET.strip()
+
 print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
 print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
+
 TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
 
@@ -54,12 +56,15 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-session = HTTP(
-    testnet=TESTNET,
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
-    recv_window=20000  # Zwiększona tolerancja czasu serwera do 20 sekund
-)
+try:
+    session = HTTP(
+        testnet=TESTNET,
+        api_key=BYBIT_API_KEY,
+        api_secret=BYBIT_API_SECRET,
+        recv_window=20000  # Zwiększona tolerancja czasu serwera do 20 sekund (kluczowe dla Render)
+    )
+except Exception as e:
+    logging.error(f"Błąd inicjalizacji sesji Bybit: {e}")
 
 # ==============================================================================
 # ZARZĄDZANIE PAMIĘCIĄ POZYCJI SPOT (JSON)
@@ -104,7 +109,7 @@ def get_balances():
                 
         return total_equity, free_usdt
     except Exception as e:
-        logging.error(f"Błąd pobierania salda: {e}")
+        logging.error(f"Błąd pobierania salda (Sprawdź autoryzację): {e}")
         return 0.0, 0.0
 
 def get_all_spot_usdt_symbols():
@@ -175,14 +180,12 @@ def scan_for_pumps():
     if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
         return
 
-    # Wyliczenie wartości zakupu na podstawie 15% CAŁEGO equity
     total_equity, free_usdt = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     all_symbols = get_all_spot_usdt_symbols()
     logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (SKANOWANIE CAŁEJ GIEŁDY: {len(all_symbols)} PAR) ===")
 
-    # Weryfikacja czy posiadamy wolne środki przed odpytaniem serwerów Bybit
     if free_usdt < order_val:
         logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT (15% konta / Min. {MIN_ORDER_VALUE}), dostępne wolne saldo to {free_usdt:.2f} USDT.")
         return
