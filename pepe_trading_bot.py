@@ -28,7 +28,10 @@ TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par pod kątem EMA Trend
 TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
 MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
 MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
-RISK_PCT_PER_TRADE = 0.15    # 15% wolnego salda na pozycję (lub min. 6 USDT)
+
+# --- ZARZĄDZANIE KAPITAŁEM ---
+RISK_PCT_PER_TRADE = 0.15    # 15% CAŁKOWITEJ wartości konta na każdą pozycję
+MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USD
 
 # Progi Zabezpieczające (Trailing Up SPOT)
 TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od najwyższego szczytu
@@ -78,21 +81,31 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE, RSI & VOL
+# FUNKCJE POMOCNICZE, SALDO, RSI & VOL
 # ==============================================================================
-def get_available_balance():
+def get_balances():
+    """Zwraca dwuelementową krotkę: (Całkowita wartość konta w USD, Wolne środki USDT)"""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
-        coins = res.get("result", {}).get("list", [{}])[0].get("coin", [])
-        for coin in coins:
+        account_data = res.get("result", {}).get("list", [{}])[0]
+        
+        # Całkowite equity (wszystkie aktywa razem) w USD
+        total_equity = float(account_data.get("totalEquity", 0.0))
+        
+        # Dostępne wolne środki w walucie bazowej (USDT)
+        free_usdt = 0.0
+        for coin in account_data.get("coin", []):
             if coin.get("coin") == "USDT":
-                return float(coin.get("equity", 0.0))
-    except Exception:
-        pass
-    return 0.0
+                # 'availableToWithdraw' precyzyjnie określa wolną gotówkę bez dźwigni
+                free_usdt = float(coin.get("availableToWithdraw", coin.get("equity", 0.0)))
+                break
+                
+        return total_equity, free_usdt
+    except Exception as e:
+        logging.error(f"Błąd pobierania salda: {e}")
+        return 0.0, 0.0
 
 def get_all_spot_usdt_symbols():
-    """Pobiera WSZYSTKIE dostępne pary USDT z rynku SPOT."""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         return [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
@@ -101,7 +114,6 @@ def get_all_spot_usdt_symbols():
         return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "STRKUSDT"]
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
-    """Pobiera TOP 150 par USDT z rynku SPOT posortowanych po wolumenie obrotu."""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
@@ -161,9 +173,17 @@ def scan_for_pumps():
     if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
         return
 
-    # Skanowanie CAŁEJ giełdy SPOT
+    # Wyliczenie wartości zakupu na podstawie 15% CAŁEGO equity
+    total_equity, free_usdt = get_balances()
+    order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
+
     all_symbols = get_all_spot_usdt_symbols()
     logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (SKANOWANIE CAŁEJ GIEŁDY: {len(all_symbols)} PAR) ===")
+
+    # Weryfikacja czy posiadamy wolne środki przed odpytaniem serwerów Bybit
+    if free_usdt < order_val:
+        logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT (15% konta / Min. {MIN_ORDER_VALUE}), dostępne wolne saldo to {free_usdt:.2f} USDT.")
+        return
 
     for symbol in all_symbols:
         if symbol in active_positions: continue
@@ -183,10 +203,7 @@ def scan_for_pumps():
             rsi_valid = 45 <= c_rsi <= 75
 
             if price_change >= PUMP_PRICE_CHANGE_PCT and volume_spike and rsi_valid:
-                balance = get_available_balance()
-                if balance < 5.0: break
-
-                order_val = max(balance * RISK_PCT_PER_TRADE, 6.0)
+                
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
@@ -216,8 +233,15 @@ def run_dip_hunter_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
 
+    total_equity, free_usdt = get_balances()
+    order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
+
     top_losers = get_top_losers_symbols()
     logging.info("=== [STRATEGIA 2] TOP DIP HUNTER (4 Spadki SPOT z RSI & VOL) ===")
+
+    if free_usdt < order_val:
+        logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT, dostępne wolne saldo to {free_usdt:.2f} USDT.")
+        return
 
     for symbol in top_losers:
         if symbol in active_positions: continue
@@ -242,10 +266,7 @@ def run_dip_hunter_strategy():
             rsi_confirmed = c_rsi <= 55
 
             if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
-                balance = get_available_balance()
-                if balance < 5.0: break
-
-                order_val = max(balance * RISK_PCT_PER_TRADE, 6.0)
+                
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
@@ -274,8 +295,15 @@ def scan_top150_for_ema_signals():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
 
+    total_equity, free_usdt = get_balances()
+    order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
+
     top_symbols = get_top_volume_symbols()
     logging.info(f"=== [STRATEGIA 3] EMA TREND SCANNER TOP {len(top_symbols)} (Z RSI & VOL) ===")
+
+    if free_usdt < order_val:
+        logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT, dostępne wolne saldo to {free_usdt:.2f} USDT.")
+        return
 
     for symbol in top_symbols:
         if symbol in active_positions: continue
@@ -301,10 +329,7 @@ def scan_top150_for_ema_signals():
             vol_ok = c_vol >= vol_ma
 
             if bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing) and rsi_ok and vol_ok:
-                balance = get_available_balance()
-                if balance < 5.0: break
-
-                order_val = max(balance * RISK_PCT_PER_TRADE, 6.0)
+                
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
@@ -389,10 +414,10 @@ def monitor_and_close_positions():
 def bot_loop():
     while True:
         try:
-            scan_for_pumps()               # 1. Szukaj pomp na CAŁEJ GIEŁDZIE SPOT
-            run_dip_hunter_strategy()      # 2. Szukaj 4 największych spadków
-            scan_top150_for_ema_signals()  # 3. Skanuj TOP 150 pod kątem EMA
-            monitor_and_close_positions()  # 4. Prowadź pozycje
+            scan_for_pumps()               
+            run_dip_hunter_strategy()      
+            scan_top150_for_ema_signals()  
+            monitor_and_close_positions()  
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
         time.sleep(3 * 60)
@@ -410,7 +435,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit SPOT Full Market Pump + EMA TOP 150 Bot is Running 24/7!")
+        self.wfile.write(b"Bybit SPOT Bot (Equity Sizing 15% / Min 100$) is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
