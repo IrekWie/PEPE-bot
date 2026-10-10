@@ -20,9 +20,8 @@ RAW_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET)
 
 BYBIT_API_KEY = RAW_KEY.strip()
 BYBIT_API_SECRET = RAW_SECRET.strip()
-print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})")
-print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})")
-
+print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
+print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
 TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
 
