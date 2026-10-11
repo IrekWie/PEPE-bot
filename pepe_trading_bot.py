@@ -12,10 +12,10 @@ from pybit.unified_trading import HTTP
 # ==============================================================================
 # OCHRONA PRZED ZAWIESZENIEM POŁĄCZEŃ SIECIOWYCH (SOCKET TIMEOUT)
 # ==============================================================================
-socket.setdefaulttimeout(15)  # Maksymalnie 15 sekund na dowolną odpowiedź sieciową
+socket.setdefaulttimeout(15)  # Maksymalnie 15 sekund na odpowiedź sieciową
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT 
+# KONFIGURACJA BOTA SPOT (RYNEK USDC - MICA COMPLIANT)
 # ==============================================================================
 FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
 FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
@@ -28,16 +28,17 @@ print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_
 
 TESTNET = False
 CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
+QUOTE_COIN = "USDC" # Waluta bazowa do handlu
 
 # --- USTAWIENIA SKANOWANIA ---
-TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par pod kątem EMA Trend
+TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par USDC
 TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
 MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
 MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
 
 # --- ZARZĄDZANIE KAPITAŁEM ---
 RISK_PCT_PER_TRADE = 0.15    # 15% CAŁKOWITEJ wartości konta na każdą pozycję
-MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USD
+MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USD/USDC
 
 # Progi Zabezpieczające (Trailing Up SPOT)
 TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od najwyższego szczytu
@@ -134,10 +135,49 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE, SALDO, RSI & VOL
+# AUTOMATYCZNA BEZSTRATNA KONWERSJA USDT -> USDC NA START
+# ==============================================================================
+def auto_convert_usdt_to_usdc():
+    if not session: return
+    try:
+        res = session.get_wallet_balance(accountType="UNIFIED")
+        if res.get("retCode") != 0: return
+
+        account_list = res.get("result", {}).get("list", [])
+        if not account_list: return
+
+        usdt_avail = 0.0
+        for coin in account_list[0].get("coin", []):
+            if coin.get("coin") == "USDT":
+                avail = coin.get("availableToWithdraw")
+                eq = coin.get("equity")
+                usdt_avail = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
+                break
+
+        if usdt_avail >= 20.0:
+            logging.info(f"🔄 Wykryto {usdt_avail:.2f} USDT na koncie UTA. Automatycznie zamieniam na USDC na rynku SPOT...")
+            qty_usdt = str(int(usdt_avail - 1.0))  # Zostawiamy $1 na ewentualną opłatę
+            
+            order_res = session.place_order(
+                category=CATEGORY,
+                symbol="USDCUSDT",
+                side="Buy",
+                orderType="Market",
+                qty=qty_usdt
+            )
+            if order_res.get("retCode") == 0:
+                logging.info(f"✅ SUKCES! Zamieniono {qty_usdt} USDT na USDC po kursie 1:1 na rynku SPOT!")
+                time.sleep(3)
+            else:
+                logging.error(f"❌ Błąd automatycznej konwersji USDT->USDC: {order_res}")
+    except Exception as e:
+        logging.error(f"Błąd podczas sprawdzania/konwersji salda USDT: {e}")
+
+# ==============================================================================
+# FUNKCJE POMOCNICZE, SALDO USDC, RSI & VOL
 # ==============================================================================
 def get_balances():
-    """Zwraca dwuelementową krotkę: (Całkowita wartość konta w USD, Wolne środki USDT)"""
+    """Zwraca dwuelementową krotkę: (Całkowita wartość konta w USD, Wolne środki USDC)"""
     if not session:
         logging.error("Sesja Bybit nie została poprawnie utworzona.")
         return 0.0, 0.0
@@ -156,63 +196,63 @@ def get_balances():
 
         account_data = account_list[0]
         total_equity = safe_float(account_data.get("totalEquity"))
-        free_usdt = 0.0
+        free_usdc = 0.0
         
         for coin in account_data.get("coin", []):
-            if coin.get("coin") == "USDT":
+            if coin.get("coin") == QUOTE_COIN:
                 avail = coin.get("availableToWithdraw")
                 eq = coin.get("equity")
-                free_usdt = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
+                free_usdc = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
                 break
                 
-        return total_equity, free_usdt
+        return total_equity, free_usdc
     except Exception as e:
         logging.error(f"Błąd pobierania salda: {e}")
         return 0.0, 0.0
 
-def get_all_spot_usdt_symbols():
+def get_all_spot_usdc_symbols():
     symbols = []
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
+        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") != "USDTUSDC"]
     except Exception as e:
         logging.warning(f"Nie udało się pobrać z get_tickers: {e}")
 
     if not symbols:
         try:
             instruments = session.get_instruments_info(category=CATEGORY).get("result", {}).get("list", [])
-            symbols = [i["symbol"] for i in instruments if i.get("symbol", "").endswith("USDT") and i.get("status") == "Trading"]
+            symbols = [i["symbol"] for i in instruments if i.get("symbol", "").endswith(QUOTE_COIN) and i.get("status") == "Trading"]
         except Exception as e:
             logging.warning(f"Nie udało się pobrać z get_instruments_info: {e}")
 
     if not symbols:
-        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
+        symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "PEPEUSDC", "XRPUSDC", "ADAUSDC", "DOGEUSDC", "LINKUSDC", "NEARUSDC"]
 
     return symbols
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        if usdt_tickers:
-            sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
+        usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
+        if usdc_tickers:
+            sorted_tickers = sorted(usdc_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
             return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania top symboli: {e}")
     
-    return get_all_spot_usdt_symbols()[:limit_count]
+    return get_all_spot_usdc_symbols()[:limit_count]
 
 def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        if usdt_tickers:
-            sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("price24hPcnt")))
+        usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
+        if usdc_tickers:
+            sorted_tickers = sorted(usdc_tickers, key=lambda x: safe_float(x.get("price24hPcnt")))
             return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania spadkowych symboli: {e}")
 
-    return get_all_spot_usdt_symbols()[:limit_count]
+    return get_all_spot_usdc_symbols()[:limit_count]
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -245,7 +285,7 @@ def get_market_data(symbol, interval="15", limit=100):
         return None
 
 # ==============================================================================
-# STRATEGIA 1: MOMENTUM PUMP HUNTER (FULL MARKET SCAN)
+# STRATEGIA 1: MOMENTUM PUMP HUNTER (FULL MARKET SCAN USDC)
 # ==============================================================================
 def scan_for_pumps():
     global active_positions
@@ -255,15 +295,15 @@ def scan_for_pumps():
         logging.info("⏸️ Osiągnięto limit pozycji dla Strategii PUMP HUNTER.")
         return
 
-    total_equity, free_usdt = get_balances()
+    total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
-    all_symbols = get_all_spot_usdt_symbols()
-    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (PAR DO SKANOWANIA: {len(all_symbols)}) ===")
-    logging.info(f"💰 Saldo UTA: {free_usdt:.2f} USDT | Wartość zakupu 1 pozycji: {order_val:.2f} USDT")
+    all_symbols = get_all_spot_usdc_symbols()
+    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (PAR USDC: {len(all_symbols)}) ===")
+    logging.info(f"💰 Saldo UTA: {free_usdc:.2f} USDC | Wartość zakupu 1 pozycji: {order_val:.2f} USDC")
 
-    if free_usdt < order_val:
-        logging.info(f"⏭️ Pomijam skanowanie. Brak wymaganych wolnych środków {order_val:.2f} USDT.")
+    if free_usdc < order_val:
+        logging.info(f"⏭️ Pomijam skanowanie. Brak wymaganych wolnych środków {order_val:.2f} USDC.")
         return
 
     scanned_count = 0
@@ -308,22 +348,22 @@ def scan_for_pumps():
         except Exception as e:
             logging.error(f"Błąd analizy pompy {symbol}: {e}")
 
-    logging.info(f"✅ Strategia 1: Przeanalizowano {scanned_count} par. Brak nowych sygnałów zakupu.")
+    logging.info(f"✅ Strategia 1: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER (Z RSI & VOL)
+# STRATEGIA 2: TOP DIP HUNTER (Z RSI & VOL USDC)
 # ==============================================================================
 def run_dip_hunter_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
 
-    total_equity, free_usdt = get_balances()
+    total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     top_losers = get_top_losers_symbols()
-    logging.info(f"=== [STRATEGIA 2] TOP DIP HUNTER (PAR DO SKANOWANIA: {len(top_losers)}) ===")
+    logging.info(f"=== [STRATEGIA 2] TOP DIP HUNTER (PAR USDC: {len(top_losers)}) ===")
 
-    if free_usdt < order_val:
+    if free_usdc < order_val:
         logging.info("⏭️ Pomijam skanowanie DIP HUNTER. Brak wolnych środków.")
         return
 
@@ -373,22 +413,22 @@ def run_dip_hunter_strategy():
         except Exception as e:
             logging.error(f"Błąd analizy dipu {symbol}: {e}")
 
-    logging.info(f"✅ Strategia 2: Przeanalizowano {scanned_count} par. Brak nowych sygnałów zakupu.")
+    logging.info(f"✅ Strategia 2: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 3: EMA TREND SCANNER (TOP 150)
+# STRATEGIA 3: EMA TREND SCANNER (TOP 150 USDC)
 # ==============================================================================
 def scan_top150_for_ema_signals():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
 
-    total_equity, free_usdt = get_balances()
+    total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     top_symbols = get_top_volume_symbols()
-    logging.info(f"=== [STRATEGIA 3] EMA TREND SCANNER (PAR DO SKANOWANIA: {len(top_symbols)}) ===")
+    logging.info(f"=== [STRATEGIA 3] EMA TREND SCANNER (PAR USDC: {len(top_symbols)}) ===")
 
-    if free_usdt < order_val:
+    if free_usdc < order_val:
         logging.info("⏭️ Pomijam skanowanie EMA TREND. Brak wolnych środków.")
         return
 
@@ -439,7 +479,7 @@ def scan_top150_for_ema_signals():
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
-    logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par. Brak nowych sygnałów zakupu.")
+    logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
 # MONITOROWANIE I SPRZEDAŻ (TRAILING UP + RSI OVERBOUGHT + VOL DUMP)
@@ -470,7 +510,7 @@ def monitor_and_close_positions():
             if current_price > peak_price:
                 pos["peak_price"] = current_price
                 save_positions(active_positions)
-                logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDT")
+                logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
 
             drop_from_peak = (pos["peak_price"] - current_price) / pos["peak_price"]
             total_pnl = (current_price - buy_price) / buy_price
@@ -504,10 +544,13 @@ def monitor_and_close_positions():
 # PĘTLA GŁÓWNA I SERWER
 # ==============================================================================
 def bot_loop():
+    # Najpierw wykonujemy automatyczną konwersję wolnego USDT na USDC
+    auto_convert_usdt_to_usdc()
+
     while True:
         try:
             logging.info("--------------------------------------------------------------------------------")
-            logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT...")
+            logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT USDC...")
             scan_for_pumps()               
             run_dip_hunter_strategy()      
             scan_top150_for_ema_signals()  
@@ -531,7 +574,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit SPOT Bot (Equity Sizing 15% / Min 100$) is Running 24/7!")
+        self.wfile.write(b"Bybit USDC SPOT Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
