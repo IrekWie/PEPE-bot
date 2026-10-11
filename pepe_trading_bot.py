@@ -17,6 +17,14 @@ FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
+# Automatyczne odczytanie pliku RSA, jeśli znajduje się w projekcie
+if os.path.exists("private_key.pem"):
+    try:
+        with open("private_key.pem", "r", encoding="utf-8") as f:
+            BYBIT_API_SECRET = f.read()
+    except Exception as e:
+        print(f"⚠️ Nie udało się odczytać pliku private_key.pem: {e}", flush=True)
+
 print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
 print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
 
@@ -52,22 +60,20 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
+# Inicjalizacja sesji Bybit z synchronizacją czasu i bezpiecznym window
+session = None
 try:
-    # Poprawiono recv_window z 60000 na 10000 (maksymalny akceptowalny limit przez Bybit v5 to 20000 ms)
     session = HTTP(
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
-        recv_window=10000
+        recv_window=10000,
+        time_sync=True
     )
-    # TEST POŁĄCZENIA PUBLICZNEGO (BEZ KLUCZY)
-try:
-    server_time = session.get_server_time()
-    print(f"✅ POŁĄCZENIE Z BYBIT OK! Czas serwera: {server_time}", flush=True)
-except Exception as err:
-    print(f"❌ BŁĄD POŁĄCZENIA SIECIOWEGO: {err}", flush=True)
+    res_time = session.get_server_time()
+    print(f"✅ POŁĄCZENIE Z BYBIT OK! Czas serwera: {res_time}", flush=True)
 except Exception as e:
-    logging.error(f"Błąd inicjalizacji sesji Bybit: {e}")
+    logging.error(f"❌ Błąd inicjalizacji sesji Bybit: {e}")
 
 # ==============================================================================
 # ZARZĄDZANIE PAMIĘCIĄ POZYCJI SPOT (JSON)
@@ -95,13 +101,18 @@ active_positions = load_positions()
 # ==============================================================================
 def get_balances():
     """Zwraca dwuelementową krotkę: (Całkowita wartość konta w USD, Wolne środki USDT)"""
+    if not session:
+        logging.error("Sesja Bybit nie została poprawnie utworzona.")
+        return 0.0, 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         
-        if res.get("retCode") != 0:
-            logging.error(f"Odpowiedź Bybit API: RetCode={res.get('retCode')}, Msg={res.get('retMsg')}")
+        ret_code = res.get("retCode")
+        ret_msg = res.get("retMsg", "")
+        if ret_code != 0:
+            logging.error(f"Błąd API Bybit przy pobieraniu salda (Code {ret_code}): {ret_msg}")
             return 0.0, 0.0
-            
+
         account_data = res.get("result", {}).get("list", [{}])[0]
         
         # Całkowite equity (wszystkie aktywa razem) w USD
