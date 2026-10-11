@@ -17,14 +17,6 @@ FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
-# Automatyczne odczytanie pliku RSA, jeśli znajduje się w projekcie
-if os.path.exists("private_key.pem"):
-    try:
-        with open("private_key.pem", "r", encoding="utf-8") as f:
-            BYBIT_API_SECRET = f.read()
-    except Exception as e:
-        print(f"⚠️ Nie udało się odczytać pliku private_key.pem: {e}", flush=True)
-
 print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
 print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
 
@@ -60,17 +52,28 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Inicjalizacja sesji Bybit z bezpiecznym recv_window
+# Inicjalizacja sesji Bybit
 session = None
+_original_time = time.time
+
 try:
     session = HTTP(
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
-        recv_window=10000
+        recv_window=20000
     )
+    
+    # Pobranie czasu z Bybit i korekta zegara na Renderze
     res_time = session.get_server_time()
-    print(f"✅ POŁĄCZENIE Z BYBIT OK! Czas serwera: {res_time}", flush=True)
+    bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
+    local_ms = int(_original_time() * 1000)
+    time_offset_sec = (bybit_ms - local_ms) / 1000.0
+    
+    # Nadpisanie funkcji time.time w celu automatycznego dopasowania milisekund do Bybita
+    time.time = lambda: _original_time() + time_offset_sec
+    print(f"⏱️ SYNCHRONIZACJA CZASU OK! Przesunięcie zegara Rendera: {time_offset_sec*1000:.0f} ms", flush=True)
+
 except Exception as e:
     logging.error(f"❌ Błąd inicjalizacji sesji Bybit: {e}")
 
