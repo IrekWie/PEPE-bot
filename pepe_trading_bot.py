@@ -37,7 +37,9 @@ MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
 MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
 
 # --- ZARZĄDZANIE KAPITAŁEM ---
-RISK_PCT_PER_TRADE = 0.15    # 15% CAŁKOWITEJ wartości konta na każdą pozycję
+RISK_PCT_PER_TRADE = 0.15    # Standardowo 15% na pozycję w Strategiach 1-3
+PEPE_RISK_HIGH_PCT = 0.20    # 20% kapitału dla PEPE (gdy jest wystarczająco środków)
+PEPE_RISK_LOW_PCT = 0.10     # 10% kapitału dla PEPE (gdy jest mniej środków)
 MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
 
 # Progi Zabezpieczające (Trailing Up SPOT)
@@ -50,7 +52,6 @@ RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
 PUMP_PRICE_CHANGE_PCT = 0.025# Wzrost ceny o min. +2.5% w świecy 15M
 
-# POPRAWIONY ADRES DLA PINGU KEEP-ALIVE
 APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
 
@@ -190,6 +191,9 @@ def get_all_spot_usdc_symbols():
     if not symbols:
         symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "PEPEUSDC", "XRPUSDC", "ADAUSDC", "DOGEUSDC", "LINKUSDC", "NEARUSDC"]
 
+    if "PEPEUSDC" not in symbols:
+        symbols.append("PEPEUSDC")
+
     return symbols
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
@@ -198,7 +202,10 @@ def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
         usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
         if usdc_tickers:
             sorted_tickers = sorted(usdc_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
-            return [t["symbol"] for t in sorted_tickers[:limit_count]]
+            res_symbols = [t["symbol"] for t in sorted_tickers[:limit_count]]
+            if "PEPEUSDC" not in res_symbols:
+                res_symbols.append("PEPEUSDC")
+            return res_symbols
     except Exception as e:
         logging.error(f"Błąd pobierania top symboli: {e}")
     
@@ -247,7 +254,7 @@ def get_market_data(symbol, interval="15", limit=100):
         return None
 
 # ==============================================================================
-# STRATEGIA 1: MOMENTUM PUMP HUNTER (FULL MARKET SCAN USDC)
+# STRATEGIA 1: MOMENTUM PUMP HUNTER
 # ==============================================================================
 def scan_for_pumps():
     global active_positions
@@ -313,7 +320,7 @@ def scan_for_pumps():
     logging.info(f"✅ Strategia 1: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER (Z RSI & VOL USDC)
+# STRATEGIA 2: TOP DIP HUNTER
 # ==============================================================================
 def run_dip_hunter_strategy():
     global active_positions
@@ -378,7 +385,7 @@ def run_dip_hunter_strategy():
     logging.info(f"✅ Strategia 2: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 3: EMA TREND SCANNER (TOP 150 USDC)
+# STRATEGIA 3: EMA TREND SCANNER
 # ==============================================================================
 def scan_top150_for_ema_signals():
     global active_positions
@@ -442,6 +449,80 @@ def scan_top150_for_ema_signals():
             logging.error(f"Błąd analizy {symbol}: {e}")
 
     logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
+
+# ==============================================================================
+# STRATEGIA 4: DEDYKOWANY SKANER PEPE (PEPEUSDC - 20% / 10% KAPITAŁU)
+# ==============================================================================
+def scan_pepe_specialist():
+    global active_positions
+    pepe_symbol = "PEPEUSDC"
+
+    if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        return
+
+    total_equity, free_usdc = get_balances()
+    target_val_20 = total_equity * PEPE_RISK_HIGH_PCT
+    target_val_10 = total_equity * PEPE_RISK_LOW_PCT
+
+    # Weryfikacja wielkości zakupu (20% kapitału, a jak za mało to 10%)
+    if free_usdc >= target_val_20 and target_val_20 >= MIN_ORDER_VALUE:
+        order_val = target_val_20
+        risk_label = "20%"
+    elif free_usdc >= target_val_10 and target_val_10 >= MIN_ORDER_VALUE:
+        order_val = target_val_10
+        risk_label = "10%"
+    elif free_usdc >= MIN_ORDER_VALUE:
+        order_val = free_usdc
+        risk_label = "Wolne Środki"
+    else:
+        logging.info(f"=== [STRATEGIA 4] PEPE SPECIALIST HUNTER ({pepe_symbol}) ===")
+        logging.info(f"⏭️ Pomijam skanowanie PEPE. Wolne środki ({free_usdc:.2f} USDC) poniżej wymaganego minimum.")
+        return
+
+    logging.info(f"=== [STRATEGIA 4] PEPE SPECIALIST HUNTER ({pepe_symbol}) ===")
+    logging.info(f"🐸 Saldo UTA: {free_usdc:.2f} USDC | Dedykowany zakup PEPE: {order_val:.2f} USDC ({risk_label} kapitału)")
+
+    try:
+        df = get_market_data(pepe_symbol, interval="15")
+        if df is None or len(df) < 25: return
+
+        candle = df.iloc[-2]
+        prev_candle = df.iloc[-3]
+        c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
+        c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+        c_rsi = candle['rsi']
+        ema9, ema21, ema89 = candle['ema9'], candle['ema21'], candle['ema89']
+
+        bullish_alignment = (ema9 > ema21) or (c_close > ema89)
+        rsi_valid = 40 <= c_rsi <= 70
+        volume_ok = c_vol >= (vol_ma * 0.8)
+
+        # Reakcja ceny: wyjście wyżej lub pro-wzrostowa świeca
+        price_rebound = (c_close > c_open) or (c_low <= ema21 and c_close > ema21)
+
+        if bullish_alignment and rsi_valid and volume_ok and price_rebound:
+            raw_qty = order_val / c_close
+            qty_str = str(int(raw_qty))  # Wolumen PEPE w sztukach całkowaitych
+
+            if safe_float(qty_str) <= 0: return
+
+            res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=qty_str)
+            if res.get("retCode") == 0:
+                active_positions[pepe_symbol] = {
+                    "strategy": "PEPE_SPECIALIST",
+                    "buy_price": c_close,
+                    "peak_price": c_close,
+                    "qty": qty_str
+                }
+                save_positions(active_positions)
+                logging.info(f"🐸🔥 [PEPE KUPNO OK] Zakupiono za {order_val:.2f} USDC ({risk_label})! RSI: {c_rsi:.1f}, Vol: OK")
+            else:
+                logging.error(f"❌ Błąd zakupu PEPE: {res}")
+        else:
+            logging.info(f"✅ Strategia 4 (PEPE): Brak sygnału zakupu dla PEPEUSDC w tej 15M świecy.")
+
+    except Exception as e:
+        logging.error(f"Błąd analizy PEPE: {e}")
 
 # ==============================================================================
 # MONITOROWANIE I SPRZEDAŻ (TRAILING UP + RSI OVERBOUGHT + VOL DUMP)
@@ -513,6 +594,7 @@ def bot_loop():
             scan_for_pumps()               
             run_dip_hunter_strategy()      
             scan_top150_for_ema_signals()  
+            scan_pepe_specialist()          
             monitor_and_close_positions()  
             logging.info("💤 CYKL ZAKOŃCZONY. Następne skanowanie za 3 minuty...")
             logging.info("--------------------------------------------------------------------------------")
