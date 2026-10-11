@@ -149,7 +149,6 @@ def get_balances():
             return 0.0, 0.0
 
         account_data = account_list[0]
-        
         total_equity = safe_float(account_data.get("totalEquity"))
         free_usdt = 0.0
         
@@ -166,32 +165,48 @@ def get_balances():
         return 0.0, 0.0
 
 def get_all_spot_usdt_symbols():
+    symbols = []
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        return [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
+        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
     except Exception as e:
-        logging.error(f"Błąd pobierania wszystkich symboli: {e}")
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "STRKUSDT"]
+        logging.warning(f"Nie udało się pobrać z get_tickers: {e}")
+
+    if not symbols:
+        try:
+            instruments = session.get_instruments_info(category=CATEGORY).get("result", {}).get("list", [])
+            symbols = [i["symbol"] for i in instruments if i.get("symbol", "").endswith("USDT") and i.get("status") == "Trading"]
+        except Exception as e:
+            logging.warning(f"Nie udało się pobrać z get_instruments_info: {e}")
+
+    if not symbols:
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
+
+    return symbols
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
-        return [t["symbol"] for t in sorted_tickers[:limit_count]]
+        if usdt_tickers:
+            sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
+            return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania top symboli: {e}")
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "STRKUSDT"]
+    
+    return get_all_spot_usdt_symbols()[:limit_count]
 
 def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("price24hPcnt")))
-        return [t["symbol"] for t in sorted_tickers[:limit_count]]
+        if usdt_tickers:
+            sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("price24hPcnt")))
+            return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania spadkowych symboli: {e}")
-        return []
+
+    return get_all_spot_usdt_symbols()[:limit_count]
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -202,7 +217,7 @@ def calculate_rsi(series, period=14):
 
 def get_market_data(symbol, interval="15", limit=100):
     try:
-        time.sleep(0.08)
+        time.sleep(0.05)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
         if not candles: return None
@@ -231,24 +246,28 @@ def scan_for_pumps():
 
     pump_positions_count = sum(1 for p in active_positions.values() if p.get("strategy") == "PUMP_HUNTER")
     if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        logging.info("⏸️ Osiągnięto limit pozycji dla Strategii PUMP HUNTER.")
         return
 
     total_equity, free_usdt = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     all_symbols = get_all_spot_usdt_symbols()
-    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (SKANOWANIE CAŁEJ GIEŁDY: {len(all_symbols)} PAR) ===")
+    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER (PAR DO SKANOWANIA: {len(all_symbols)}) ===")
+    logging.info(f"💰 Saldo UTA: {free_usdt:.2f} USDT | Wartość zakupu 1 pozycji: {order_val:.2f} USDT")
 
     if free_usdt < order_val:
-        logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT (15% konta / Min. {MIN_ORDER_VALUE}), dostępne wolne saldo to {free_usdt:.2f} USDT.")
+        logging.info(f"⏭️ Pomijam skanowanie. Brak wymaganych wolnych środków {order_val:.2f} USDT.")
         return
 
+    scanned_count = 0
     for symbol in all_symbols:
         if symbol in active_positions: continue
         if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
             df = get_market_data(symbol, interval="15")
+            scanned_count += 1
             if df is None or len(df) < 25: continue
 
             candle = df.iloc[-2]
@@ -261,7 +280,6 @@ def scan_for_pumps():
             rsi_valid = 45 <= c_rsi <= 75
 
             if price_change >= PUMP_PRICE_CHANGE_PCT and volume_spike and rsi_valid:
-                
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
@@ -277,12 +295,14 @@ def scan_for_pumps():
                     }
                     pump_positions_count += 1
                     save_positions(active_positions)
-                    logging.info(f"🚀 [PUMP KUPNO] Wykryto skok na {symbol}! Wzrost: +{price_change*100:.2f}%, Vol: {c_vol/vol_ma:.1f}x, RSI: {c_rsi:.1f}")
+                    logging.info(f"🚀 [PUMP KUPNO OK] {symbol}! Wzrost: +{price_change*100:.2f}%, Vol: {c_vol/vol_ma:.1f}x, RSI: {c_rsi:.1f}")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
         except Exception as e:
             logging.error(f"Błąd analizy pompy {symbol}: {e}")
+
+    logging.info(f"✅ Strategia 1: Przeanalizowano {scanned_count} par. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
 # STRATEGIA 2: TOP DIP HUNTER (Z RSI & VOL)
@@ -295,18 +315,20 @@ def run_dip_hunter_strategy():
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     top_losers = get_top_losers_symbols()
-    logging.info("=== [STRATEGIA 2] TOP DIP HUNTER (4 Spadki SPOT z RSI & VOL) ===")
+    logging.info(f"=== [STRATEGIA 2] TOP DIP HUNTER (PAR DO SKANOWANIA: {len(top_losers)}) ===")
 
     if free_usdt < order_val:
-        logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT, dostępne wolne saldo to {free_usdt:.2f} USDT.")
+        logging.info("⏭️ Pomijam skanowanie DIP HUNTER. Brak wolnych środków.")
         return
 
+    scanned_count = 0
     for symbol in top_losers:
         if symbol in active_positions: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
             df = get_market_data(symbol, interval="15")
+            scanned_count += 1
             if df is None or len(df) < 25: continue
 
             candle, prev_candle = df.iloc[-2], df.iloc[-3]
@@ -324,7 +346,6 @@ def run_dip_hunter_strategy():
             rsi_confirmed = c_rsi <= 55
 
             if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
-                
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
@@ -339,12 +360,14 @@ def run_dip_hunter_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [DIP KUPNO] Odbicie na {symbol}! RSI: {c_rsi:.1f}, Vol Ratio: {c_vol/vol_ma:.1f}x")
+                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol Ratio: {c_vol/vol_ma:.1f}x")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
         except Exception as e:
             logging.error(f"Błąd analizy dipu {symbol}: {e}")
+
+    logging.info(f"✅ Strategia 2: Przeanalizowano {scanned_count} par. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
 # STRATEGIA 3: EMA TREND SCANNER (TOP 150)
@@ -357,18 +380,20 @@ def scan_top150_for_ema_signals():
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     top_symbols = get_top_volume_symbols()
-    logging.info(f"=== [STRATEGIA 3] EMA TREND SCANNER TOP {len(top_symbols)} (Z RSI & VOL) ===")
+    logging.info(f"=== [STRATEGIA 3] EMA TREND SCANNER (PAR DO SKANOWANIA: {len(top_symbols)}) ===")
 
     if free_usdt < order_val:
-        logging.info(f"⏭️ Pomijam skanowanie wykresów. Potrzeba {order_val:.2f} USDT, dostępne wolne saldo to {free_usdt:.2f} USDT.")
+        logging.info("⏭️ Pomijam skanowanie EMA TREND. Brak wolnych środków.")
         return
 
+    scanned_count = 0
     for symbol in top_symbols:
         if symbol in active_positions: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
             df = get_market_data(symbol, interval="15")
+            scanned_count += 1
             if df is None or len(df) < 25: continue
 
             candle = df.iloc[-2]
@@ -387,7 +412,6 @@ def scan_top150_for_ema_signals():
             vol_ok = c_vol >= vol_ma
 
             if bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing) and rsi_ok and vol_ok:
-                
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
@@ -402,21 +426,25 @@ def scan_top150_for_ema_signals():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [EMA KUPNO] Sygnał na {symbol}! RSI: {c_rsi:.1f}, Vol: OK | Cena: {c_close}")
+                    logging.info(f"🔥 [EMA KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: OK | Cena: {c_close}")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
+    logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par. Brak nowych sygnałów zakupu.")
+
 # ==============================================================================
 # MONITOROWANIE I SPRZEDAŻ (TRAILING UP + RSI OVERBOUGHT + VOL DUMP)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
-    if not active_positions: return
+    if not active_positions:
+        logging.info("ℹ️ Brak otwartych pozycji SPOT do monitorowania.")
+        return
 
-    logging.info("=== [MONITOROWANIE POZYCJI & TRAILING UP / RSI / VOL] ===")
+    logging.info(f"=== [MONITOROWANIE POZYCJI: {len(active_positions)} AKTYWNYCH] ===")
     symbols_to_delete = []
 
     for symbol, pos in active_positions.items():
@@ -472,10 +500,14 @@ def monitor_and_close_positions():
 def bot_loop():
     while True:
         try:
+            logging.info("--------------------------------------------------------------------------------")
+            logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT...")
             scan_for_pumps()               
             run_dip_hunter_strategy()      
             scan_top150_for_ema_signals()  
             monitor_and_close_positions()  
+            logging.info("💤 CYKL ZAKOŃCZONY. Następne skanowanie za 3 minuty...")
+            logging.info("--------------------------------------------------------------------------------")
         except Exception as e:
             logging.error(f"Błąd pętli bota: {e}")
         time.sleep(3 * 60)
