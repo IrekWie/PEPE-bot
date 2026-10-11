@@ -3,10 +3,16 @@ import time
 import json
 import logging
 import threading
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import requests
 from pybit.unified_trading import HTTP
+
+# ==============================================================================
+# OCHRONA PRZED ZAWIESZENIEM POŁĄCZEŃ SIECIOWYCH (SOCKET TIMEOUT)
+# ==============================================================================
+socket.setdefaulttimeout(15)  # Maksymalnie 15 sekund na dowolną odpowiedź sieciową
 
 # ==============================================================================
 # KONFIGURACJA BOTA SPOT 
