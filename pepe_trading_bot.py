@@ -71,6 +71,17 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def format_qty_for_sell(symbol, raw_qty):
+    """Formatowanie liczby monet pod rynek SPOT przy sprzedaży"""
+    if symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol or "BONK" in symbol or "FLOKI" in symbol:
+        return str(int(raw_qty))
+    elif raw_qty >= 100:
+        return f"{raw_qty:.1f}"
+    elif raw_qty >= 1:
+        return f"{raw_qty:.2f}"
+    else:
+        return f"{raw_qty:.4f}"
+
 # ==============================================================================
 # INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT (EU PRIORITY)
 # ==============================================================================
@@ -295,18 +306,16 @@ def scan_for_pumps():
             rsi_valid = 45 <= c_rsi <= 75
 
             if price_change >= PUMP_PRICE_CHANGE_PCT and volume_spike and rsi_valid:
-                raw_qty = order_val / c_close
-                qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
+                order_qty_usdc = f"{order_val:.2f}"
+                qty_for_sell = format_qty_for_sell(symbol, order_val / c_close)
 
-                if safe_float(qty_str) <= 0: continue
-
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
                     active_positions[symbol] = {
                         "strategy": "PUMP_HUNTER",
                         "buy_price": c_close,
                         "peak_price": c_close,
-                        "qty": qty_str
+                        "qty": qty_for_sell
                     }
                     pump_positions_count += 1
                     save_positions(active_positions)
@@ -361,18 +370,16 @@ def run_dip_hunter_strategy():
             rsi_confirmed = c_rsi <= 55
 
             if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
-                raw_qty = order_val / c_close
-                qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
+                order_qty_usdc = f"{order_val:.2f}"
+                qty_for_sell = format_qty_for_sell(symbol, order_val / c_close)
 
-                if safe_float(qty_str) <= 0: continue
-
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
                     active_positions[symbol] = {
                         "strategy": "DIP_HUNTER",
                         "buy_price": c_close,
                         "peak_price": c_close,
-                        "qty": qty_str
+                        "qty": qty_for_sell
                     }
                     save_positions(active_positions)
                     logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol Ratio: {c_vol/vol_ma:.1f}x")
@@ -427,18 +434,16 @@ def scan_top150_for_ema_signals():
             vol_ok = c_vol >= vol_ma
 
             if bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing) and rsi_ok and vol_ok:
-                raw_qty = order_val / c_close
-                qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
+                order_qty_usdc = f"{order_val:.2f}"
+                qty_for_sell = format_qty_for_sell(symbol, order_val / c_close)
 
-                if safe_float(qty_str) <= 0: continue
-
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
                     active_positions[symbol] = {
                         "strategy": "EMA_TOP150",
                         "buy_price": c_close,
                         "peak_price": c_close,
-                        "qty": qty_str
+                        "qty": qty_for_sell
                     }
                     save_positions(active_positions)
                     logging.info(f"🔥 [EMA KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: OK | Cena: {c_close}")
@@ -464,7 +469,6 @@ def scan_pepe_specialist():
     target_val_20 = total_equity * PEPE_RISK_HIGH_PCT
     target_val_10 = total_equity * PEPE_RISK_LOW_PCT
 
-    # Weryfikacja wielkości zakupu (20% kapitału, a jak za mało to 10%)
     if free_usdc >= target_val_20 and target_val_20 >= MIN_ORDER_VALUE:
         order_val = target_val_20
         risk_label = "20%"
@@ -487,7 +491,6 @@ def scan_pepe_specialist():
         if df is None or len(df) < 25: return
 
         candle = df.iloc[-2]
-        prev_candle = df.iloc[-3]
         c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
         c_vol, vol_ma = candle['volume'], candle['vol_ma20']
         c_rsi = candle['rsi']
@@ -496,23 +499,19 @@ def scan_pepe_specialist():
         bullish_alignment = (ema9 > ema21) or (c_close > ema89)
         rsi_valid = 40 <= c_rsi <= 70
         volume_ok = c_vol >= (vol_ma * 0.8)
-
-        # Reakcja ceny: wyjście wyżej lub pro-wzrostowa świeca
         price_rebound = (c_close > c_open) or (c_low <= ema21 and c_close > ema21)
 
         if bullish_alignment and rsi_valid and volume_ok and price_rebound:
-            raw_qty = order_val / c_close
-            qty_str = str(int(raw_qty))  # Wolumen PEPE w sztukach całkowaitych
+            order_qty_usdc = f"{order_val:.2f}"
+            qty_for_sell = format_qty_for_sell(pepe_symbol, order_val / c_close)
 
-            if safe_float(qty_str) <= 0: return
-
-            res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=qty_str)
+            res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
             if res.get("retCode") == 0:
                 active_positions[pepe_symbol] = {
                     "strategy": "PEPE_SPECIALIST",
                     "buy_price": c_close,
                     "peak_price": c_close,
-                    "qty": qty_str
+                    "qty": qty_for_sell
                 }
                 save_positions(active_positions)
                 logging.info(f"🐸🔥 [PEPE KUPNO OK] Zakupiono za {order_val:.2f} USDC ({risk_label})! RSI: {c_rsi:.1f}, Vol: OK")
