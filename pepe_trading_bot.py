@@ -54,12 +54,20 @@ logging.basicConfig(
 
 _original_time = time.time
 
+def safe_float(val, default=0.0):
+    try:
+        if val is None or str(val).strip() == "":
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 # ==============================================================================
-# AUTOMATYCZNE TESTOWANIE PUNKTÓW KOŃCOWYCH (GLOBAL, EU, BYTICK)
+# INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT (EU PRIORITY)
 # ==============================================================================
 endpoints_to_test = [
-    ("Global Mainnet", "https://api.bybit.com"),
     ("EU Region / MiCA", "https://api.bybit.eu"),
+    ("Global Mainnet", "https://api.bybit.com"),
     ("Bytick Mainnet", "https://api.bytick.com"),
 ]
 
@@ -73,33 +81,30 @@ for name, url in endpoints_to_test:
             api_secret=BYBIT_API_SECRET,
             recv_window=20000
         )
-        test_sess.endpoint = url  # Prawidłowe przypisanie adresu punktu końcowego w pybit
+        test_sess.endpoint = url
         
         res_bal = test_sess.get_wallet_balance(accountType="UNIFIED")
         if res_bal.get("retCode") == 0:
             session = test_sess
             print(f"✅ POŁĄCZONO SUKCESEM PRZEZ: {name} ({url})!", flush=True)
             
-            # Synchronizacja milisekundowa
             res_time = test_sess.get_server_time()
             bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
             local_ms = int(_original_time() * 1000)
             time_offset_sec = (bybit_ms - local_ms) / 1000.0
             time.time = lambda: _original_time() + time_offset_sec
             break
-        else:
-            print(f"ℹ️ {name} ({url}): RetCode={res_bal.get('retCode')} ({res_bal.get('retMsg')})", flush=True)
-    except Exception as e:
-        print(f"ℹ️ {name} ({url}): Błąd = {e}", flush=True)
+    except Exception:
+        pass
 
 if not session:
-    print("⚠️ Używam domyślnego punktu końcowego https://api.bybit.com...", flush=True)
     session = HTTP(
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
         recv_window=20000
     )
+    session.endpoint = "https://api.bybit.eu"
 
 # ==============================================================================
 # ZARZĄDZANIE PAMIĘCIĄ POZYCJI SPOT (JSON)
@@ -139,13 +144,20 @@ def get_balances():
             logging.error(f"Błąd API Bybit przy pobieraniu salda (Code {ret_code}): {ret_msg}")
             return 0.0, 0.0
 
-        account_data = res.get("result", {}).get("list", [{}])[0]
+        account_list = res.get("result", {}).get("list", [])
+        if not account_list:
+            return 0.0, 0.0
+
+        account_data = account_list[0]
         
-        total_equity = float(account_data.get("totalEquity", 0.0))
+        total_equity = safe_float(account_data.get("totalEquity"))
         free_usdt = 0.0
+        
         for coin in account_data.get("coin", []):
             if coin.get("coin") == "USDT":
-                free_usdt = float(coin.get("availableToWithdraw", coin.get("equity", 0.0)))
+                avail = coin.get("availableToWithdraw")
+                eq = coin.get("equity")
+                free_usdt = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
                 break
                 
         return total_equity, free_usdt
@@ -165,7 +177,7 @@ def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("turnover24h", 0.0)), reverse=True)
+        sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
         return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania top symboli: {e}")
@@ -175,7 +187,7 @@ def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdt_tickers = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("price24hPcnt", 0.0)))
+        sorted_tickers = sorted(usdt_tickers, key=lambda x: safe_float(x.get("price24hPcnt")))
         return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania spadkowych symboli: {e}")
@@ -253,7 +265,7 @@ def scan_for_pumps():
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
-                if float(qty_str) <= 0: continue
+                if safe_float(qty_str) <= 0: continue
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
                 if res.get("retCode") == 0:
@@ -316,7 +328,7 @@ def run_dip_hunter_strategy():
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
-                if float(qty_str) <= 0: continue
+                if safe_float(qty_str) <= 0: continue
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
                 if res.get("retCode") == 0:
@@ -379,7 +391,7 @@ def scan_top150_for_ema_signals():
                 raw_qty = order_val / c_close
                 qty_str = f"{round(raw_qty, 2):.2f}" if not (symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol) else str(int(raw_qty))
 
-                if float(qty_str) <= 0: continue
+                if safe_float(qty_str) <= 0: continue
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=qty_str)
                 if res.get("retCode") == 0:
