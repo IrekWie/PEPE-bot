@@ -60,15 +60,14 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Inicjalizacja sesji Bybit z synchronizacją czasu i bezpiecznym window
+# Inicjalizacja sesji Bybit z bezpiecznym recv_window
 session = None
 try:
     session = HTTP(
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
-        recv_window=10000,
-        time_sync=True
+        recv_window=10000
     )
     res_time = session.get_server_time()
     print(f"✅ POŁĄCZENIE Z BYBIT OK! Czas serwera: {res_time}", flush=True)
