@@ -38,7 +38,7 @@ MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
 
 # --- ZARZĄDZANIE KAPITAŁEM ---
 RISK_PCT_PER_TRADE = 0.15    # 15% CAŁKOWITEJ wartości konta na każdą pozycję
-MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USD/USDC
+MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
 
 # Progi Zabezpieczające (Trailing Up SPOT)
 TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od najwyższego szczytu
@@ -135,45 +135,6 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# AUTOMATYCZNA BEZSTRATNA KONWERSJA USDT -> USDC NA START
-# ==============================================================================
-def auto_convert_usdt_to_usdc():
-    if not session: return
-    try:
-        res = session.get_wallet_balance(accountType="UNIFIED")
-        if res.get("retCode") != 0: return
-
-        account_list = res.get("result", {}).get("list", [])
-        if not account_list: return
-
-        usdt_avail = 0.0
-        for coin in account_list[0].get("coin", []):
-            if coin.get("coin") == "USDT":
-                avail = coin.get("availableToWithdraw")
-                eq = coin.get("equity")
-                usdt_avail = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
-                break
-
-        if usdt_avail >= 20.0:
-            logging.info(f"🔄 Wykryto {usdt_avail:.2f} USDT na koncie UTA. Automatycznie zamieniam na USDC na rynku SPOT...")
-            qty_usdt = str(int(usdt_avail - 1.0))  # Zostawiamy $1 na ewentualną opłatę
-            
-            order_res = session.place_order(
-                category=CATEGORY,
-                symbol="USDCUSDT",
-                side="Buy",
-                orderType="Market",
-                qty=qty_usdt
-            )
-            if order_res.get("retCode") == 0:
-                logging.info(f"✅ SUKCES! Zamieniono {qty_usdt} USDT na USDC po kursie 1:1 na rynku SPOT!")
-                time.sleep(3)
-            else:
-                logging.error(f"❌ Błąd automatycznej konwersji USDT->USDC: {order_res}")
-    except Exception as e:
-        logging.error(f"Błąd podczas sprawdzania/konwersji salda USDT: {e}")
-
-# ==============================================================================
 # FUNKCJE POMOCNICZE, SALDO USDC, RSI & VOL
 # ==============================================================================
 def get_balances():
@@ -214,7 +175,7 @@ def get_all_spot_usdc_symbols():
     symbols = []
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") != "USDTUSDC"]
+        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in ["USDTUSDC", "USDCUSDT"]]
     except Exception as e:
         logging.warning(f"Nie udało się pobrać z get_tickers: {e}")
 
@@ -544,9 +505,6 @@ def monitor_and_close_positions():
 # PĘTLA GŁÓWNA I SERWER
 # ==============================================================================
 def bot_loop():
-    # Najpierw wykonujemy automatyczną konwersję wolnego USDT na USDC
-    auto_convert_usdt_to_usdc()
-
     while True:
         try:
             logging.info("--------------------------------------------------------------------------------")
