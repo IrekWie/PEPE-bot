@@ -60,6 +60,12 @@ try:
         api_secret=BYBIT_API_SECRET,
         recv_window=10000
     )
+    # TEST POŁĄCZENIA PUBLICZNEGO (BEZ KLUCZY)
+try:
+    server_time = session.get_server_time()
+    print(f"✅ POŁĄCZENIE Z BYBIT OK! Czas serwera: {server_time}", flush=True)
+except Exception as err:
+    print(f"❌ BŁĄD POŁĄCZENIA SIECIOWEGO: {err}", flush=True)
 except Exception as e:
     logging.error(f"Błąd inicjalizacji sesji Bybit: {e}")
 
