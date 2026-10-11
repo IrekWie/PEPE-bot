@@ -50,7 +50,8 @@ RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
 PUMP_PRICE_CHANGE_PCT = 0.025# Wzrost ceny o min. +2.5% w świecy 15M
 
-APP_URL = "https://pepe-trading-bot-ujqx.onrender.com"
+# POPRAWIONY ADRES DLA PINGU KEEP-ALIVE
+APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
 
 logging.basicConfig(
