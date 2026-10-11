@@ -52,51 +52,48 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Synchronizacja milisekundowa zegara
 _original_time = time.time
 
 # ==============================================================================
-# AUTOMATYCZNE WYKRYWANIE ENPOINTU (GLOBAL, EU, BYTICK, DEMO)
+# AUTOMATYCZNE TESTOWANIE PUNKTÓW KOŃCOWYCH (GLOBAL, EU, BYTICK)
 # ==============================================================================
 endpoints_to_test = [
-    ("Global Mainnet (api.bybit.com)", {"endpoint": "https://api.bybit.com"}),
-    ("EU / EEA Region (api.bybit.eu)", {"endpoint": "https://api.bybit.eu"}),
-    ("Bytick Mainnet (api.bytick.com)", {"endpoint": "https://api.bytick.com"}),
-    ("Demo Trading Mode (api-demo.bybit.com)", {"demo": True}),
+    ("Global Mainnet", "https://api.bybit.com"),
+    ("EU Region / MiCA", "https://api.bybit.eu"),
+    ("Bytick Mainnet", "https://api.bytick.com"),
 ]
 
 session = None
 
-for name, kwargs in endpoints_to_test:
+for name, url in endpoints_to_test:
     try:
-        test_session = HTTP(
+        test_sess = HTTP(
             testnet=TESTNET,
             api_key=BYBIT_API_KEY,
             api_secret=BYBIT_API_SECRET,
-            recv_window=20000,
-            **kwargs
+            recv_window=20000
         )
+        test_sess.endpoint = url  # Prawidłowe przypisanie adresu punktu końcowego w pybit
         
-        # Test pobrania salda – weryfikacja autoryzacji dla danej domeny
-        res_bal = test_session.get_wallet_balance(accountType="UNIFIED")
+        res_bal = test_sess.get_wallet_balance(accountType="UNIFIED")
         if res_bal.get("retCode") == 0:
-            session = test_session
-            print(f"✅ POŁĄCZONO SUKCESEM PRZEZ: {name}!", flush=True)
+            session = test_sess
+            print(f"✅ POŁĄCZONO SUKCESEM PRZEZ: {name} ({url})!", flush=True)
             
-            # Korekta czasu
-            res_time = test_session.get_server_time()
+            # Synchronizacja milisekundowa
+            res_time = test_sess.get_server_time()
             bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
             local_ms = int(_original_time() * 1000)
             time_offset_sec = (bybit_ms - local_ms) / 1000.0
             time.time = lambda: _original_time() + time_offset_sec
             break
         else:
-            print(f"ℹ️ Próba {name}: RetCode={res_bal.get('retCode')} ({res_bal.get('retMsg')})", flush=True)
+            print(f"ℹ️ {name} ({url}): RetCode={res_bal.get('retCode')} ({res_bal.get('retMsg')})", flush=True)
     except Exception as e:
-        print(f"ℹ️ Próba {name}: Błąd połączenia/autoryzacji: {e}", flush=True)
+        print(f"ℹ️ {name} ({url}): Błąd = {e}", flush=True)
 
 if not session:
-    print("⚠️ Tworzę domyślną sesję...", flush=True)
+    print("⚠️ Używam domyślnego punktu końcowego https://api.bybit.com...", flush=True)
     session = HTTP(
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
