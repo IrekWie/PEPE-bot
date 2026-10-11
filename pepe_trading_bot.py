@@ -17,11 +17,6 @@ FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
-# ROZWIĄZANIE PROBLEMU 401: Wczytanie czystego klucza RSA bezpośrednio z pliku
-if os.path.exists("private_key.pem"):
-    with open("private_key.pem", "r", encoding="utf-8") as f:
-        BYBIT_API_SECRET = f.read()
-
 print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
 print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
 
@@ -58,11 +53,12 @@ logging.basicConfig(
 )
 
 try:
+    # Poprawiono recv_window z 60000 na 10000 (maksymalny akceptowalny limit przez Bybit v5 to 20000 ms)
     session = HTTP(
         testnet=TESTNET,
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
-        recv_window=60000
+        recv_window=10000
     )
 except Exception as e:
     logging.error(f"Błąd inicjalizacji sesji Bybit: {e}")
@@ -95,6 +91,11 @@ def get_balances():
     """Zwraca dwuelementową krotkę: (Całkowita wartość konta w USD, Wolne środki USDT)"""
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
+        
+        if res.get("retCode") != 0:
+            logging.error(f"Odpowiedź Bybit API: RetCode={res.get('retCode')}, Msg={res.get('retMsg')}")
+            return 0.0, 0.0
+            
         account_data = res.get("result", {}).get("list", [{}])[0]
         
         # Całkowite equity (wszystkie aktywa razem) w USD
@@ -104,13 +105,12 @@ def get_balances():
         free_usdt = 0.0
         for coin in account_data.get("coin", []):
             if coin.get("coin") == "USDT":
-                # 'availableToWithdraw' precyzyjnie określa wolną gotówkę bez dźwigni
                 free_usdt = float(coin.get("availableToWithdraw", coin.get("equity", 0.0)))
                 break
                 
         return total_equity, free_usdt
     except Exception as e:
-        logging.error(f"Błąd pobierania salda (Sprawdź autoryzację): {e}")
+        logging.error(f"Błąd pobierania salda: {e}")
         return 0.0, 0.0
 
 def get_all_spot_usdt_symbols():
