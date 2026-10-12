@@ -44,6 +44,11 @@ PEPE_RISK_HIGH_PCT = 0.20    # 20% kapitału dla PEPE (gdy jest wystarczająco �
 PEPE_RISK_LOW_PCT = 0.10     # 10% kapitału dla PEPE (gdy jest mniej środków)
 MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
 
+# --- SEKCJA PARATRYCZNA STRATEGII 2 (TOP DIP HUNTER) ---
+MIN_DIP_24H_PCT = -0.050     # Wymagany SPADEK minimum -5.0% w 24h (brak zakupów przy minimalnych spadkach)
+DIP_RSI_15M_MAX = 40         # Głębokie wyprzedanie na 15M (RSI <= 40)
+DIP_VOL_MULTIPLIER = 1.5     # Wolumen odbicia co najmniej 1.5x większy od MA20
+
 # --- PROGI ZABEZPIECZAJĄCE (DYNAMIICZNE) ---
 TRAILING_DROP_PCT = 0.015       # Standardowy Trailing Stop (-1.5% od szczytu)
 MEME_TRAILING_DROP_PCT = 0.025  # Szerszy Trailing Stop dla Memecoinów (-2.5% od szczytu)
@@ -53,7 +58,7 @@ HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
 BREAKEVEN_TRIGGER_PCT = 0.015   # Aktywacja po osiągnięciu szczytu +1.5% PnL
 BREAKEVEN_SL_PCT = 0.002        # Przesunięcie Stop Loss na +0.2% PnL (pokrycie opłat)
 
-# --- PROGI RSI & VOL ---
+# --- PROGI RSI & VOL (DLA PUMP HUNTER & EMA) ---
 RSI_OVERBOUGHT_SELL = 80     # Sprzedaj, gdy RSI przekroczy 80
 RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
@@ -264,6 +269,43 @@ def is_btc_market_healthy():
         logging.warning(f"Błąd weryfikacji trendu BTC: {e}")
         return True
 
+def check_quarterly_health(symbol):
+    """ANALIZA ZACHOWANIA W OSTATNIM KWARTALE (90 Dni na interwale D1).
+    Odrzuca tokeny bez historii oraz waluty w permanentnej spiralnej zapaści."""
+    try:
+        time.sleep(0.05)
+        res = session.get_kline(category=CATEGORY, symbol=symbol, interval="D", limit=90)
+        candles = res.get("result", {}).get("list", [])
+        if not candles or len(candles) < 60:
+            # Krótsza historia niż 2 miesiące / kwartał -> ODRZUCAMY
+            return False
+
+        df_q = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
+        df_q = df_q.iloc[::-1].reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df_q[col] = df_q[col].astype(float)
+
+        close_now = df_q.iloc[-1]['close']
+        close_90d_ago = df_q.iloc[0]['close']
+        q_change = (close_now - close_90d_ago) / close_90d_ago
+
+        # Spadek w kwartale o więcej niż -75% oznacza ruinę waluty (Death Spiral)
+        if q_change <= -0.75:
+            return False
+
+        # Obliczenie RSI Dniowego (D1)
+        df_q['rsi_d1'] = calculate_rsi(df_q['close'], period=14)
+        rsi_d1_now = df_q.iloc[-1]['rsi_d1']
+
+        # Dniowe RSI nie może być skrajnie wykupione (>55 w korekcie)
+        if rsi_d1_now > 55:
+            return False
+
+        return True
+    except Exception as e:
+        logging.warning(f"Błąd analizy kwartalnej dla {symbol}: {e}")
+        return False
+
 def get_all_spot_usdc_symbols():
     symbols = []
     try:
@@ -288,7 +330,6 @@ def get_all_spot_usdc_symbols():
     return symbols
 
 def sync_positions_from_bybit():
-    """AUTOREKUPERACJA Z HISTORIĄ CEN ZAKUPU (GET EXECUTIONS)"""
     global active_positions
     if not session: return
     try:
@@ -322,7 +363,6 @@ def sync_positions_from_bybit():
                     
                     if val_in_usdc >= 10.0:
                         buy_price = curr_price
-                        # Odpytanie o prawdziwą cenę zakupu z historii giełdy
                         try:
                             exec_res = session.get_executions(category=CATEGORY, symbol=symbol, limit=10)
                             if exec_res.get("retCode") == 0:
@@ -366,16 +406,19 @@ def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     return get_all_spot_usdc_symbols()[:limit_count]
 
 def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
+    """ZWRACA TYLKO MONETY ZE SPADKIEM MINIMUM -5.0% W 24H"""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
         if usdc_tickers:
-            sorted_tickers = sorted(usdc_tickers, key=lambda x: safe_float(x.get("price24hPcnt")))
+            # Filtrujemy tylko realne spadki (price24hPcnt <= -0.05)
+            valid_losers = [t for t in usdc_tickers if safe_float(t.get("price24hPcnt")) <= MIN_DIP_24H_PCT]
+            sorted_tickers = sorted(valid_losers, key=lambda x: safe_float(x.get("price24hPcnt")))
             return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania spadkowych symboli: {e}")
 
-    return get_all_spot_usdc_symbols()[:limit_count]
+    return []
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -474,7 +517,7 @@ def scan_for_pumps():
     logging.info(f"✅ Strategia 1: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER
+# STRATEGIA 2: TOP DIP HUNTER (Z FILTREM KWARTALNYM I MIN. SPADKIEM -5%)
 # ==============================================================================
 def run_dip_hunter_strategy():
     global active_positions
@@ -485,7 +528,11 @@ def run_dip_hunter_strategy():
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     top_losers = get_top_losers_symbols()
-    logging.info(f"=== [STRATEGIA 2] TOP DIP HUNTER (PAR USDC: {len(top_losers)}) ===")
+    logging.info(f"=== [STRATEGIA 2] TOP DIP HUNTER (SPADKI > -5%: {len(top_losers)} MONET) ===")
+
+    if not top_losers:
+        logging.info("⏭️ Brak monet spełniających warunek spadku minimum -5.0% w 24h. Pomijam DIP HUNTER.")
+        return
 
     if free_usdc < order_val:
         logging.info("⏭️ Pomijam skanowanie DIP HUNTER. Brak wolnych środków.")
@@ -497,6 +544,12 @@ def run_dip_hunter_strategy():
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
+            # 1. ANALIZA ZACHOWANIA Z OSTATNIEGO KWARTAŁU (90 Dni)
+            if not check_quarterly_health(symbol):
+                logging.info(f"⏭️ Odrzucono {symbol}: Słaby profil kwartalny (permanentny krach lub brak historii).")
+                continue
+
+            # 2. ANALIZA SYGNAŁU NA INTERWALE 15M
             df = get_market_data(symbol, interval="15")
             scanned_count += 1
             if df is None or len(df) < 25: continue
@@ -512,8 +565,8 @@ def run_dip_hunter_strategy():
             is_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
             is_above_ema = (c_close > candle['ema9']) and (prev_candle['close'] <= prev_candle['ema9'])
 
-            vol_confirmed = c_vol > vol_ma
-            rsi_confirmed = c_rsi <= 55
+            vol_confirmed = c_vol >= (vol_ma * DIP_VOL_MULTIPLIER)
+            rsi_confirmed = c_rsi <= DIP_RSI_15M_MAX
 
             if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
                 order_qty_usdc = f"{order_val:.2f}"
@@ -528,14 +581,14 @@ def run_dip_hunter_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol Ratio: {c_vol/vol_ma:.1f}x")
+                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! Głęboki dip zweryfikowany kwartalnie! RSI: {c_rsi:.1f}, Vol: {c_vol/vol_ma:.1f}x")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
         except Exception as e:
             logging.error(f"Błąd analizy dipu {symbol}: {e}")
 
-    logging.info(f"✅ Strategia 2: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
+    logging.info(f"✅ Strategia 2: Przeanalizowano {scanned_count} kwalifikujących się spadków. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
 # STRATEGIA 3: EMA TREND SCANNER
@@ -700,7 +753,6 @@ def monitor_and_close_positions():
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
 
-            # 1. Wyznaczenie Trailing Drop (2.5% dla Memecoinów, 1.5% dla reszty)
             is_meme = any(m in symbol for m in ["PEPE", "SHIB", "DOGE", "BONK", "FLOKI"])
             trailing_drop_pct = MEME_TRAILING_DROP_PCT if is_meme else TRAILING_DROP_PCT
             
@@ -708,7 +760,6 @@ def monitor_and_close_positions():
             total_pnl = (current_price - buy_price) / buy_price
             peak_pnl = (pos["peak_price"] - buy_price) / buy_price
 
-            # 2. Mechanizm Breakeven (Gdy szczyt PnL >= +1.5%, SL na +0.2%)
             if peak_pnl >= BREAKEVEN_TRIGGER_PCT:
                 breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
                 stop_loss_sell = current_price <= breakeven_price
@@ -737,7 +788,6 @@ def monitor_and_close_positions():
                     else:
                         res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
 
-                        # RETRY z ucinaniem mikroskopijnej prowizji w razie potrzeby
                         if res.get("retCode") == 170131:
                             logging.warning(f"⚠️ Wykryto brak ułamka środków (170131) dla {symbol}. Ponawiam próbę z korektą 0.1%...")
                             time.sleep(0.5)
