@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import socket
+import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import requests
@@ -71,16 +72,44 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
-def format_qty_for_sell(symbol, raw_qty):
-    """Formatowanie liczby monet pod rynek SPOT przy sprzedaży"""
+instrument_precisions = {}
+
+def get_symbol_qty_precision(symbol):
+    """Pobiera i zapisuje w pamięci podręcznej precyzję (ilość miejsc po przecinku) dla danego symbolu z Bybit"""
+    if symbol in instrument_precisions:
+        return instrument_precisions[symbol]
+    
+    try:
+        if session:
+            res = session.get_instruments_info(category=CATEGORY, symbol=symbol)
+            if res.get("retCode") == 0:
+                list_data = res.get("result", {}).get("list", [])
+                if list_data:
+                    lot_filter = list_data[0].get("lotSizeFilter", {})
+                    qty_step = lot_filter.get("qtyStep", "1")
+                    if "." in qty_step:
+                        decimals = len(qty_step.split(".")[1])
+                    else:
+                        decimals = 0
+                    instrument_precisions[symbol] = decimals
+                    return decimals
+    except Exception as e:
+        logging.warning(f"Nie udało się pobrać precyzji dla {symbol}: {e}")
+
     if symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol or "BONK" in symbol or "FLOKI" in symbol:
-        return str(int(raw_qty))
-    elif raw_qty >= 100:
-        return f"{raw_qty:.1f}"
-    elif raw_qty >= 1:
-        return f"{raw_qty:.2f}"
+        return 0
+    return 1
+
+def format_qty_for_sell(symbol, raw_qty):
+    """Formatowanie liczby monet pod rynek SPOT z BEZWZGLĘDNYM zaokrąglaniem w dół (FLOOR)"""
+    decimals = get_symbol_qty_precision(symbol)
+    factor = 10 ** decimals
+    floored_qty = math.floor(raw_qty * factor) / factor
+    
+    if decimals == 0:
+        return str(int(floored_qty))
     else:
-        return f"{raw_qty:.4f}"
+        return f"{floored_qty:.{decimals}f}"
 
 # ==============================================================================
 # INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT (EU PRIORITY)
@@ -592,7 +621,7 @@ def scan_pepe_specialist():
         logging.error(f"Błąd analizy PEPE: {e}")
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (DOKŁADNE SALDO PORTFELA SPOT)
+# MONITOROWANIE I SPRZEDAŻ (BEZPIECZNE FORMOWANIE W DÓŁ / FLOOR)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -637,13 +666,18 @@ def monitor_and_close_positions():
                 
                 if real_balance > 0:
                     qty_to_sell = format_qty_for_sell(symbol, real_balance)
-                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
-
-                    if res.get("retCode") == 0:
-                        logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Powód: {reason} | PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f}")
+                    
+                    if safe_float(qty_to_sell) <= 0:
+                        logging.warning(f"⚠️ Saldo {coin_name} ({real_balance}) jest zbyt małe, aby utworzyć zlecenie sprzedaży. Usuwam z pamięci.")
                         symbols_to_delete.append(symbol)
                     else:
-                        logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
+                        res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
+
+                        if res.get("retCode") == 0:
+                            logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Powód: {reason} | PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f}")
+                            symbols_to_delete.append(symbol)
+                        else:
+                            logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
                 else:
                     logging.warning(f"⚠️ Brak monet {coin_name} na koncie (pozycja mogła zostać zamknięta ręcznie). Usuwam z pamięci.")
                     symbols_to_delete.append(symbol)
