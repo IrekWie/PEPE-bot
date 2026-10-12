@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import socket
+from decimal import Decimal
 import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
@@ -43,11 +44,16 @@ PEPE_RISK_HIGH_PCT = 0.20    # 20% kapitału dla PEPE (gdy jest wystarczająco �
 PEPE_RISK_LOW_PCT = 0.10     # 10% kapitału dla PEPE (gdy jest mniej środków)
 MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
 
-# Progi Zabezpieczające (Trailing Up SPOT)
-TRAILING_DROP_PCT = 0.015    # Sprzedaż po spadku o 1.5% od najwyższego szczytu
-HARD_STOP_LOSS_PCT = 0.02    # Sztywny Stop Loss -2% od ceny zakupu
+# --- PROGI ZABEZPIECZAJĄCE (DYNAMIICZNE) ---
+TRAILING_DROP_PCT = 0.015       # Standardowy Trailing Stop (-1.5% od szczytu)
+MEME_TRAILING_DROP_PCT = 0.025  # Szerszy Trailing Stop dla Memecoinów (-2.5% od szczytu)
+HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
 
-# Progi RSI & VOL
+# --- MECHANIZM BREAKEVEN ---
+BREAKEVEN_TRIGGER_PCT = 0.015   # Aktywacja po osiągnięciu szczytu +1.5% PnL
+BREAKEVEN_SL_PCT = 0.002        # Przesunięcie Stop Loss na +0.2% PnL (pokrycie opłat)
+
+# --- PROGI RSI & VOL ---
 RSI_OVERBOUGHT_SELL = 80     # Sprzedaj, gdy RSI przekroczy 80
 RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
@@ -72,12 +78,14 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
-instrument_precisions = {}
+# ==============================================================================
+# PRECYZYJNY SILNIK FORMOWANIA ILOŚCI (DECIMAL QUANTIZATION)
+# ==============================================================================
+instrument_filters = {}
 
-def get_symbol_qty_precision(symbol):
-    """Pobiera i zapisuje w pamięci podręcznej precyzję (ilość miejsc po przecinku) dla danego symbolu z Bybit"""
-    if symbol in instrument_precisions:
-        return instrument_precisions[symbol]
+def get_symbol_lot_filter(symbol):
+    if symbol in instrument_filters:
+        return instrument_filters[symbol]
     
     try:
         if session:
@@ -87,29 +95,41 @@ def get_symbol_qty_precision(symbol):
                 if list_data:
                     lot_filter = list_data[0].get("lotSizeFilter", {})
                     qty_step = lot_filter.get("qtyStep", "1")
-                    if "." in qty_step:
-                        decimals = len(qty_step.split(".")[1])
-                    else:
-                        decimals = 0
-                    instrument_precisions[symbol] = decimals
-                    return decimals
+                    min_qty = lot_filter.get("minOrderQty", "1")
+                    instrument_filters[symbol] = (qty_step, min_qty)
+                    return qty_step, min_qty
     except Exception as e:
-        logging.warning(f"Nie udało się pobrać precyzji dla {symbol}: {e}")
+        logging.warning(f"Nie udało się pobrać filtrów dla {symbol}: {e}")
 
     if symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol or "BONK" in symbol or "FLOKI" in symbol:
-        return 0
-    return 1
+        return "1", "1"
+    return "0.1", "0.1"
 
-def format_qty_for_sell(symbol, raw_qty):
-    """Formatowanie liczby monet pod rynek SPOT z BEZWZGLĘDNYM zaokrąglaniem w dół (FLOOR)"""
-    decimals = get_symbol_qty_precision(symbol)
-    factor = 10 ** decimals
-    floored_qty = math.floor(raw_qty * factor) / factor
-    
-    if decimals == 0:
-        return str(int(floored_qty))
-    else:
-        return f"{floored_qty:.{decimals}f}"
+def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
+    try:
+        qty_dec = Decimal(str(raw_qty))
+        step_dec = Decimal(str(qty_step_str))
+        min_dec = Decimal(str(min_qty_str))
+        
+        if step_dec <= 0:
+            floored_dec = qty_dec
+        else:
+            floored_dec = (qty_dec // step_dec) * step_dec
+        
+        if floored_dec < min_dec:
+            return None
+        
+        normalized_step = step_dec.normalize()
+        exp = normalized_step.as_tuple().exponent
+        
+        if exp < 0:
+            decimals = abs(exp)
+            return f"{floored_dec:.{decimals}f}"
+        else:
+            return f"{int(floored_dec)}"
+    except Exception as e:
+        logging.error(f"Błąd precyzyjnego formatowania ilości: {e}")
+        return None
 
 # ==============================================================================
 # INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT (EU PRIORITY)
@@ -180,7 +200,6 @@ active_positions = load_positions()
 # FUNKCJE POMOCNICZE, SALDO USDC, RSI & VOL
 # ==============================================================================
 def get_balances():
-    """Zwraca dwuelementową krotkę: (Całkowita wartość konta w USD, Wolne środki USDC)"""
     if not session:
         logging.error("Sesja Bybit nie została poprawnie utworzona.")
         return 0.0, 0.0
@@ -214,7 +233,6 @@ def get_balances():
         return 0.0, 0.0
 
 def get_coin_available_balance(coin_name):
-    """Odczytuje z Bybit faktycznie dostępne wolne saldo danej monety"""
     if not session: return 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin_name)
@@ -229,6 +247,22 @@ def get_coin_available_balance(coin_name):
     except Exception as e:
         logging.error(f"Błąd pobierania salda dla {coin_name}: {e}")
     return 0.0
+
+def is_btc_market_healthy():
+    """OCHRONA BTC: Wstrzymuje nowe zakupy, gdy Bitcoin krwawi na 15M (>1% spadku)"""
+    try:
+        df_btc = get_market_data("BTCUSDC", interval="15", limit=25)
+        if df_btc is None or len(df_btc) < 10:
+            return True
+        last_candle = df_btc.iloc[-2]
+        btc_change = (last_candle['close'] - last_candle['open']) / last_candle['open']
+        if btc_change <= -0.010:
+            logging.warning(f"⚠️ [BTC MARKET GUARD] Spadek Bitcoina {btc_change*100:.2f}% w 15M. Wstrzymuję nowe zakupy altcoinów.")
+            return False
+        return True
+    except Exception as e:
+        logging.warning(f"Błąd weryfikacji trendu BTC: {e}")
+        return True
 
 def get_all_spot_usdc_symbols():
     symbols = []
@@ -254,7 +288,7 @@ def get_all_spot_usdc_symbols():
     return symbols
 
 def sync_positions_from_bybit():
-    """Automatyczna rekuperacja pozycji zakupionych przed restartem bota z filtrem walut fiat"""
+    """AUTOREKUPERACJA Z HISTORIĄ CEN ZAKUPU (GET EXECUTIONS)"""
     global active_positions
     if not session: return
     try:
@@ -268,7 +302,6 @@ def sync_positions_from_bybit():
 
         for coin_info in account_list[0].get("coin", []):
             coin = coin_info.get("coin")
-            # Ignorujemy stablecoiny oraz tradycyjne waluty (fiat)
             if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: continue
 
             avail = coin_info.get("availableToWithdraw")
@@ -278,7 +311,6 @@ def sync_positions_from_bybit():
             if bal <= 0: continue
 
             symbol = f"{coin}USDC"
-            # Sprawdzamy czy para faktycznie istnieje w ofercie Bybit przed pobraniem wykresu
             if symbol not in valid_usdc_symbols:
                 continue
 
@@ -289,15 +321,29 @@ def sync_positions_from_bybit():
                     val_in_usdc = bal * curr_price
                     
                     if val_in_usdc >= 10.0:
-                        qty_str = format_qty_for_sell(symbol, bal)
-                        active_positions[symbol] = {
-                            "strategy": "AUTO_RESTORED",
-                            "buy_price": curr_price,
-                            "peak_price": curr_price,
-                            "qty": qty_str
-                        }
-                        restored = True
-                        logging.info(f"🔄 [AUTOREKUPERACJA] Wykryto i przywrócono pozycję {symbol}: {qty_str} monet (~{val_in_usdc:.2f} USDC)")
+                        buy_price = curr_price
+                        # Odpytanie o prawdziwą cenę zakupu z historii giełdy
+                        try:
+                            exec_res = session.get_executions(category=CATEGORY, symbol=symbol, limit=10)
+                            if exec_res.get("retCode") == 0:
+                                exec_list = exec_res.get("result", {}).get("list", [])
+                                buys = [e for e in exec_list if e.get("side") == "Buy"]
+                                if buys:
+                                    buy_price = safe_float(buys[0].get("execPrice"), curr_price)
+                        except Exception:
+                            pass
+
+                        qty_step, min_qty = get_symbol_lot_filter(symbol)
+                        qty_str = format_qty_with_step(bal, qty_step, min_qty)
+                        if qty_str:
+                            active_positions[symbol] = {
+                                "strategy": "AUTO_RESTORED",
+                                "buy_price": buy_price,
+                                "peak_price": max(curr_price, buy_price),
+                                "qty": qty_str
+                            }
+                            restored = True
+                            logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono pozycję {symbol}: {qty_str} monet | Realna cena zakupu: {buy_price} USDC (~{val_in_usdc:.2f} USDC)")
 
         if restored:
             save_positions(active_positions)
@@ -372,6 +418,8 @@ def scan_for_pumps():
         logging.info("⏸️ Osiągnięto limit pozycji dla Strategii PUMP HUNTER.")
         return
 
+    if not is_btc_market_healthy(): return
+
     total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
@@ -404,15 +452,15 @@ def scan_for_pumps():
 
             if price_change >= PUMP_PRICE_CHANGE_PCT and volume_spike and rsi_valid:
                 order_qty_usdc = f"{order_val:.2f}"
-                qty_for_sell = format_qty_for_sell(symbol, order_val / c_close)
-
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                     active_positions[symbol] = {
                         "strategy": "PUMP_HUNTER",
                         "buy_price": c_close,
                         "peak_price": c_close,
-                        "qty": qty_for_sell
+                        "qty": qty_str
                     }
                     pump_positions_count += 1
                     save_positions(active_positions)
@@ -431,6 +479,7 @@ def scan_for_pumps():
 def run_dip_hunter_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    if not is_btc_market_healthy(): return
 
     total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
@@ -468,15 +517,15 @@ def run_dip_hunter_strategy():
 
             if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
                 order_qty_usdc = f"{order_val:.2f}"
-                qty_for_sell = format_qty_for_sell(symbol, order_val / c_close)
-
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                     active_positions[symbol] = {
                         "strategy": "DIP_HUNTER",
                         "buy_price": c_close,
                         "peak_price": c_close,
-                        "qty": qty_for_sell
+                        "qty": qty_str
                     }
                     save_positions(active_positions)
                     logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol Ratio: {c_vol/vol_ma:.1f}x")
@@ -494,6 +543,7 @@ def run_dip_hunter_strategy():
 def scan_top150_for_ema_signals():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    if not is_btc_market_healthy(): return
 
     total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
@@ -532,15 +582,15 @@ def scan_top150_for_ema_signals():
 
             if bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing) and rsi_ok and vol_ok:
                 order_qty_usdc = f"{order_val:.2f}"
-                qty_for_sell = format_qty_for_sell(symbol, order_val / c_close)
-
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                     active_positions[symbol] = {
                         "strategy": "EMA_TOP150",
                         "buy_price": c_close,
                         "peak_price": c_close,
-                        "qty": qty_for_sell
+                        "qty": qty_str
                     }
                     save_positions(active_positions)
                     logging.info(f"🔥 [EMA KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: OK | Cena: {c_close}")
@@ -600,15 +650,15 @@ def scan_pepe_specialist():
 
         if bullish_alignment and rsi_valid and volume_ok and price_rebound:
             order_qty_usdc = f"{order_val:.2f}"
-            qty_for_sell = format_qty_for_sell(pepe_symbol, order_val / c_close)
-
             res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
             if res.get("retCode") == 0:
+                qty_step, min_qty = get_symbol_lot_filter(pepe_symbol)
+                qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                 active_positions[pepe_symbol] = {
                     "strategy": "PEPE_SPECIALIST",
                     "buy_price": c_close,
                     "peak_price": c_close,
-                    "qty": qty_for_sell
+                    "qty": qty_str
                 }
                 save_positions(active_positions)
                 logging.info(f"🐸🔥 [PEPE KUPNO OK] Zakupiono za {order_val:.2f} USDC ({risk_label})! RSI: {c_rsi:.1f}, Vol: OK")
@@ -621,7 +671,7 @@ def scan_pepe_specialist():
         logging.error(f"Błąd analizy PEPE: {e}")
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (BEZPIECZNE FORMOWANIE W DÓŁ / FLOOR)
+# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (BREAKEVEN + DYNAMIC MEME TRAILING)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -650,28 +700,51 @@ def monitor_and_close_positions():
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
 
+            # 1. Wyznaczenie Trailing Drop (2.5% dla Memecoinów, 1.5% dla reszty)
+            is_meme = any(m in symbol for m in ["PEPE", "SHIB", "DOGE", "BONK", "FLOKI"])
+            trailing_drop_pct = MEME_TRAILING_DROP_PCT if is_meme else TRAILING_DROP_PCT
+            
             drop_from_peak = (pos["peak_price"] - current_price) / pos["peak_price"]
             total_pnl = (current_price - buy_price) / buy_price
+            peak_pnl = (pos["peak_price"] - buy_price) / buy_price
 
-            trailing_sell = drop_from_peak >= TRAILING_DROP_PCT and current_price > buy_price
-            stop_loss_sell = total_pnl <= -HARD_STOP_LOSS_PCT
+            # 2. Mechanizm Breakeven (Gdy szczyt PnL >= +1.5%, SL na +0.2%)
+            if peak_pnl >= BREAKEVEN_TRIGGER_PCT:
+                breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
+                stop_loss_sell = current_price <= breakeven_price
+                sl_type = "Breakeven SL (+0.2%)"
+            else:
+                stop_loss_sell = total_pnl <= -HARD_STOP_LOSS_PCT
+                sl_type = "Hard Stop Loss (-2.0%)"
+
+            trailing_sell = drop_from_peak >= trailing_drop_pct and current_price > buy_price
             rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
             vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
 
             if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell:
-                reason = "Trailing Up" if trailing_sell else ("Stop Loss" if stop_loss_sell else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit"))
+                reason = f"Trailing Up (-{trailing_drop_pct*100:.1f}%)" if trailing_sell else (sl_type if stop_loss_sell else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit"))
                 
                 coin_name = symbol.replace(QUOTE_COIN, "")
                 real_balance = get_coin_available_balance(coin_name)
                 
                 if real_balance > 0:
-                    qty_to_sell = format_qty_for_sell(symbol, real_balance)
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_to_sell = format_qty_with_step(real_balance, qty_step, min_qty)
                     
-                    if safe_float(qty_to_sell) <= 0:
-                        logging.warning(f"⚠️ Saldo {coin_name} ({real_balance}) jest zbyt małe, aby utworzyć zlecenie sprzedaży. Usuwam z pamięci.")
+                    if not qty_to_sell:
+                        logging.warning(f"⚠️ Saldo {coin_name} ({real_balance}) poniżej wymaganego minimum. Usuwam z pamięci.")
                         symbols_to_delete.append(symbol)
                     else:
                         res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
+
+                        # RETRY z ucinaniem mikroskopijnej prowizji w razie potrzeby
+                        if res.get("retCode") == 170131:
+                            logging.warning(f"⚠️ Wykryto brak ułamka środków (170131) dla {symbol}. Ponawiam próbę z korektą 0.1%...")
+                            time.sleep(0.5)
+                            real_balance_retry = get_coin_available_balance(coin_name) * 0.999
+                            qty_to_sell_retry = format_qty_with_step(real_balance_retry, qty_step, min_qty)
+                            if qty_to_sell_retry:
+                                res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell_retry)
 
                         if res.get("retCode") == 0:
                             logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Powód: {reason} | PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f}")
