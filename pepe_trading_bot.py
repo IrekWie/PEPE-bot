@@ -184,6 +184,23 @@ def get_balances():
         logging.error(f"Błąd pobierania salda: {e}")
         return 0.0, 0.0
 
+def get_coin_available_balance(coin_name):
+    """Odczytuje z Bybit faktycznie dostępne wolne saldo danej monety"""
+    if not session: return 0.0
+    try:
+        res = session.get_wallet_balance(accountType="UNIFIED", coin=coin_name)
+        if res.get("retCode") == 0:
+            account_list = res.get("result", {}).get("list", [])
+            if account_list:
+                for c in account_list[0].get("coin", []):
+                    if c.get("coin") == coin_name:
+                        avail = c.get("availableToWithdraw")
+                        eq = c.get("equity")
+                        return safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
+    except Exception as e:
+        logging.error(f"Błąd pobierania salda dla {coin_name}: {e}")
+    return 0.0
+
 def get_all_spot_usdc_symbols():
     symbols = []
     try:
@@ -524,7 +541,7 @@ def scan_pepe_specialist():
         logging.error(f"Błąd analizy PEPE: {e}")
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (TRAILING UP + RSI OVERBOUGHT + VOL DUMP)
+# MONITOROWANIE I SPRZEDAŻ (DOKŁADNE SALDO PORTFELA SPOT)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -547,7 +564,6 @@ def monitor_and_close_positions():
 
             buy_price = pos["buy_price"]
             peak_price = pos.get("peak_price", buy_price)
-            qty_to_sell = pos["qty"]
 
             if current_price > peak_price:
                 pos["peak_price"] = current_price
@@ -564,13 +580,23 @@ def monitor_and_close_positions():
 
             if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell:
                 reason = "Trailing Up" if trailing_sell else ("Stop Loss" if stop_loss_sell else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit"))
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
+                
+                # Pobieramy FAKTYCZNIE DOSTĘPNE saldo monety na Bybit (po opłatach SPOT)
+                coin_name = symbol.replace(QUOTE_COIN, "")
+                real_balance = get_coin_available_balance(coin_name)
+                
+                if real_balance > 0:
+                    qty_to_sell = format_qty_for_sell(symbol, real_balance)
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
 
-                if res.get("retCode") == 0:
-                    logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Powód: {reason} | PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f}")
-                    symbols_to_delete.append(symbol)
+                    if res.get("retCode") == 0:
+                        logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Powód: {reason} | PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f}")
+                        symbols_to_delete.append(symbol)
+                    else:
+                        logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
                 else:
-                    logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
+                    logging.warning(f"⚠️ Brak monet {coin_name} na koncie (pozycja mogła zostać zamknięta ręcznie). Usuwam z pamięci.")
+                    symbols_to_delete.append(symbol)
             else:
                 logging.info(f"ℹ️ [{symbol}] PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f} | Szczyt: {pos['peak_price']} | Cena: {current_price}")
 
