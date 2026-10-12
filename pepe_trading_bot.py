@@ -203,7 +203,7 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE, SALDO USDC, RSI, VOL & EMA 200
+# FUNKCJE POMOCNICZE, SALDO USDC, RSI, VOL & FILTR BTC
 # ==============================================================================
 def get_balances():
     if not session:
@@ -254,15 +254,16 @@ def get_coin_available_balance(coin_name):
         logging.error(f"Błąd pobierania salda dla {coin_name}: {e}")
     return 0.0
 
-def is_btc_market_healthy():
+def is_btc_market_healthy(drop_threshold=-0.010):
+    """FILTR BTC: Wstrzymuje zakupy w zależności od zadanego progu spadku BTC w 15M"""
     try:
         df_btc = get_market_data("BTCUSDC", interval="15", limit=25)
         if df_btc is None or len(df_btc) < 10:
             return True
         last_candle = df_btc.iloc[-2]
         btc_change = (last_candle['close'] - last_candle['open']) / last_candle['open']
-        if btc_change <= -0.010:
-            logging.warning(f"⚠️ [BTC MARKET GUARD] Spadek Bitcoina {btc_change*100:.2f}% w 15M. Wstrzymuję nowe zakupy altcoinów.")
+        if btc_change <= drop_threshold:
+            logging.warning(f"⚠️ [BTC MARKET GUARD] Spadek Bitcoina {btc_change*100:.2f}% w 15M (Próg: {drop_threshold*100:.1f}%). Wstrzymuję zakupy.")
             return False
         return True
     except Exception as e:
@@ -454,7 +455,7 @@ def scan_for_pumps():
         logging.info("⏸️ Osiągnięto limit pozycji dla Strategii PUMP HUNTER.")
         return
 
-    if not is_btc_market_healthy(): return
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
@@ -515,7 +516,7 @@ def scan_for_pumps():
 def run_dip_hunter_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
-    if not is_btc_market_healthy(): return
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
@@ -587,7 +588,7 @@ def run_dip_hunter_strategy():
 def scan_top150_for_ema_signals():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
-    if not is_btc_market_healthy(): return
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
@@ -647,13 +648,18 @@ def scan_top150_for_ema_signals():
     logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 4: DEDYKOWANY SKANER PEPE (EMA 21 / 89 / 200 STRATEGY)
+# STRATEGIA 4: DEDYKOWANY SKANER PEPE (EMA 21/89/200 + ASEKURACJA BTC -1.5%)
 # ==============================================================================
 def scan_pepe_specialist():
     global active_positions
     pepe_symbol = "PEPEUSDC"
 
     if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        return
+
+    # ASEKURACJA BTC DLA PEPE: Wstrzymuje zakupy PEPE tylko przy nagłym krachu BTC (> -1.5% w 15M)
+    if not is_btc_market_healthy(drop_threshold=-0.015):
+        logging.info("⏭️ [PEPE] Pomijam skanowanie PEPE ze względu na gwałtowny spadek Bitcoina (> -1.5%).")
         return
 
     total_equity, free_usdc = get_balances()
@@ -757,7 +763,6 @@ def monitor_and_close_positions():
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
 
-            # Wyznaczenie Trailing Drop (2.8% dla PEPE, 2.5% dla innych Memecoinów, 1.5% dla reszty)
             if symbol == "PEPEUSDC":
                 trailing_drop_pct = PEPE_TRAILING_DROP_PCT
             elif any(m in symbol for m in ["SHIB", "DOGE", "BONK", "FLOKI"]):
@@ -769,7 +774,6 @@ def monitor_and_close_positions():
             total_pnl = (current_price - buy_price) / buy_price
             peak_pnl = (pos["peak_price"] - buy_price) / buy_price
 
-            # Breakeven Mechanism
             if peak_pnl >= BREAKEVEN_TRIGGER_PCT:
                 breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
                 stop_loss_sell = current_price <= breakeven_price
@@ -782,7 +786,6 @@ def monitor_and_close_positions():
             rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
             vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
 
-            # PEPE EMA TREND BREAKAWAY EXIT (Złamanie trendu EMA89 dla PEPE)
             pepe_ema_break_exit = False
             if symbol == "PEPEUSDC":
                 ema89 = candle['ema89']
