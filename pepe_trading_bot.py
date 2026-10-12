@@ -44,21 +44,22 @@ PEPE_RISK_HIGH_PCT = 0.20    # 20% kapitału dla PEPE (gdy jest wystarczająco �
 PEPE_RISK_LOW_PCT = 0.10     # 10% kapitału dla PEPE (gdy jest mniej środków)
 MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
 
-# --- SEKCJA PARATRYCZNA STRATEGII 2 (TOP DIP HUNTER) ---
-MIN_DIP_24H_PCT = -0.050     # Wymagany SPADEK minimum -5.0% w 24h (brak zakupów przy minimalnych spadkach)
+# --- STRATEGIA 2 (TOP DIP HUNTER) ---
+MIN_DIP_24H_PCT = -0.050     # Wymagany SPADEK minimum -5.0% w 24h
 DIP_RSI_15M_MAX = 40         # Głębokie wyprzedanie na 15M (RSI <= 40)
 DIP_VOL_MULTIPLIER = 1.5     # Wolumen odbicia co najmniej 1.5x większy od MA20
 
-# --- PROGI ZABEZPIECZAJĄCE (DYNAMIICZNE) ---
+# --- PROGI ZABEZPIECZAJĄCE ---
 TRAILING_DROP_PCT = 0.015       # Standardowy Trailing Stop (-1.5% od szczytu)
-MEME_TRAILING_DROP_PCT = 0.025  # Szerszy Trailing Stop dla Memecoinów (-2.5% od szczytu)
+PEPE_TRAILING_DROP_PCT = 0.028  # Dedykowany Trailing Stop dla PEPE (-2.8% od szczytu)
+MEME_TRAILING_DROP_PCT = 0.025  # Trailing Stop dla pozostałych Memecoinów (-2.5%)
 HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
 
 # --- MECHANIZM BREAKEVEN ---
 BREAKEVEN_TRIGGER_PCT = 0.015   # Aktywacja po osiągnięciu szczytu +1.5% PnL
 BREAKEVEN_SL_PCT = 0.002        # Przesunięcie Stop Loss na +0.2% PnL (pokrycie opłat)
 
-# --- PROGI RSI & VOL (DLA PUMP HUNTER & EMA) ---
+# --- PROGI RSI & VOL ---
 RSI_OVERBOUGHT_SELL = 80     # Sprzedaj, gdy RSI przekroczy 80
 RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
@@ -202,7 +203,7 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE, SALDO USDC, RSI & VOL
+# FUNKCJE POMOCNICZE, SALDO USDC, RSI, VOL & EMA 200
 # ==============================================================================
 def get_balances():
     if not session:
@@ -254,7 +255,6 @@ def get_coin_available_balance(coin_name):
     return 0.0
 
 def is_btc_market_healthy():
-    """OCHRONA BTC: Wstrzymuje nowe zakupy, gdy Bitcoin krwawi na 15M (>1% spadku)"""
     try:
         df_btc = get_market_data("BTCUSDC", interval="15", limit=25)
         if df_btc is None or len(df_btc) < 10:
@@ -270,14 +270,11 @@ def is_btc_market_healthy():
         return True
 
 def check_quarterly_health(symbol):
-    """ANALIZA ZACHOWANIA W OSTATNIM KWARTALE (90 Dni na interwale D1).
-    Odrzuca tokeny bez historii oraz waluty w permanentnej spiralnej zapaści."""
     try:
         time.sleep(0.05)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval="D", limit=90)
         candles = res.get("result", {}).get("list", [])
         if not candles or len(candles) < 60:
-            # Krótsza historia niż 2 miesiące / kwartał -> ODRZUCAMY
             return False
 
         df_q = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
@@ -289,15 +286,12 @@ def check_quarterly_health(symbol):
         close_90d_ago = df_q.iloc[0]['close']
         q_change = (close_now - close_90d_ago) / close_90d_ago
 
-        # Spadek w kwartale o więcej niż -75% oznacza ruinę waluty (Death Spiral)
         if q_change <= -0.75:
             return False
 
-        # Obliczenie RSI Dniowego (D1)
         df_q['rsi_d1'] = calculate_rsi(df_q['close'], period=14)
         rsi_d1_now = df_q.iloc[-1]['rsi_d1']
 
-        # Dniowe RSI nie może być skrajnie wykupione (>55 w korekcie)
         if rsi_d1_now > 55:
             return False
 
@@ -406,12 +400,10 @@ def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     return get_all_spot_usdc_symbols()[:limit_count]
 
 def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
-    """ZWRACA TYLKO MONETY ZE SPADKIEM MINIMUM -5.0% W 24H"""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
         if usdc_tickers:
-            # Filtrujemy tylko realne spadki (price24hPcnt <= -0.05)
             valid_losers = [t for t in usdc_tickers if safe_float(t.get("price24hPcnt")) <= MIN_DIP_24H_PCT]
             sorted_tickers = sorted(valid_losers, key=lambda x: safe_float(x.get("price24hPcnt")))
             return [t["symbol"] for t in sorted_tickers[:limit_count]]
@@ -427,7 +419,7 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def get_market_data(symbol, interval="15", limit=100):
+def get_market_data(symbol, interval="15", limit=250):
     try:
         time.sleep(0.05)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
@@ -442,6 +434,7 @@ def get_market_data(symbol, interval="15", limit=100):
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
         df['rsi'] = calculate_rsi(df['close'], period=14)
         df['vol_ma20'] = df['volume'].rolling(window=20).mean()
 
@@ -517,7 +510,7 @@ def scan_for_pumps():
     logging.info(f"✅ Strategia 1: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER (Z FILTREM KWARTALNYM I MIN. SPADKIEM -5%)
+# STRATEGIA 2: TOP DIP HUNTER
 # ==============================================================================
 def run_dip_hunter_strategy():
     global active_positions
@@ -544,12 +537,10 @@ def run_dip_hunter_strategy():
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
-            # 1. ANALIZA ZACHOWANIA Z OSTATNIEGO KWARTAŁU (90 Dni)
             if not check_quarterly_health(symbol):
-                logging.info(f"⏭️ Odrzucono {symbol}: Słaby profil kwartalny (permanentny krach lub brak historii).")
+                logging.info(f"⏭️ Odrzucono {symbol}: Słaby profil kwartalny.")
                 continue
 
-            # 2. ANALIZA SYGNAŁU NA INTERWALE 15M
             df = get_market_data(symbol, interval="15")
             scanned_count += 1
             if df is None or len(df) < 25: continue
@@ -581,7 +572,7 @@ def run_dip_hunter_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! Głęboki dip zweryfikowany kwartalnie! RSI: {c_rsi:.1f}, Vol: {c_vol/vol_ma:.1f}x")
+                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: {c_vol/vol_ma:.1f}x")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
@@ -656,7 +647,7 @@ def scan_top150_for_ema_signals():
     logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 4: DEDYKOWANY SKANER PEPE (PEPEUSDC - 20% / 10% KAPITAŁU)
+# STRATEGIA 4: DEDYKOWANY SKANER PEPE (EMA 21 / 89 / 200 STRATEGY)
 # ==============================================================================
 def scan_pepe_specialist():
     global active_positions
@@ -679,52 +670,65 @@ def scan_pepe_specialist():
         order_val = free_usdc
         risk_label = "Wolne Środki"
     else:
-        logging.info(f"=== [STRATEGIA 4] PEPE SPECIALIST HUNTER ({pepe_symbol}) ===")
+        logging.info(f"=== [STRATEGIA 4] PEPE EMA SPECIALIST ({pepe_symbol}) ===")
         logging.info(f"⏭️ Pomijam skanowanie PEPE. Wolne środki ({free_usdc:.2f} USDC) poniżej wymaganego minimum.")
         return
 
-    logging.info(f"=== [STRATEGIA 4] PEPE SPECIALIST HUNTER ({pepe_symbol}) ===")
+    logging.info(f"=== [STRATEGIA 4] PEPE EMA SPECIALIST ({pepe_symbol}) ===")
     logging.info(f"🐸 Saldo UTA: {free_usdc:.2f} USDC | Dedykowany zakup PEPE: {order_val:.2f} USDC ({risk_label} kapitału)")
 
     try:
-        df = get_market_data(pepe_symbol, interval="15")
-        if df is None or len(df) < 25: return
+        df = get_market_data(pepe_symbol, interval="15", limit=250)
+        if df is None or len(df) < 200: return
 
         candle = df.iloc[-2]
+        prev_candle = df.iloc[-3]
         c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
         c_vol, vol_ma = candle['volume'], candle['vol_ma20']
         c_rsi = candle['rsi']
-        ema9, ema21, ema89 = candle['ema9'], candle['ema21'], candle['ema89']
+        
+        ema21 = candle['ema21']
+        ema89 = candle['ema89']
+        ema200 = candle['ema200']
+        
+        prev_ema21 = prev_candle['ema21']
+        prev_ema89 = prev_candle['ema89']
 
-        bullish_alignment = (ema9 > ema21) or (c_close > ema89)
-        rsi_valid = 40 <= c_rsi <= 70
-        volume_ok = c_vol >= (vol_ma * 0.8)
-        price_rebound = (c_close > c_open) or (c_low <= ema21 and c_close > ema21)
+        # 1. MAKRO TREND: PEPE MUSI BYĆ W TRENDZIE WZROSTOWYM PONAD EMA 200
+        macro_trend_ok = (c_close > ema200) and (ema21 > ema200)
 
-        if bullish_alignment and rsi_valid and volume_ok and price_rebound:
+        # 2. SYGNAŁ WEJŚCIA: PRZECIĘCIE EMA 21 NAD EMA 89 LUB ODBICIE W TRENDZIE
+        ema_crossover = (prev_ema21 <= prev_ema89) and (ema21 > ema89)
+        ema_bounce = (ema21 > ema89) and (c_low <= ema21) and (c_close > ema21) and (c_close > c_open)
+
+        rsi_valid = 45 <= c_rsi <= 70
+        volume_ok = c_vol >= vol_ma
+
+        if macro_trend_ok and (ema_crossover or ema_bounce) and rsi_valid and volume_ok:
             order_qty_usdc = f"{order_val:.2f}"
             res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
             if res.get("retCode") == 0:
                 qty_step, min_qty = get_symbol_lot_filter(pepe_symbol)
                 qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                 active_positions[pepe_symbol] = {
-                    "strategy": "PEPE_SPECIALIST",
+                    "strategy": "PEPE_EMA_SPECIALIST",
                     "buy_price": c_close,
                     "peak_price": c_close,
                     "qty": qty_str
                 }
                 save_positions(active_positions)
-                logging.info(f"🐸🔥 [PEPE KUPNO OK] Zakupiono za {order_val:.2f} USDC ({risk_label})! RSI: {c_rsi:.1f}, Vol: OK")
+                s_type = "Złoty Krzyż EMA21/89" if ema_crossover else "Odbicie w Trendzie EMA21"
+                logging.info(f"🐸🔥 [PEPE KUPNO OK] Sygnał: {s_type} | Zakup: {order_val:.2f} USDC ({risk_label})! RSI: {c_rsi:.1f}, Vol: OK")
             else:
                 logging.error(f"❌ Błąd zakupu PEPE: {res}")
         else:
-            logging.info(f"✅ Strategia 4 (PEPE): Brak sygnału zakupu dla PEPEUSDC w tej 15M świecy.")
+            logging.info(f"✅ Strategia 4 (PEPE): Brak sygnału EMA21/89/200 dla PEPEUSDC w tej 15M świecy.")
 
     except Exception as e:
         logging.error(f"Błąd analizy PEPE: {e}")
 
 # ==============================================================================
-# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (BREAKEVEN + DYNAMIC MEME TRAILING)
+# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (DEDYKOWANE WYJŚCIE EMA DLA PEPE)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -737,7 +741,7 @@ def monitor_and_close_positions():
 
     for symbol, pos in active_positions.items():
         try:
-            df = get_market_data(symbol, interval="15", limit=25)
+            df = get_market_data(symbol, interval="15", limit=250)
             if df is None: continue
 
             candle = df.iloc[-1]
@@ -753,13 +757,19 @@ def monitor_and_close_positions():
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
 
-            is_meme = any(m in symbol for m in ["PEPE", "SHIB", "DOGE", "BONK", "FLOKI"])
-            trailing_drop_pct = MEME_TRAILING_DROP_PCT if is_meme else TRAILING_DROP_PCT
-            
+            # Wyznaczenie Trailing Drop (2.8% dla PEPE, 2.5% dla innych Memecoinów, 1.5% dla reszty)
+            if symbol == "PEPEUSDC":
+                trailing_drop_pct = PEPE_TRAILING_DROP_PCT
+            elif any(m in symbol for m in ["SHIB", "DOGE", "BONK", "FLOKI"]):
+                trailing_drop_pct = MEME_TRAILING_DROP_PCT
+            else:
+                trailing_drop_pct = TRAILING_DROP_PCT
+
             drop_from_peak = (pos["peak_price"] - current_price) / pos["peak_price"]
             total_pnl = (current_price - buy_price) / buy_price
             peak_pnl = (pos["peak_price"] - buy_price) / buy_price
 
+            # Breakeven Mechanism
             if peak_pnl >= BREAKEVEN_TRIGGER_PCT:
                 breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
                 stop_loss_sell = current_price <= breakeven_price
@@ -772,8 +782,16 @@ def monitor_and_close_positions():
             rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
             vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
 
-            if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell:
-                reason = f"Trailing Up (-{trailing_drop_pct*100:.1f}%)" if trailing_sell else (sl_type if stop_loss_sell else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit"))
+            # PEPE EMA TREND BREAKAWAY EXIT (Złamanie trendu EMA89 dla PEPE)
+            pepe_ema_break_exit = False
+            if symbol == "PEPEUSDC":
+                ema89 = candle['ema89']
+                ema21 = candle['ema21']
+                if current_price < ema89 or ema21 < ema89:
+                    pepe_ema_break_exit = True
+
+            if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit:
+                reason = f"Trailing Up (-{trailing_drop_pct*100:.1f}%)" if trailing_sell else (sl_type if stop_loss_sell else ("PEPE EMA Trend Breakdown" if pepe_ema_break_exit else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit")))
                 
                 coin_name = symbol.replace(QUOTE_COIN, "")
                 real_balance = get_coin_available_balance(coin_name)
