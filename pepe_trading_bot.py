@@ -201,6 +201,51 @@ def get_coin_available_balance(coin_name):
         logging.error(f"Błąd pobierania salda dla {coin_name}: {e}")
     return 0.0
 
+def sync_positions_from_bybit():
+    """Automatyczna rekuperacja pozycji zakupionych przed restartem bota"""
+    global active_positions
+    if not session: return
+    try:
+        res = session.get_wallet_balance(accountType="UNIFIED")
+        if res.get("retCode") != 0: return
+        account_list = res.get("result", {}).get("list", [])
+        if not account_list: return
+
+        restored = False
+        for coin_info in account_list[0].get("coin", []):
+            coin = coin_info.get("coin")
+            if coin in ["USDC", "USDT", "USD"]: continue
+
+            avail = coin_info.get("availableToWithdraw")
+            eq = coin_info.get("equity")
+            bal = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
+
+            if bal <= 0: continue
+
+            symbol = f"{coin}USDC"
+            if symbol not in active_positions:
+                df = get_market_data(symbol, interval="15", limit=5)
+                if df is not None and len(df) > 0:
+                    curr_price = df.iloc[-1]['close']
+                    val_in_usdc = bal * curr_price
+                    
+                    # Jeśli wartość pozycji przekracza 10 USD (omijamy drobne resztki)
+                    if val_in_usdc >= 10.0:
+                        qty_str = format_qty_for_sell(symbol, bal)
+                        active_positions[symbol] = {
+                            "strategy": "AUTO_RESTORED",
+                            "buy_price": curr_price,
+                            "peak_price": curr_price,
+                            "qty": qty_str
+                        }
+                        restored = True
+                        logging.info(f"🔄 [AUTOREKUPERACJA] Wykryto i przywrócono pozycję {symbol}: {qty_str} monet (~{val_in_usdc:.2f} USDC)")
+
+        if restored:
+            save_positions(active_positions)
+    except Exception as e:
+        logging.error(f"Błąd automatycznej synchronizacji z Bybit: {e}")
+
 def get_all_spot_usdc_symbols():
     symbols = []
     try:
@@ -581,7 +626,6 @@ def monitor_and_close_positions():
             if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell:
                 reason = "Trailing Up" if trailing_sell else ("Stop Loss" if stop_loss_sell else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit"))
                 
-                # Pobieramy FAKTYCZNIE DOSTĘPNE saldo monety na Bybit (po opłatach SPOT)
                 coin_name = symbol.replace(QUOTE_COIN, "")
                 real_balance = get_coin_available_balance(coin_name)
                 
@@ -612,10 +656,17 @@ def monitor_and_close_positions():
 # PĘTLA GŁÓWNA I SERWER
 # ==============================================================================
 def bot_loop():
+    # Automatyczna rekuperacja otwartych pozycji z giełdy na starcie
+    sync_positions_from_bybit()
+
     while True:
         try:
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT USDC...")
+            
+            # Dodatkowa kontrola synchronizacji przy każdym cyklu
+            sync_positions_from_bybit()
+
             scan_for_pumps()               
             run_dip_hunter_strategy()      
             scan_top150_for_ema_signals()  
