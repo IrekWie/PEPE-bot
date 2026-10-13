@@ -36,7 +36,7 @@ QUOTE_COIN = "USDC" # Waluta bazowa do handlu
 TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par USDC
 TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
 TOP_GAINERS_COUNT = 4        # Skanuj 4 monety o największym wzroście 24h
-MAX_EMA_CROSS_POSITIONS = 5  # Maksymalnie 5 pozycji dla strategii czystego przecięcia EMA 21/89
+MAX_EMA_CROSS_POSITIONS = 5  # Maksymalnie 5 pozycji dla czystego przecięcia EMA 21/89
 MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
 MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
 
@@ -45,6 +45,11 @@ RISK_PCT_PER_TRADE = 0.15    # Standardowo 15% na pozycję
 PEPE_RISK_HIGH_PCT = 0.20    # 20% kapitału dla PEPE (gdy jest wystarczająco środków)
 PEPE_RISK_LOW_PCT = 0.10     # 10% kapitału dla PEPE (gdy jest mniej środków)
 MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
+
+# --- FILTRY ANTY-SZUMOWE EMA 21/89 ---
+EMA_CROSS_MIN_SPREAD_PCT = 0.0020  # Wymagana separacja min. +0.20% ponad EMA 89
+EMA_CROSS_VOL_MULTIPLIER = 1.10    # Wolumen na świecy min. 1.1x MA20
+EMA_EXIT_HYSTERESIS_PCT  = 0.0020  # Histereza wyjścia: EMA 21 musi spaść min. 0.20% poniżej EMA 89
 
 # --- STRATEGIA 2 (TOP DIP HUNTER) ---
 MIN_DIP_24H_PCT = -0.050     # Wymagany SPADEK minimum -5.0% w 24h
@@ -61,7 +66,7 @@ HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
 BREAKEVEN_TRIGGER_PCT = 0.015   # Aktywacja po osiągnięciu szczytu +1.5% PnL
 BREAKEVEN_SL_PCT = 0.002        # Przesunięcie Stop Loss na +0.2% PnL (pokrycie opłat)
 
-# --- PROGI RSI & VOL (DLA STRATEGII PUMP & STANDARD EMA) ---
+# --- PROGI RSI & VOL ---
 RSI_OVERBOUGHT_SELL = 80     # Sprzedaj, gdy RSI przekroczy 80
 RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
@@ -660,7 +665,7 @@ def scan_top150_for_ema_signals():
     logging.info(f"✅ Strategia 3: Przeanalizowano {scanned_count} par USDC. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 4: DEDYKOWANY SKANER PEPE (EMA 21/89/200 + ASEKURACJA BTC -1.5%)
+# STRATEGIA 4: DEDYKOWANY SKANER PEPE (EMA 21/89/200 + FILTR ANTY-SZUMOWY)
 # ==============================================================================
 def scan_pepe_specialist():
     global active_positions
@@ -711,9 +716,17 @@ def scan_pepe_specialist():
         prev_ema21 = prev_candle['ema21']
         prev_ema89 = prev_candle['ema89']
 
+        # 1. MAKRO TREND WZROSTOWY
         macro_trend_ok = (c_close > ema200) and (ema21 > ema200)
-        ema_crossover = (prev_ema21 <= prev_ema89) and (ema21 > ema89)
-        ema_bounce = (ema21 > ema89) and (c_low <= ema21) and (c_close > ema21) and (c_close > c_open)
+
+        # 2. FILTR ANTY-SZUMOWY WEJŚCIA DLA PEPE
+        ema_spread = (ema21 - ema89) / ema89
+        ema_rising = ema21 > prev_ema21
+        
+        # Złoty Krzyż z minimalną separacją i rosnącym nachyleniem
+        ema_crossover = (prev_ema21 <= prev_ema89) and (ema21 > ema89) and (ema_spread >= 0.0015) and ema_rising
+        # Odbicie od wsparcia z zachowaniem przewagi EMA21
+        ema_bounce = (ema21 > ema89) and (c_low <= ema21) and (c_close > ema21) and (c_close > c_open) and ema_rising
 
         rsi_valid = 45 <= c_rsi <= 70
         volume_ok = c_vol >= vol_ma
@@ -731,12 +744,12 @@ def scan_pepe_specialist():
                     "qty": qty_str
                 }
                 save_positions(active_positions)
-                s_type = "Złoty Krzyż EMA21/89" if ema_crossover else "Odbicie w Trendzie EMA21"
+                s_type = "Złoty Krzyż EMA21/89 (Clean)" if ema_crossover else "Odbicie w Trendzie EMA21"
                 logging.info(f"🐸🔥 [PEPE KUPNO OK] Sygnał: {s_type} | Zakup: {order_val:.2f} USDC ({risk_label})! RSI: {c_rsi:.1f}, Vol: OK")
             else:
                 logging.error(f"❌ Błąd zakupu PEPE: {res}")
         else:
-            logging.info(f"✅ Strategia 4 (PEPE): Brak sygnału EMA21/89/200 dla PEPEUSDC w tej 15M świecy.")
+            logging.info(f"✅ Strategia 4 (PEPE): Brak potwierdzonego sygnału EMA dla PEPEUSDC w tej 15M świecy.")
 
     except Exception as e:
         logging.error(f"Błąd analizy PEPE: {e}")
@@ -812,7 +825,7 @@ def run_top_gainers_strategy():
     logging.info(f"✅ Strategia 5: Przeanalizowano {scanned_count} liderów rynku. Brak nowych sygnałów zakupu.")
 
 # ==============================================================================
-# STRATEGIA 6: CZYSTY CROSS EMA 21 / 89 (MAX 5 POZYCJI)
+# STRATEGIA 6: CZYSTY CROSS EMA 21 / 89 (POZBAWIONY SZUMÓW / ANTI-WHIPSAW)
 # ==============================================================================
 def run_ema21_89_pure_crossover_strategy():
     global active_positions
@@ -827,7 +840,7 @@ def run_ema21_89_pure_crossover_strategy():
     order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
 
     all_symbols = get_all_spot_usdc_symbols()
-    logging.info(f"=== [STRATEGIA 6] CZYSTY CROSS EMA 21/89 (AKTYWNYCH: {current_cross_positions}/{MAX_EMA_CROSS_POSITIONS}) ===")
+    logging.info(f"=== [STRATEGIA 6] CZYSTY CROSS EMA 21/89 ANTI-SZUM (AKTYWNYCH: {current_cross_positions}/{MAX_EMA_CROSS_POSITIONS}) ===")
 
     if free_usdc < order_val:
         logging.info(f"⏭️ Pomijam skanowanie EMA 21/89 Cross. Brak wolnych środków {order_val:.2f} USDC.")
@@ -845,15 +858,29 @@ def run_ema21_89_pure_crossover_strategy():
 
             candle = df.iloc[-2]
             prev_candle = df.iloc[-3]
-            c_close = candle['close']
+            c_open, c_close = candle['open'], candle['close']
+            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
 
             ema21_now, ema89_now = candle['ema21'], candle['ema89']
             ema21_prev, ema89_prev = prev_candle['ema21'], prev_candle['ema89']
 
-            # ZŁOTY KRZYŻ: ŚWIEŻE PRZECIĘCIE EMA 21 OD DOŁU NAD EMA 89
-            golden_cross = (ema21_prev <= ema89_prev) and (ema21_now > ema89_now)
+            # 1. ZŁOTY KRZYŻ: ŚWIEŻE PRZECIĘCIE
+            basic_crossover = (ema21_prev <= ema89_prev) and (ema21_now > ema89_now)
 
-            if golden_cross:
+            # 2. FILTR SEPARACJI (SPREAD): EMA 21 WYBIŁA SIĘ MINIMUM 0.20% PONAD EMA 89
+            spread_pct = (ema21_now - ema89_now) / ema89_now
+            has_clean_spread = spread_pct >= EMA_CROSS_MIN_SPREAD_PCT
+
+            # 3. FILTR NACHYLENIA (SLOPE): EMA 21 MA WYRAŹNY WEKTOR WZROSTOWY
+            ema21_sloping_up = ema21_now > ema21_prev
+
+            # 4. POTWIERDZENIE CENĄ I ŚWIECĄ: CENA PONAD EMA21 ORAZ ZIELONY KORPUS
+            price_confirmed = (c_close > ema21_now) and (c_close > c_open)
+
+            # 5. POTWIERDZENIE WOLUMENEM: RUCH POTWIERDZONY NAPŁYWEM KAPITAŁU
+            volume_confirmed = c_vol >= (vol_ma * EMA_CROSS_VOL_MULTIPLIER)
+
+            if basic_crossover and has_clean_spread and ema21_sloping_up and price_confirmed and volume_confirmed:
                 order_qty_usdc = f"{order_val:.2f}"
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
@@ -867,17 +894,17 @@ def run_ema21_89_pure_crossover_strategy():
                     }
                     current_cross_positions += 1
                     save_positions(active_positions)
-                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Złoty Krzyż na 15M! Zakup za {order_val:.2f} USDC")
+                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Potwierdzony Złoty Krzyż (Spread: +{spread_pct*100:.2f}%, Vol: {c_vol/vol_ma:.1f}x) | Zakup: {order_val:.2f} USDC")
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
 
         except Exception as e:
             logging.error(f"Błąd analizy EMA Cross {symbol}: {e}")
 
-    logging.info(f"✅ Strategia 6: Przeanalizowano {scanned_count} par. Znaleziono pozycje Cross: {current_cross_positions}/{MAX_EMA_CROSS_POSITIONS}.")
+    logging.info(f"✅ Strategia 6: Przeanalizowano {scanned_count} par. Pozycje Cross: {current_cross_positions}/{MAX_EMA_CROSS_POSITIONS}.")
 
 # ==============================================================================
-# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (Z OBSŁUGĄ KRZYŻA ŚMIERCI DLA STRATEGII 6)
+# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (Z OBSŁUGĄ HISTEREZY WYJŚCIA)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -894,6 +921,7 @@ def monitor_and_close_positions():
             if df is None: continue
 
             candle = df.iloc[-1]
+            prev_candle = df.iloc[-2]
             current_price = candle['close']
             current_rsi = candle['rsi']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
@@ -930,21 +958,24 @@ def monitor_and_close_positions():
 
             trailing_sell = drop_from_peak >= trailing_drop_pct and current_price > buy_price
 
-            # 3. ZASADY WYJŚCIA DLA STRATEGII 6 (CZYSTY CROSS EMA 21/89)
+            # 3. ZASADY WYJŚCIA DLA STRATEGII 6 (HISTEREZA ANTY-SZUMOWA)
             ema_death_cross_sell = False
             if strat_name == "EMA21_89_CROSS":
                 ema21 = candle['ema21']
                 ema89 = candle['ema89']
-                # Wyjście wskaźnikowe: utrata przewagi EMA21 nad EMA89
-                if ema21 < ema89:
+
+                # Histereza: Realny Krzyż Śmierci (spadek EMA 21 min. 0.20% poniżej EMA 89)
+                hysteresis_exit = ema21 < (ema89 * (1.0 - EMA_EXIT_HYSTERESIS_PCT))
+                # LUB 2 kolejne świece zamknięte pod EMA 89
+                two_candles_below_ema89 = (current_price < ema89) and (prev_candle['close'] < prev_candle['ema89'])
+
+                if hysteresis_exit or two_candles_below_ema89:
                     ema_death_cross_sell = True
                 
-                # Czysta strategia EMA nie korzysta z filtrów RSI/Volume dump
                 rsi_overbought_sell = False
                 vol_dump_sell = False
                 pepe_ema_break_exit = False
             else:
-                # Reguły wyjścia dla pozostałych strategii
                 rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
                 vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
                 pepe_ema_break_exit = False
@@ -960,7 +991,7 @@ def monitor_and_close_positions():
                 elif stop_loss_sell:
                     reason = sl_type
                 elif ema_death_cross_sell:
-                    reason = "Krzyż Śmierci EMA 21/89 (Zanikanie Trendu)"
+                    reason = "Potwierdzony Krzyż Śmierci EMA 21/89 (Zanikanie Trendu)"
                 elif pepe_ema_break_exit:
                     reason = "PEPE EMA Trend Breakdown"
                 elif rsi_overbought_sell:
