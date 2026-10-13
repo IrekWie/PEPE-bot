@@ -35,11 +35,13 @@ QUOTE_COIN = "USDC" # Waluta bazowa do handlu
 # --- USTAWIENIA SKANOWANIA ---
 TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par USDC
 TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
+TOP_GAINERS_COUNT = 4        # Skanuj 4 monety o największym wzroście 24h
+MAX_EMA_CROSS_POSITIONS = 5  # Maksymalnie 5 pozycji dla strategii czystego przecięcia EMA 21/89
 MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
 MAX_TOTAL_POSITIONS = 8      # Łączny limit otwartych pozycji
 
 # --- ZARZĄDZANIE KAPITAŁEM ---
-RISK_PCT_PER_TRADE = 0.15    # Standardowo 15% na pozycję w Strategiach 1-3
+RISK_PCT_PER_TRADE = 0.15    # Standardowo 15% na pozycję
 PEPE_RISK_HIGH_PCT = 0.20    # 20% kapitału dla PEPE (gdy jest wystarczająco środków)
 PEPE_RISK_LOW_PCT = 0.10     # 10% kapitału dla PEPE (gdy jest mniej środków)
 MIN_ORDER_VALUE = 100.0      # Minimalna wartość zakupu to 100 USDC
@@ -59,7 +61,7 @@ HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
 BREAKEVEN_TRIGGER_PCT = 0.015   # Aktywacja po osiągnięciu szczytu +1.5% PnL
 BREAKEVEN_SL_PCT = 0.002        # Przesunięcie Stop Loss na +0.2% PnL (pokrycie opłat)
 
-# --- PROGI RSI & VOL ---
+# --- PROGI RSI & VOL (DLA STRATEGII PUMP & STANDARD EMA) ---
 RSI_OVERBOUGHT_SELL = 80     # Sprzedaj, gdy RSI przekroczy 80
 RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
 PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
@@ -255,7 +257,6 @@ def get_coin_available_balance(coin_name):
     return 0.0
 
 def is_btc_market_healthy(drop_threshold=-0.010):
-    """FILTR BTC: Wstrzymuje zakupy w zależności od zadanego progu spadku BTC w 15M"""
     try:
         df_btc = get_market_data("BTCUSDC", interval="15", limit=25)
         if df_btc is None or len(df_btc) < 10:
@@ -410,7 +411,18 @@ def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
             return [t["symbol"] for t in sorted_tickers[:limit_count]]
     except Exception as e:
         logging.error(f"Błąd pobierania spadkowych symboli: {e}")
+    return []
 
+def get_top_gainers_symbols(limit_count=TOP_GAINERS_COUNT):
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in ["USDTUSDC", "USDCUSDT"]]
+        if usdc_tickers:
+            valid_gainers = [t for t in usdc_tickers if safe_float(t.get("price24hPcnt")) >= 0.02]
+            sorted_tickers = sorted(valid_gainers, key=lambda x: safe_float(x.get("price24hPcnt")), reverse=True)
+            return [t["symbol"] for t in sorted_tickers[:limit_count]]
+    except Exception as e:
+        logging.error(f"Błąd pobierania top wzrostowych symboli: {e}")
     return []
 
 def calculate_rsi(series, period=14):
@@ -657,7 +669,6 @@ def scan_pepe_specialist():
     if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
         return
 
-    # ASEKURACJA BTC DLA PEPE: Wstrzymuje zakupy PEPE tylko przy nagłym krachu BTC (> -1.5% w 15M)
     if not is_btc_market_healthy(drop_threshold=-0.015):
         logging.info("⏭️ [PEPE] Pomijam skanowanie PEPE ze względu na gwałtowny spadek Bitcoina (> -1.5%).")
         return
@@ -700,10 +711,7 @@ def scan_pepe_specialist():
         prev_ema21 = prev_candle['ema21']
         prev_ema89 = prev_candle['ema89']
 
-        # 1. MAKRO TREND: PEPE MUSI BYĆ W TRENDZIE WZROSTOWYM PONAD EMA 200
         macro_trend_ok = (c_close > ema200) and (ema21 > ema200)
-
-        # 2. SYGNAŁ WEJŚCIA: PRZECIĘCIE EMA 21 NAD EMA 89 LUB ODBICIE W TRENDZIE
         ema_crossover = (prev_ema21 <= prev_ema89) and (ema21 > ema89)
         ema_bounce = (ema21 > ema89) and (c_low <= ema21) and (c_close > ema21) and (c_close > c_open)
 
@@ -734,7 +742,142 @@ def scan_pepe_specialist():
         logging.error(f"Błąd analizy PEPE: {e}")
 
 # ==============================================================================
-# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (DEDYKOWANE WYJŚCIE EMA DLA PEPE)
+# STRATEGIA 5: TOP 4 GAINERS EMA PULLBACK HUNTER
+# ==============================================================================
+def run_top_gainers_strategy():
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
+
+    total_equity, free_usdc = get_balances()
+    order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
+
+    top_gainers = get_top_gainers_symbols()
+    logging.info(f"=== [STRATEGIA 5] TOP 4 GAINERS EMA PULLBACK (PAR: {len(top_gainers)}) ===")
+
+    if not top_gainers:
+        logging.info("⏭️ Brak silnych liderów wzrostowych (+2% 24h). Pomijam TOP GAINERS.")
+        return
+
+    if free_usdc < order_val:
+        logging.info("⏭️ Pomijam skanowanie TOP GAINERS. Brak wolnych środków.")
+        return
+
+    scanned_count = 0
+    for symbol in top_gainers:
+        if symbol in active_positions: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+
+        try:
+            df = get_market_data(symbol, interval="15", limit=250)
+            scanned_count += 1
+            if df is None or len(df) < 100: continue
+
+            candle = df.iloc[-2]
+            c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
+            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+            c_rsi = candle['rsi']
+            
+            ema9 = candle['ema9']
+            ema21 = candle['ema21']
+            ema89 = candle['ema89']
+
+            bullish_structure = (c_close > ema89) and (ema21 > ema89)
+            tested_ema_support = (c_low <= max(ema9, ema21)) and (c_close >= ema21)
+            bullish_candle_reaction = (c_close > c_open)
+
+            rsi_healthy = 50 <= c_rsi <= 68
+            vol_confirmed = c_vol >= vol_ma
+
+            if bullish_structure and tested_ema_support and bullish_candle_reaction and rsi_healthy and vol_confirmed:
+                order_qty_usdc = f"{order_val:.2f}"
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                    active_positions[symbol] = {
+                        "strategy": "TOP_GAINERS_PULLBACK",
+                        "buy_price": c_close,
+                        "peak_price": c_close,
+                        "qty": qty_str
+                    }
+                    save_positions(active_positions)
+                    logging.info(f"🚀🔥 [TOP GAINERS KUPNO OK] {symbol}! Odbicie od EMA przed wystrzałem! RSI: {c_rsi:.1f}, Vol: OK")
+                else:
+                    logging.error(f"❌ Błąd zakupu {symbol}: {res}")
+
+        except Exception as e:
+            logging.error(f"Błąd analizy lidera wzrostów {symbol}: {e}")
+
+    logging.info(f"✅ Strategia 5: Przeanalizowano {scanned_count} liderów rynku. Brak nowych sygnałów zakupu.")
+
+# ==============================================================================
+# STRATEGIA 6: CZYSTY CROSS EMA 21 / 89 (MAX 5 POZYCJI)
+# ==============================================================================
+def run_ema21_89_pure_crossover_strategy():
+    global active_positions
+
+    current_cross_positions = sum(1 for p in active_positions.values() if p.get("strategy") == "EMA21_89_CROSS")
+    if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        return
+
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
+
+    total_equity, free_usdc = get_balances()
+    order_val = max(total_equity * RISK_PCT_PER_TRADE, MIN_ORDER_VALUE)
+
+    all_symbols = get_all_spot_usdc_symbols()
+    logging.info(f"=== [STRATEGIA 6] CZYSTY CROSS EMA 21/89 (AKTYWNYCH: {current_cross_positions}/{MAX_EMA_CROSS_POSITIONS}) ===")
+
+    if free_usdc < order_val:
+        logging.info(f"⏭️ Pomijam skanowanie EMA 21/89 Cross. Brak wolnych środków {order_val:.2f} USDC.")
+        return
+
+    scanned_count = 0
+    for symbol in all_symbols:
+        if symbol in active_positions: continue
+        if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
+
+        try:
+            df = get_market_data(symbol, interval="15", limit=120)
+            scanned_count += 1
+            if df is None or len(df) < 95: continue
+
+            candle = df.iloc[-2]
+            prev_candle = df.iloc[-3]
+            c_close = candle['close']
+
+            ema21_now, ema89_now = candle['ema21'], candle['ema89']
+            ema21_prev, ema89_prev = prev_candle['ema21'], prev_candle['ema89']
+
+            # ZŁOTY KRZYŻ: ŚWIEŻE PRZECIĘCIE EMA 21 OD DOŁU NAD EMA 89
+            golden_cross = (ema21_prev <= ema89_prev) and (ema21_now > ema89_now)
+
+            if golden_cross:
+                order_qty_usdc = f"{order_val:.2f}"
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                    active_positions[symbol] = {
+                        "strategy": "EMA21_89_CROSS",
+                        "buy_price": c_close,
+                        "peak_price": c_close,
+                        "qty": qty_str
+                    }
+                    current_cross_positions += 1
+                    save_positions(active_positions)
+                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Złoty Krzyż na 15M! Zakup za {order_val:.2f} USDC")
+                else:
+                    logging.error(f"❌ Błąd zakupu {symbol}: {res}")
+
+        except Exception as e:
+            logging.error(f"Błąd analizy EMA Cross {symbol}: {e}")
+
+    logging.info(f"✅ Strategia 6: Przeanalizowano {scanned_count} par. Znaleziono pozycje Cross: {current_cross_positions}/{MAX_EMA_CROSS_POSITIONS}.")
+
+# ==============================================================================
+# MONITOROWANIE I BEZ BŁĘDNA SPRZEDAŻ (Z OBSŁUGĄ KRZYŻA ŚMIERCI DLA STRATEGII 6)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -757,12 +900,14 @@ def monitor_and_close_positions():
 
             buy_price = pos["buy_price"]
             peak_price = pos.get("peak_price", buy_price)
+            strat_name = pos.get("strategy", "")
 
             if current_price > peak_price:
                 pos["peak_price"] = current_price
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
 
+            # 1. Trailing Stop
             if symbol == "PEPEUSDC":
                 trailing_drop_pct = PEPE_TRAILING_DROP_PCT
             elif any(m in symbol for m in ["SHIB", "DOGE", "BONK", "FLOKI"]):
@@ -774,6 +919,7 @@ def monitor_and_close_positions():
             total_pnl = (current_price - buy_price) / buy_price
             peak_pnl = (pos["peak_price"] - buy_price) / buy_price
 
+            # 2. Breakeven & Hard Stop Loss
             if peak_pnl >= BREAKEVEN_TRIGGER_PCT:
                 breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
                 stop_loss_sell = current_price <= breakeven_price
@@ -783,26 +929,52 @@ def monitor_and_close_positions():
                 sl_type = "Hard Stop Loss (-2.0%)"
 
             trailing_sell = drop_from_peak >= trailing_drop_pct and current_price > buy_price
-            rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
-            vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
 
-            pepe_ema_break_exit = False
-            if symbol == "PEPEUSDC":
-                ema89 = candle['ema89']
+            # 3. ZASADY WYJŚCIA DLA STRATEGII 6 (CZYSTY CROSS EMA 21/89)
+            ema_death_cross_sell = False
+            if strat_name == "EMA21_89_CROSS":
                 ema21 = candle['ema21']
-                if current_price < ema89 or ema21 < ema89:
-                    pepe_ema_break_exit = True
-
-            if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit:
-                reason = f"Trailing Up (-{trailing_drop_pct*100:.1f}%)" if trailing_sell else (sl_type if stop_loss_sell else ("PEPE EMA Trend Breakdown" if pepe_ema_break_exit else ("RSI Overbought (>80)" if rsi_overbought_sell else "Volume Dump Exit")))
+                ema89 = candle['ema89']
+                # Wyjście wskaźnikowe: utrata przewagi EMA21 nad EMA89
+                if ema21 < ema89:
+                    ema_death_cross_sell = True
                 
+                # Czysta strategia EMA nie korzysta z filtrów RSI/Volume dump
+                rsi_overbought_sell = False
+                vol_dump_sell = False
+                pepe_ema_break_exit = False
+            else:
+                # Reguły wyjścia dla pozostałych strategii
+                rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
+                vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
+                pepe_ema_break_exit = False
+                if symbol == "PEPEUSDC":
+                    ema89 = candle['ema89']
+                    ema21 = candle['ema21']
+                    if current_price < ema89 or ema21 < ema89:
+                        pepe_ema_break_exit = True
+
+            if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit or ema_death_cross_sell:
+                if trailing_sell:
+                    reason = f"Trailing Up (-{trailing_drop_pct*100:.1f}%)"
+                elif stop_loss_sell:
+                    reason = sl_type
+                elif ema_death_cross_sell:
+                    reason = "Krzyż Śmierci EMA 21/89 (Zanikanie Trendu)"
+                elif pepe_ema_break_exit:
+                    reason = "PEPE EMA Trend Breakdown"
+                elif rsi_overbought_sell:
+                    reason = "RSI Overbought (>80)"
+                else:
+                    reason = "Volume Dump Exit"
+
                 coin_name = symbol.replace(QUOTE_COIN, "")
                 real_balance = get_coin_available_balance(coin_name)
-                
+
                 if real_balance > 0:
                     qty_step, min_qty = get_symbol_lot_filter(symbol)
                     qty_to_sell = format_qty_with_step(real_balance, qty_step, min_qty)
-                    
+
                     if not qty_to_sell:
                         logging.warning(f"⚠️ Saldo {coin_name} ({real_balance}) poniżej wymaganego minimum. Usuwam z pamięci.")
                         symbols_to_delete.append(symbol)
@@ -818,7 +990,7 @@ def monitor_and_close_positions():
                                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell_retry)
 
                         if res.get("retCode") == 0:
-                            logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Powód: {reason} | PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f}")
+                            logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Strategia: {strat_name} | Powód: {reason} | PnL: {total_pnl*100:.2f}% | Szczyt: {pos['peak_price']}")
                             symbols_to_delete.append(symbol)
                         else:
                             logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
@@ -826,7 +998,7 @@ def monitor_and_close_positions():
                     logging.warning(f"⚠️ Brak monet {coin_name} na koncie (pozycja mogła zostać zamknięta ręcznie). Usuwam z pamięci.")
                     symbols_to_delete.append(symbol)
             else:
-                logging.info(f"ℹ️ [{symbol}] PnL: {total_pnl*100:.2f}% | RSI: {current_rsi:.1f} | Szczyt: {pos['peak_price']} | Cena: {current_price}")
+                logging.info(f"ℹ️ [{symbol}] [{strat_name}] PnL: {total_pnl*100:.2f}% | Szczyt: {pos['peak_price']} | Cena: {current_price}")
 
         except Exception as e:
             logging.error(f"Błąd monitorowania {symbol}: {e}")
@@ -846,14 +1018,17 @@ def bot_loop():
         try:
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT USDC...")
-            
+
             sync_positions_from_bybit()
 
-            scan_for_pumps()               
-            run_dip_hunter_strategy()      
-            scan_top150_for_ema_signals()  
-            scan_pepe_specialist()          
-            monitor_and_close_positions()  
+            scan_for_pumps()
+            run_dip_hunter_strategy()
+            run_top_gainers_strategy()
+            run_ema21_89_pure_crossover_strategy()
+            scan_top150_for_ema_signals()
+            scan_pepe_specialist()
+            monitor_and_close_positions()
+
             logging.info("💤 CYKL ZAKOŃCZONY. Następne skanowanie za 3 minuty...")
             logging.info("--------------------------------------------------------------------------------")
         except Exception as e:
