@@ -37,26 +37,31 @@ TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par USDC
 TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
 TOP_GAINERS_COUNT = 4        # Skanuj 4 monety o największym wzroście 24h
 MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
-MIN_EXCHANGE_NOTIONAL = 5.0  # Minimalna dopuszczalna kwota zakupu na Bybit SPOT (5 USDC)
+
+# --- LIMITY FINANSOWE ---
+STANDARD_MIN_ORDER_VALUE = 100.0  # Standardowe minimum pozycji: 100 USDC
+MIN_EXCHANGE_NOTIONAL = 5.0       # Techniczne minimum zlecenia SPOT na Bybit (5 USDC)
 
 # ==============================================================================
-# ZMIENNE GLOBALNE DYNAMICZNEGO ZARZĄDZANIA RYZYKIEM (MODYFIKOWANE PRZEZ SENTYMENT)
+# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA (MODYFIKOWANE PRZEZ SENTYMENT)
 # ==============================================================================
 MAX_TOTAL_POSITIONS = 8
 MAX_EMA_CROSS_POSITIONS = 5
-RISK_PCT_PER_TRADE = 0.15
-PEPE_RISK_HIGH_PCT = 0.20
-PEPE_RISK_LOW_PCT = 0.10
+
+# Procenty alokacji wg stopnia bezpieczeństwa strategii
+SAFE_RISK_PCT = 0.20         # Poziomy 1, 2, 4 (Najbezpieczniejsze)
+MODERATE_RISK_PCT = 0.15     # Poziomy 3, 5, 6 (Umiarkowane)
+HIGH_RISK_PCT = 0.10         # Poziomy 7, 8, 9 (Ryzykowne / Memy)
 
 # --- FILTRY ANTY-SZUMOWE EMA 21/89 ---
-EMA_CROSS_MIN_SPREAD_PCT = 0.0020  # Wymagana separacja min. +0.20% ponad EMA 89
-EMA_CROSS_VOL_MULTIPLIER = 1.10    # Wolumen na świecy min. 1.1x MA20
-EMA_EXIT_HYSTERESIS_PCT  = 0.0020  # Histereza wyjścia: EMA 21 musi spaść min. 0.20% poniżej EMA 89
+EMA_CROSS_MIN_SPREAD_PCT = 0.0020  
+EMA_CROSS_VOL_MULTIPLIER = 1.10    
+EMA_EXIT_HYSTERESIS_PCT  = 0.0020  
 
 # --- STRATEGIA 2 (TOP DIP HUNTER) ---
-MIN_DIP_24H_PCT = -0.050     # Wymagany SPADEK minimum -5.0% w 24h
-DIP_RSI_15M_MAX = 40         # Głębokie wyprzedanie na 15M (RSI <= 40)
-DIP_VOL_MULTIPLIER = 1.5     # Wolumen odbicia co najmniej 1.5x większy od MA20
+MIN_DIP_24H_PCT = -0.050     
+DIP_RSI_15M_MAX = 40         
+DIP_VOL_MULTIPLIER = 1.5     
 
 # --- PROGI ZABEZPIECZAJĄCE ---
 TRAILING_DROP_PCT = 0.015       # Standardowy Trailing Stop (-1.5% od szczytu)
@@ -65,14 +70,14 @@ MEME_TRAILING_DROP_PCT = 0.025  # Trailing Stop dla pozostałych Memecoinów (-2
 HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
 
 # --- MECHANIZM BREAKEVEN ---
-BREAKEVEN_TRIGGER_PCT = 0.015   # Aktywacja po osiągnięciu szczytu +1.5% PnL
-BREAKEVEN_SL_PCT = 0.002        # Przesunięcie Stop Loss na +0.2% PnL (pokrycie opłat)
+BREAKEVEN_TRIGGER_PCT = 0.015   
+BREAKEVEN_SL_PCT = 0.002        
 
 # --- PROGI RSI & VOL ---
-RSI_OVERBOUGHT_SELL = 80     # Sprzedaj, gdy RSI przekroczy 80
-RSI_MAX_BUY_EMA = 65         # Maksymalne RSI dla zakupu w trendzie
-PUMP_VOL_MULTIPLIER = 2.5    # Wolumen 2.5x wyższy od średniej MA20 dla PUMP
-PUMP_PRICE_CHANGE_PCT = 0.025# Wzrost ceny o min. +2.5% w świecy 15M
+RSI_OVERBOUGHT_SELL = 80     
+RSI_MAX_BUY_EMA = 65         
+PUMP_VOL_MULTIPLIER = 2.5    
+PUMP_PRICE_CHANGE_PCT = 0.025
 
 APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
@@ -94,18 +99,31 @@ def safe_float(val, default=0.0):
         return default
 
 # ==============================================================================
-# ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU
+# ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU (Z OBSŁUGĄ KOŃCÓWEK SALDA NP. 50$)
 # ==============================================================================
 def get_order_budget(total_equity, free_usdc, target_pct):
+    """
+    1. Celuje w standardowe wejście: max(total_equity * target_pct, 100 USD).
+    2. Jeśli na koncie jest >= kwoty docelowej -> kupuje za pełną kwotę.
+    3. Jeśli na koncie zostało mniej niż 100 USD (np. 50 USD, 30 USD), ale powyżej minimum giełdowego (5 USD) ->
+       wykorzystuje całą pozostałą resztę salda.
+    4. Blokuje wejście tylko jeśli wolne środki są poniżej 5 USD.
+    """
     target_val = total_equity * target_pct
-    if free_usdc >= target_val and target_val >= MIN_EXCHANGE_NOTIONAL:
-        return round(target_val, 2), f"{target_pct * 100:.0f}%"
+    effective_target = max(target_val, STANDARD_MIN_ORDER_VALUE)
 
+    # 1. Pełny budżet (>= 100 USD lub więcej z wyliczonego %)
+    if free_usdc >= effective_target:
+        label = f"{target_pct * 100:.0f}%" if target_val >= STANDARD_MIN_ORDER_VALUE else f"Min. {STANDARD_MIN_ORDER_VALUE:.0f}$"
+        return round(effective_target, 2), label
+
+    # 2. Na koncie zostało mniej niż docelowa kwota (nawet poniżej 100 USD, np. 50 USD)
     available_spend = math.floor(free_usdc * 0.995 * 100) / 100.0
     if available_spend >= MIN_EXCHANGE_NOTIONAL:
-        return available_spend, f"Reszta salda ({available_spend:.2f} USDC)"
+        return available_spend, f"Reszta salda ({available_spend:.2f}$)"
 
-    return 0.0, "Brak wolnych środków"
+    # 3. Brak środków nawet na minimum giełdowe Bybit (< 5 USD)
+    return 0.0, f"Brak środków (< {MIN_EXCHANGE_NOTIONAL}$)"
 
 # ==============================================================================
 # PRECYZYJNY SILNIK FORMOWANIA ILOŚCI (DECIMAL QUANTIZATION)
@@ -271,7 +289,7 @@ def get_coin_available_balance(coin_name):
     return 0.0
 
 def update_market_sentiment():
-    global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, RISK_PCT_PER_TRADE, PEPE_RISK_HIGH_PCT, PEPE_RISK_LOW_PCT
+    global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, SAFE_RISK_PCT, MODERATE_RISK_PCT, HIGH_RISK_PCT
     try:
         df = get_market_data("BTCUSDC", interval="240", limit=100)
         if df is None or len(df) < 50:
@@ -287,25 +305,25 @@ def update_market_sentiment():
             sentiment = "BULLISH 🟢"
             MAX_TOTAL_POSITIONS = 8
             MAX_EMA_CROSS_POSITIONS = 5
-            RISK_PCT_PER_TRADE = 0.15
-            PEPE_RISK_HIGH_PCT = 0.20
-            PEPE_RISK_LOW_PCT = 0.10
+            SAFE_RISK_PCT = 0.20      # Najwięcej dla bezpiecznych
+            MODERATE_RISK_PCT = 0.15  # Mniej dla średnich
+            HIGH_RISK_PCT = 0.10      # Najmniej dla ryzykownych
         elif c_close < ema89 or ema21 < ema89:
             sentiment = "BEARISH 🔴 (Defensywa)"
             MAX_TOTAL_POSITIONS = 3
             MAX_EMA_CROSS_POSITIONS = 1
-            RISK_PCT_PER_TRADE = 0.08
-            PEPE_RISK_HIGH_PCT = 0.10
-            PEPE_RISK_LOW_PCT = 0.05
+            SAFE_RISK_PCT = 0.15      
+            MODERATE_RISK_PCT = 0.0   
+            HIGH_RISK_PCT = 0.0       
         else:
             sentiment = "NEUTRAL 🟡"
             MAX_TOTAL_POSITIONS = 5
             MAX_EMA_CROSS_POSITIONS = 3
-            RISK_PCT_PER_TRADE = 0.12
-            PEPE_RISK_HIGH_PCT = 0.15
-            PEPE_RISK_LOW_PCT = 0.08
+            SAFE_RISK_PCT = 0.18
+            MODERATE_RISK_PCT = 0.12
+            HIGH_RISK_PCT = 0.0       
         
-        logging.info(f"📊 [MAKRO SENTYMENT BTC 4H] {sentiment} | Limit Pozycji: {MAX_TOTAL_POSITIONS} | Ryzyko: {RISK_PCT_PER_TRADE*100:.1f}%")
+        logging.info(f"📊 [MAKRO SENTYMENT BTC 4H] {sentiment} | Max Pozycji: {MAX_TOTAL_POSITIONS} | Alokacje: Safe {SAFE_RISK_PCT*100:.0f}% / Mod {MODERATE_RISK_PCT*100:.0f}% / High {HIGH_RISK_PCT*100:.0f}%")
         return sentiment
     except Exception as e:
         logging.error(f"Błąd aktualizacji sentymentu: {e}")
@@ -500,7 +518,7 @@ def run_mtf_alignment_strategy():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols(80)
     logging.info(f"=== [POZ 1: NAJBEZPIECZNIEJSZA] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
@@ -542,10 +560,10 @@ def run_mtf_alignment_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"💎🎯 [MTF KUPNO OK] {symbol}! Hossa 4H + Dołek 15M (RSI: {rsi_15m:.1f})")
+                    logging.info(f"💎🎯 [MTF KUPNO OK] {symbol}! Hossa 4H + Dołek 15M (RSI: {rsi_15m:.1f}) | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
                     if order_val <= 0: break
         except Exception:
             pass
@@ -559,7 +577,7 @@ def scan_top150_for_ema_signals():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols()
     logging.info(f"=== [POZ 2: BARDZO BEZPIECZNA] EMA TREND SCANNER ===")
@@ -602,10 +620,10 @@ def scan_top150_for_ema_signals():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [EMA KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: OK | Cena: {c_close}")
+                    logging.info(f"🔥 [EMA KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: OK | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
                     if order_val <= 0: break
         except Exception:
             pass
@@ -619,7 +637,7 @@ def run_top_gainers_strategy():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
 
     top_gainers = get_top_gainers_symbols()
     logging.info(f"=== [POZ 3: UMIARKOWANIE BEZPIECZNA] TOP GAINERS PULLBACK ===")
@@ -661,10 +679,10 @@ def run_top_gainers_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🚀🔥 [TOP GAINERS KUPNO OK] {symbol}! Odbicie od EMA przed wystrzałem! RSI: {c_rsi:.1f}")
+                    logging.info(f"🚀🔥 [TOP GAINERS KUPNO OK] {symbol}! Odbicie od EMA! | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
                     if order_val <= 0: break
         except Exception:
             pass
@@ -677,7 +695,7 @@ def run_relative_strength_strategy():
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
 
     logging.info("=== [POZ 4: BEZPIECZNA / OBRONNA] RELATIVE STRENGTH VS BTC ===")
     if order_val <= 0: return
@@ -726,10 +744,10 @@ def run_relative_strength_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🛡️🚀 [RS KUPNO OK] {symbol}! Rośnie (+{alt_1h_change*100:.2f}%) mimo spadku BTC!")
+                    logging.info(f"🛡️🚀 [RS KUPNO OK] {symbol}! Rośnie (+{alt_1h_change*100:.2f}%) mimo spadku BTC! | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
                     if order_val <= 0: break
     except Exception:
         pass
@@ -743,7 +761,7 @@ def run_bb_squeeze_strategy():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols(TOP_MARKETS_COUNT)
     logging.info(f"=== [POZ 5: ŚREDNIE RYZYKO] BOLLINGER BANDS SQUEEZE ===")
@@ -786,10 +804,10 @@ def run_bb_squeeze_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"💥🚀 [BB SQUEEZE KUPNO OK] {symbol}! Wybicie po kompresji! Vol: {c_vol/vol_ma:.1f}x")
+                    logging.info(f"💥🚀 [BB SQUEEZE KUPNO OK] {symbol}! Wybicie po kompresji! | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
                     if order_val <= 0: break
         except Exception:
             pass
@@ -807,7 +825,7 @@ def run_ema21_89_pure_crossover_strategy():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
 
     all_symbols = get_all_spot_usdc_symbols()
     logging.info(f"=== [POZ 6: ŚREDNIO-WYŻSZE RYZYKO] CZYSTY CROSS EMA 21/89 ===")
@@ -824,7 +842,7 @@ def run_ema21_89_pure_crossover_strategy():
 
             candle = df.iloc[-2]
             prev_candle = df.iloc[-3]
-            c_open, c_close = candle['open'], candle['close']
+            c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
 
             ema21_now, ema89_now = candle['ema21'], candle['ema89']
@@ -851,10 +869,10 @@ def run_ema21_89_pure_crossover_strategy():
                     }
                     current_cross_positions += 1
                     save_positions(active_positions)
-                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Złoty Krzyż (Spread: +{spread_pct*100:.2f}%)")
+                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Złoty Krzyż | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
                     if order_val <= 0: break
         except Exception:
             pass
@@ -868,7 +886,7 @@ def run_dip_hunter_strategy():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
 
     top_losers = get_top_losers_symbols()
     logging.info(f"=== [POZ 7: WYŻSZE RYZYKO] TOP DIP HUNTER ===")
@@ -911,10 +929,10 @@ def run_dip_hunter_strategy():
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: {c_vol/vol_ma:.1f}x")
+                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f} | Zakup: {order_val:.2f}$ ({risk_label})")
                     
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
                     if order_val <= 0: break
         except Exception:
             pass
@@ -932,7 +950,7 @@ def scan_for_pumps():
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
 
     all_symbols = get_all_spot_usdc_symbols()
     logging.info(f"=== [POZ 8: WYSOKIE RYZYKO] MOMENTUM PUMP HUNTER ===")
@@ -970,10 +988,10 @@ def scan_for_pumps():
                     }
                     pump_positions_count += 1
                     save_positions(active_positions)
-                    logging.info(f"🚀 [PUMP KUPNO OK] {symbol}! Wzrost: +{price_change*100:.2f}%, Vol: {c_vol/vol_ma:.1f}x, RSI: {c_rsi:.1f}")
+                    logging.info(f"🚀 [PUMP KUPNO OK] {symbol}! Wzrost: +{price_change*100:.2f}% | Zakup: {order_val:.2f}$ ({risk_label})")
                     
                     total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
                     if order_val <= 0: break
                 else:
                     logging.error(f"❌ Błąd zakupu {symbol}: {res}")
@@ -994,24 +1012,7 @@ def scan_pepe_specialist():
     if not is_btc_market_healthy(drop_threshold=-0.015): return
 
     total_equity, free_usdc = get_balances()
-    
-    target_val_20 = total_equity * PEPE_RISK_HIGH_PCT
-    target_val_10 = total_equity * PEPE_RISK_LOW_PCT
-
-    if free_usdc >= target_val_20 and target_val_20 >= MIN_EXCHANGE_NOTIONAL:
-        order_val = round(target_val_20, 2)
-        risk_label = f"{PEPE_RISK_HIGH_PCT*100:.0f}%"
-    elif free_usdc >= target_val_10 and target_val_10 >= MIN_EXCHANGE_NOTIONAL:
-        order_val = round(target_val_10, 2)
-        risk_label = f"{PEPE_RISK_LOW_PCT*100:.0f}%"
-    else:
-        available_spend = math.floor(free_usdc * 0.995 * 100) / 100.0
-        if available_spend >= MIN_EXCHANGE_NOTIONAL:
-            order_val = available_spend
-            risk_label = "Reszta salda"
-        else:
-            order_val = 0.0
-            risk_label = "Brak wolnych środków"
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
 
     logging.info(f"=== [POZ 9: NAJBARDZIEJ RYZYKOWNA / MEME] PEPE EMA SPECIALIST ===")
 
@@ -1054,7 +1055,7 @@ def scan_pepe_specialist():
                 }
                 save_positions(active_positions)
                 s_type = "Złoty Krzyż EMA21/89" if ema_crossover else "Odbicie EMA21"
-                logging.info(f"🐸🔥 [PEPE KUPNO OK] {s_type} | Zakup: {order_val:.2f} USDC ({risk_label})")
+                logging.info(f"🐸🔥 [PEPE KUPNO OK] {s_type} | Zakup: {order_val:.2f}$ ({risk_label})")
 
     except Exception:
         pass
@@ -1195,23 +1196,23 @@ def bot_loop():
             sync_positions_from_bybit()
 
             # 2. FILTR SENTYMENTU: ZAWSZE URUCHAMIANE BEZPIECZNE STRATEGIE (W KAŻDYCH WARUNKACH)
-            run_mtf_alignment_strategy()           # Poziom 1: Najbezpieczniejsza (Hossa 4H + Wyprzedanie 15M)
-            scan_top150_for_ema_signals()         # Poziom 2: Bardzo bezpieczna (EMA Trend + Strefa Wartości)
-            run_relative_strength_strategy()       # Poziom 4: Bezpieczna/Obronna (Siła względna vs spadki BTC)
+            run_mtf_alignment_strategy()           # Poziom 1: Najbezpieczniejsza
+            scan_top150_for_ema_signals()         # Poziom 2: Bardzo bezpieczna
+            run_relative_strength_strategy()       # Poziom 4: Bezpieczna/Obronna
 
             # 3. STRATEGIE UMIARKOWANEGO RYZYKA (BLOKOWANE W OKRESIE SPADKÓW / BEARISH)
             if "BEARISH" not in current_sentiment:
-                run_top_gainers_strategy()             # Poziom 3: Liderzy 24h na reteście EMA
-                run_bb_squeeze_strategy()              # Poziom 5: Wybicia z kompresji Bollingera
-                run_ema21_89_pure_crossover_strategy() # Poziom 6: Złote Krzyże EMA 21/89
+                run_top_gainers_strategy()             # Poziom 3
+                run_bb_squeeze_strategy()              # Poziom 5
+                run_ema21_89_pure_crossover_strategy() # Poziom 6
             else:
                 logging.info("🛡️ [TRYB BEARISH] Rynek w spadkach! Pomijam strategie średniego i wysokiego ryzyka (Poziomy 3, 5-9). Środki chronione w USDC.")
 
             # 4. STRATEGIE WYSOKIEGO RYZYKA (URUCHAMIANE WYŁĄCZNIE W HOSSIE / BULLISH)
             if "BULLISH" in current_sentiment:
-                run_dip_hunter_strategy()              # Poziom 7: Kupowanie spadków > 5%
-                scan_for_pumps()                       # Poziom 8: Momentum Pump Hunter
-                scan_pepe_specialist()                 # Poziom 9: Memecoin PEPE
+                run_dip_hunter_strategy()              # Poziom 7
+                scan_for_pumps()                       # Poziom 8
+                scan_pepe_specialist()                 # Poziom 9
             elif "BEARISH" not in current_sentiment:
                 logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam strategie najwyższego ryzyka (Dip Hunter, Pump Hunter, PEPE).")
 
