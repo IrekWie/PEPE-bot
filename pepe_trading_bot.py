@@ -94,6 +94,20 @@ def safe_float(val, default=0.0):
         return default
 
 # ==============================================================================
+# ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU
+# ==============================================================================
+def get_order_budget(total_equity, free_usdc, target_pct):
+    target_val = total_equity * target_pct
+    if free_usdc >= target_val and target_val >= MIN_EXCHANGE_NOTIONAL:
+        return round(target_val, 2), f"{target_pct * 100:.0f}%"
+
+    available_spend = math.floor(free_usdc * 0.995 * 100) / 100.0
+    if available_spend >= MIN_EXCHANGE_NOTIONAL:
+        return available_spend, f"Reszta salda ({available_spend:.2f} USDC)"
+
+    return 0.0, "Brak wolnych środków"
+
+# ==============================================================================
 # PRECYZYJNY SILNIK FORMOWANIA ILOŚCI (DECIMAL QUANTIZATION)
 # ==============================================================================
 instrument_filters = {}
@@ -240,18 +254,6 @@ def get_balances():
         logging.error(f"Błąd pobierania salda: {e}")
         return 0.0, 0.0
 
-def get_order_budget(total_equity, free_usdc, target_pct):
-    """Oblicza budżet wykorzystując elastycznie resztki salda."""
-    target_val = total_equity * target_pct
-    if free_usdc >= target_val and target_val >= MIN_EXCHANGE_NOTIONAL:
-        return round(target_val, 2), f"{target_pct * 100:.0f}%"
-
-    available_spend = math.floor(free_usdc * 0.995 * 100) / 100.0
-    if available_spend >= MIN_EXCHANGE_NOTIONAL:
-        return available_spend, f"Reszta salda ({available_spend:.2f} USDC)"
-
-    return 0.0, "Brak wolnych środków"
-
 def get_coin_available_balance(coin_name):
     if not session: return 0.0
     try:
@@ -264,15 +266,11 @@ def get_coin_available_balance(coin_name):
                         avail = c.get("availableToWithdraw")
                         eq = c.get("equity")
                         return safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
-    except Exception as e:
+    except Exception:
         pass
     return 0.0
 
 def update_market_sentiment():
-    """
-    DYNAMICZNE ZARZĄDZANIE RYZYKIEM (MAKRO TREND 4H NA BTC).
-    Zabezpiecza przed uwięzieniem kapitału w bessie i pozwala na agresywny skup w hossie.
-    """
     global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, RISK_PCT_PER_TRADE, PEPE_RISK_HIGH_PCT, PEPE_RISK_LOW_PCT
     try:
         df = get_market_data("BTCUSDC", interval="240", limit=100)
@@ -285,7 +283,6 @@ def update_market_sentiment():
         ema50 = candle['ema50']
         ema89 = candle['ema89']
 
-        # HOSSA: Agresywne lokowanie kapitału
         if c_close > ema50 and ema21 > ema50:
             sentiment = "BULLISH 🟢"
             MAX_TOTAL_POSITIONS = 8
@@ -293,15 +290,13 @@ def update_market_sentiment():
             RISK_PCT_PER_TRADE = 0.15
             PEPE_RISK_HIGH_PCT = 0.20
             PEPE_RISK_LOW_PCT = 0.10
-        # BESSA / KRACH: Ochrona kapitału, chomikowanie gotówki
         elif c_close < ema89 or ema21 < ema89:
             sentiment = "BEARISH 🔴 (Defensywa)"
-            MAX_TOTAL_POSITIONS = 3       # Zostawia większość kapitału bezpieczną w USDC
+            MAX_TOTAL_POSITIONS = 3
             MAX_EMA_CROSS_POSITIONS = 1
-            RISK_PCT_PER_TRADE = 0.08     # Zmniejszona wielkość pozycji
+            RISK_PCT_PER_TRADE = 0.08
             PEPE_RISK_HIGH_PCT = 0.10
             PEPE_RISK_LOW_PCT = 0.05
-        # KONSOLIDACJA: Umiarkowane podejście
         else:
             sentiment = "NEUTRAL 🟡"
             MAX_TOTAL_POSITIONS = 5
@@ -310,14 +305,13 @@ def update_market_sentiment():
             PEPE_RISK_HIGH_PCT = 0.15
             PEPE_RISK_LOW_PCT = 0.08
         
-        logging.info(f"📊 [MAKRO SENTYMENT BTC 4H] {sentiment} | Max Pozycji: {MAX_TOTAL_POSITIONS} | Ryzyko Bazowe: {RISK_PCT_PER_TRADE*100:.1f}%")
+        logging.info(f"📊 [MAKRO SENTYMENT BTC 4H] {sentiment} | Limit Pozycji: {MAX_TOTAL_POSITIONS} | Ryzyko: {RISK_PCT_PER_TRADE*100:.1f}%")
         return sentiment
     except Exception as e:
         logging.error(f"Błąd aktualizacji sentymentu: {e}")
         return "UNKNOWN"
 
 def is_btc_market_healthy(drop_threshold=-0.010):
-    """Mirkro-filtr: Blokada podczas gwałtownego dumpu w 15 minutach."""
     try:
         df_btc = get_market_data("BTCUSDC", interval="15", limit=25)
         if df_btc is None or len(df_btc) < 10: return True
@@ -416,11 +410,11 @@ def sync_positions_from_bybit():
                                 "qty": qty_str
                             }
                             restored = True
-                            logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono pozycję {symbol}: {qty_str} monet | Realna cena zakupu: {buy_price} USDC")
+                            logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono pozycję {symbol}: {qty_str} monet | Realna cena: {buy_price} USDC")
 
         if restored: save_positions(active_positions)
     except Exception as e:
-        logging.error(f"Błąd automatycznej synchronizacji z Bybit: {e}")
+        logging.error(f"Błąd synchronizacji z Bybit: {e}")
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
@@ -498,75 +492,9 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIA 1: MOMENTUM PUMP HUNTER
+# STRATEGIA (POZIOM 1 - NAJBEZPIECZNIEJSZA): MULTI-TIMEFRAME ALIGNMENT (4H + 15M)
 # ==============================================================================
-def scan_for_pumps():
-    global active_positions
-
-    pump_positions_count = sum(1 for p in active_positions.values() if p.get("strategy") == "PUMP_HUNTER")
-    if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
-        return
-
-    if not is_btc_market_healthy(drop_threshold=-0.010): return
-
-    total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-
-    all_symbols = get_all_spot_usdc_symbols()
-    logging.info(f"=== [STRATEGIA 1] MOMENTUM PUMP HUNTER ===")
-
-    if order_val <= 0:
-        logging.info(f"⏭️ Brak wolnych środków (Dostępne: {free_usdc:.2f} USDC < {MIN_EXCHANGE_NOTIONAL} USDC).")
-        return
-
-    scanned_count = 0
-    for symbol in all_symbols:
-        if symbol in active_positions: continue
-        if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
-
-        try:
-            df = get_market_data(symbol, interval="15")
-            scanned_count += 1
-            if df is None or len(df) < 25: continue
-
-            candle = df.iloc[-2]
-            c_open, c_close = candle['open'], candle['close']
-            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
-            c_rsi = candle['rsi']
-
-            price_change = (c_close - c_open) / c_open
-            volume_spike = c_vol >= (vol_ma * PUMP_VOL_MULTIPLIER)
-            rsi_valid = 45 <= c_rsi <= 75
-
-            if price_change >= PUMP_PRICE_CHANGE_PCT and volume_spike and rsi_valid:
-                order_qty_usdc = f"{order_val:.2f}"
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
-                if res.get("retCode") == 0:
-                    qty_step, min_qty = get_symbol_lot_filter(symbol)
-                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
-                    active_positions[symbol] = {
-                        "strategy": "PUMP_HUNTER",
-                        "buy_price": c_close,
-                        "peak_price": c_close,
-                        "qty": qty_str
-                    }
-                    pump_positions_count += 1
-                    save_positions(active_positions)
-                    logging.info(f"🚀 [PUMP KUPNO OK] {symbol}! Wzrost: +{price_change*100:.2f}%, Vol: {c_vol/vol_ma:.1f}x, RSI: {c_rsi:.1f}")
-                    
-                    total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-                    if order_val <= 0: break
-                else:
-                    logging.error(f"❌ Błąd zakupu {symbol}: {res}")
-
-        except Exception as e:
-            pass
-
-# ==============================================================================
-# STRATEGIA 2: TOP DIP HUNTER
-# ==============================================================================
-def run_dip_hunter_strategy():
+def run_mtf_alignment_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
     if not is_btc_market_healthy(drop_threshold=-0.010): return
@@ -574,50 +502,48 @@ def run_dip_hunter_strategy():
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
 
-    top_losers = get_top_losers_symbols()
-    logging.info(f"=== [STRATEGIA 2] TOP DIP HUNTER ===")
+    top_symbols = get_top_volume_symbols(80)
+    logging.info(f"=== [POZ 1: NAJBEZPIECZNIEJSZA] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
 
-    if not top_losers: return
     if order_val <= 0: return
 
-    for symbol in top_losers:
+    for symbol in top_symbols:
         if symbol in active_positions: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
-            if not check_quarterly_health(symbol): continue
-            df = get_market_data(symbol, interval="15")
-            if df is None or len(df) < 25: continue
+            df_4h = get_market_data(symbol, interval="240", limit=60)
+            if df_4h is None or len(df_4h) < 45: continue
 
-            candle, prev_candle = df.iloc[-2], df.iloc[-3]
-            c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
-            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
-            c_rsi = candle['rsi']
+            candle_4h = df_4h.iloc[-1]
+            macro_uptrend = (candle_4h['close'] > candle_4h['ema50']) and (candle_4h['ema21'] > candle_4h['ema50'])
+            if not macro_uptrend: continue
 
-            body = abs(c_close - c_open)
-            lower_wick = min(c_open, c_close) - c_low
-            is_pinbar = lower_wick > (body * 2.0) and (c_close > c_open)
-            is_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
-            is_above_ema = (c_close > candle['ema9']) and (prev_candle['close'] <= prev_candle['ema9'])
+            df_15m = get_market_data(symbol, interval="15", limit=35)
+            if df_15m is None or len(df_15m) < 20: continue
 
-            vol_confirmed = c_vol >= (vol_ma * DIP_VOL_MULTIPLIER)
-            rsi_confirmed = c_rsi <= DIP_RSI_15M_MAX
+            c_15m = df_15m.iloc[-2]
+            c_open, c_close, c_low = c_15m['open'], c_15m['close'], c_15m['low']
+            rsi_15m = c_15m['rsi']
+            
+            oversold_on_15m = rsi_15m <= 36
+            rebound_reaction = (c_close > c_open) or ((c_open - c_low) > abs(c_close - c_open) * 1.5)
 
-            if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
+            if oversold_on_15m and rebound_reaction:
                 order_qty_usdc = f"{order_val:.2f}"
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
                 if res.get("retCode") == 0:
                     qty_step, min_qty = get_symbol_lot_filter(symbol)
                     qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                     active_positions[symbol] = {
-                        "strategy": "DIP_HUNTER",
+                        "strategy": "MTF_ALIGNMENT_4H_15M",
                         "buy_price": c_close,
                         "peak_price": c_close,
                         "qty": qty_str
                     }
                     save_positions(active_positions)
-                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: {c_vol/vol_ma:.1f}x")
-                    
+                    logging.info(f"💎🎯 [MTF KUPNO OK] {symbol}! Hossa 4H + Dołek 15M (RSI: {rsi_15m:.1f})")
+
                     total_equity, free_usdc = get_balances()
                     order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
                     if order_val <= 0: break
@@ -625,7 +551,7 @@ def run_dip_hunter_strategy():
             pass
 
 # ==============================================================================
-# STRATEGIA 3: EMA TREND SCANNER
+# STRATEGIA (POZIOM 2): EMA TREND SCANNER (TOP 150)
 # ==============================================================================
 def scan_top150_for_ema_signals():
     global active_positions
@@ -636,7 +562,7 @@ def scan_top150_for_ema_signals():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
 
     top_symbols = get_top_volume_symbols()
-    logging.info(f"=== [STRATEGIA 3] EMA TREND SCANNER ===")
+    logging.info(f"=== [POZ 2: BARDZO BEZPIECZNA] EMA TREND SCANNER ===")
 
     if order_val <= 0: return
 
@@ -685,85 +611,7 @@ def scan_top150_for_ema_signals():
             pass
 
 # ==============================================================================
-# STRATEGIA 4: DEDYKOWANY SKANER PEPE (EMA 21/89/200)
-# ==============================================================================
-def scan_pepe_specialist():
-    global active_positions
-    pepe_symbol = "PEPEUSDC"
-
-    if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
-        return
-
-    if not is_btc_market_healthy(drop_threshold=-0.015): return
-
-    total_equity, free_usdc = get_balances()
-    
-    target_val_20 = total_equity * PEPE_RISK_HIGH_PCT
-    target_val_10 = total_equity * PEPE_RISK_LOW_PCT
-
-    if free_usdc >= target_val_20 and target_val_20 >= MIN_EXCHANGE_NOTIONAL:
-        order_val = round(target_val_20, 2)
-        risk_label = f"{PEPE_RISK_HIGH_PCT*100:.0f}%"
-    elif free_usdc >= target_val_10 and target_val_10 >= MIN_EXCHANGE_NOTIONAL:
-        order_val = round(target_val_10, 2)
-        risk_label = f"{PEPE_RISK_LOW_PCT*100:.0f}%"
-    else:
-        available_spend = math.floor(free_usdc * 0.995 * 100) / 100.0
-        if available_spend >= MIN_EXCHANGE_NOTIONAL:
-            order_val = available_spend
-            risk_label = "Reszta salda"
-        else:
-            order_val = 0.0
-            risk_label = "Brak wolnych środków"
-
-    logging.info(f"=== [STRATEGIA 4] PEPE EMA SPECIALIST ===")
-
-    if order_val <= 0: return
-
-    try:
-        df = get_market_data(pepe_symbol, interval="15", limit=250)
-        if df is None or len(df) < 200: return
-
-        candle = df.iloc[-2]
-        prev_candle = df.iloc[-3]
-        c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
-        c_vol, vol_ma = candle['volume'], candle['vol_ma20']
-        c_rsi = candle['rsi']
-        
-        ema21, ema89, ema200 = candle['ema21'], candle['ema89'], candle['ema200']
-        prev_ema21, prev_ema89 = prev_candle['ema21'], prev_candle['ema89']
-
-        macro_trend_ok = (c_close > ema200) and (ema21 > ema200)
-        ema_spread = (ema21 - ema89) / ema89
-        ema_rising = ema21 > prev_ema21
-        
-        ema_crossover = (prev_ema21 <= prev_ema89) and (ema21 > ema89) and (ema_spread >= 0.0015) and ema_rising
-        ema_bounce = (ema21 > ema89) and (c_low <= ema21) and (c_close > ema21) and (c_close > c_open) and ema_rising
-
-        rsi_valid = 45 <= c_rsi <= 70
-        volume_ok = c_vol >= vol_ma
-
-        if macro_trend_ok and (ema_crossover or ema_bounce) and rsi_valid and volume_ok:
-            order_qty_usdc = f"{order_val:.2f}"
-            res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
-            if res.get("retCode") == 0:
-                qty_step, min_qty = get_symbol_lot_filter(pepe_symbol)
-                qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
-                active_positions[pepe_symbol] = {
-                    "strategy": "PEPE_EMA_SPECIALIST",
-                    "buy_price": c_close,
-                    "peak_price": c_close,
-                    "qty": qty_str
-                }
-                save_positions(active_positions)
-                s_type = "Złoty Krzyż EMA21/89" if ema_crossover else "Odbicie EMA21"
-                logging.info(f"🐸🔥 [PEPE KUPNO OK] {s_type} | Zakup: {order_val:.2f} USDC ({risk_label})")
-
-    except Exception as e:
-        pass
-
-# ==============================================================================
-# STRATEGIA 5: TOP 4 GAINERS EMA PULLBACK HUNTER
+# STRATEGIA (POZIOM 3): TOP 4 GAINERS EMA PULLBACK
 # ==============================================================================
 def run_top_gainers_strategy():
     global active_positions
@@ -774,7 +622,7 @@ def run_top_gainers_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
 
     top_gainers = get_top_gainers_symbols()
-    logging.info(f"=== [STRATEGIA 5] TOP GAINERS PULLBACK ===")
+    logging.info(f"=== [POZ 3: UMIARKOWANIE BEZPIECZNA] TOP GAINERS PULLBACK ===")
 
     if not top_gainers or order_val <= 0: return
 
@@ -822,191 +670,7 @@ def run_top_gainers_strategy():
             pass
 
 # ==============================================================================
-# STRATEGIA 6: CZYSTY CROSS EMA 21 / 89
-# ==============================================================================
-def run_ema21_89_pure_crossover_strategy():
-    global active_positions
-
-    current_cross_positions = sum(1 for p in active_positions.values() if p.get("strategy") == "EMA21_89_CROSS")
-    if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
-        return
-
-    if not is_btc_market_healthy(drop_threshold=-0.010): return
-
-    total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-
-    all_symbols = get_all_spot_usdc_symbols()
-    logging.info(f"=== [STRATEGIA 6] CZYSTY CROSS EMA 21/89 ===")
-
-    if order_val <= 0: return
-
-    for symbol in all_symbols:
-        if symbol in active_positions: continue
-        if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
-
-        try:
-            df = get_market_data(symbol, interval="15", limit=120)
-            if df is None or len(df) < 95: continue
-
-            candle = df.iloc[-2]
-            prev_candle = df.iloc[-3]
-            c_open, c_close = candle['open'], candle['close']
-            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
-
-            ema21_now, ema89_now = candle['ema21'], candle['ema89']
-            ema21_prev, ema89_prev = prev_candle['ema21'], prev_candle['ema89']
-
-            basic_crossover = (ema21_prev <= ema89_prev) and (ema21_now > ema89_now)
-            spread_pct = (ema21_now - ema89_now) / ema89_now
-            has_clean_spread = spread_pct >= EMA_CROSS_MIN_SPREAD_PCT
-            ema21_sloping_up = ema21_now > ema21_prev
-            price_confirmed = (c_close > ema21_now) and (c_close > c_open)
-            volume_confirmed = c_vol >= (vol_ma * EMA_CROSS_VOL_MULTIPLIER)
-
-            if basic_crossover and has_clean_spread and ema21_sloping_up and price_confirmed and volume_confirmed:
-                order_qty_usdc = f"{order_val:.2f}"
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
-                if res.get("retCode") == 0:
-                    qty_step, min_qty = get_symbol_lot_filter(symbol)
-                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
-                    active_positions[symbol] = {
-                        "strategy": "EMA21_89_CROSS",
-                        "buy_price": c_close,
-                        "peak_price": c_close,
-                        "qty": qty_str
-                    }
-                    current_cross_positions += 1
-                    save_positions(active_positions)
-                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Złoty Krzyż (Spread: +{spread_pct*100:.2f}%)")
-
-                    total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-                    if order_val <= 0: break
-        except Exception:
-            pass
-
-# ==============================================================================
-# STRATEGIA 7: BOLLINGER BANDS SQUEEZE BREAKOUT
-# ==============================================================================
-def run_bb_squeeze_strategy():
-    global active_positions
-    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
-    if not is_btc_market_healthy(drop_threshold=-0.010): return
-
-    total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-
-    top_symbols = get_top_volume_symbols(TOP_MARKETS_COUNT)
-    logging.info(f"=== [STRATEGIA 7] BOLLINGER BANDS SQUEEZE ===")
-
-    if order_val <= 0: return
-
-    for symbol in top_symbols:
-        if symbol in active_positions: continue
-        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
-
-        try:
-            df = get_market_data(symbol, interval="15", limit=60)
-            if df is None or len(df) < 40: continue
-
-            candle = df.iloc[-2]
-            c_open, c_close = candle['open'], candle['close']
-            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
-            c_rsi = candle['rsi']
-            bb_upper = candle['bb_upper']
-
-            recent_widths = df['bb_width'].iloc[-20:-2]
-            avg_width_50 = df['bb_width'].iloc[-40:-2].mean()
-            min_width = recent_widths.min()
-
-            was_squeezed = min_width <= (avg_width_50 * 0.70)
-            breakout_up = (c_close > bb_upper) and (c_close > c_open)
-            vol_spike = c_vol >= (vol_ma * 2.5)
-            rsi_momentum = 50 <= c_rsi <= 72
-
-            if was_squeezed and breakout_up and vol_spike and rsi_momentum:
-                order_qty_usdc = f"{order_val:.2f}"
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
-                if res.get("retCode") == 0:
-                    qty_step, min_qty = get_symbol_lot_filter(symbol)
-                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
-                    active_positions[symbol] = {
-                        "strategy": "BB_SQUEEZE_BREAKOUT",
-                        "buy_price": c_close,
-                        "peak_price": c_close,
-                        "qty": qty_str
-                    }
-                    save_positions(active_positions)
-                    logging.info(f"💥🚀 [BB SQUEEZE KUPNO OK] {symbol}! Wybicie po kompresji! Vol: {c_vol/vol_ma:.1f}x")
-
-                    total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-                    if order_val <= 0: break
-        except Exception:
-            pass
-
-# ==============================================================================
-# STRATEGIA 8: MULTI-TIMEFRAME ALIGNMENT (4H + 15M)
-# ==============================================================================
-def run_mtf_alignment_strategy():
-    global active_positions
-    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
-    if not is_btc_market_healthy(drop_threshold=-0.010): return
-
-    total_equity, free_usdc = get_balances()
-    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-
-    top_symbols = get_top_volume_symbols(80)
-    logging.info(f"=== [STRATEGIA 8] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
-
-    if order_val <= 0: return
-
-    for symbol in top_symbols:
-        if symbol in active_positions: continue
-        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
-
-        try:
-            df_4h = get_market_data(symbol, interval="240", limit=60)
-            if df_4h is None or len(df_4h) < 45: continue
-
-            candle_4h = df_4h.iloc[-1]
-            macro_uptrend = (candle_4h['close'] > candle_4h['ema50']) and (candle_4h['ema21'] > candle_4h['ema50'])
-            if not macro_uptrend: continue
-
-            df_15m = get_market_data(symbol, interval="15", limit=35)
-            if df_15m is None or len(df_15m) < 20: continue
-
-            c_15m = df_15m.iloc[-2]
-            c_open, c_close, c_low = c_15m['open'], c_15m['close'], c_15m['low']
-            rsi_15m = c_15m['rsi']
-            
-            oversold_on_15m = rsi_15m <= 36
-            rebound_reaction = (c_close > c_open) or ((c_open - c_low) > abs(c_close - c_open) * 1.5)
-
-            if oversold_on_15m and rebound_reaction:
-                order_qty_usdc = f"{order_val:.2f}"
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
-                if res.get("retCode") == 0:
-                    qty_step, min_qty = get_symbol_lot_filter(symbol)
-                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
-                    active_positions[symbol] = {
-                        "strategy": "MTF_ALIGNMENT_4H_15M",
-                        "buy_price": c_close,
-                        "peak_price": c_close,
-                        "qty": qty_str
-                    }
-                    save_positions(active_positions)
-                    logging.info(f"💎🎯 [MTF KUPNO OK] {symbol}! Hossa 4H + Dołek 15M (RSI: {rsi_15m:.1f})")
-
-                    total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
-                    if order_val <= 0: break
-        except Exception:
-            pass
-
-# ==============================================================================
-# STRATEGIA 9: RELATIVE STRENGTH VS BITCOIN
+# STRATEGIA (POZIOM 4): RELATIVE STRENGTH VS BITCOIN
 # ==============================================================================
 def run_relative_strength_strategy():
     global active_positions
@@ -1015,7 +679,7 @@ def run_relative_strength_strategy():
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
 
-    logging.info("=== [STRATEGIA 9] RELATIVE STRENGTH VS BTC ===")
+    logging.info("=== [POZ 4: BEZPIECZNA / OBRONNA] RELATIVE STRENGTH VS BTC ===")
     if order_val <= 0: return
 
     try:
@@ -1071,7 +735,332 @@ def run_relative_strength_strategy():
         pass
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ
+# STRATEGIA (POZIOM 5): BOLLINGER BANDS SQUEEZE BREAKOUT
+# ==============================================================================
+def run_bb_squeeze_strategy():
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
+
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+
+    top_symbols = get_top_volume_symbols(TOP_MARKETS_COUNT)
+    logging.info(f"=== [POZ 5: ŚREDNIE RYZYKO] BOLLINGER BANDS SQUEEZE ===")
+
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+
+        try:
+            df = get_market_data(symbol, interval="15", limit=60)
+            if df is None or len(df) < 40: continue
+
+            candle = df.iloc[-2]
+            c_open, c_close = candle['open'], candle['close']
+            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+            c_rsi = candle['rsi']
+            bb_upper = candle['bb_upper']
+
+            recent_widths = df['bb_width'].iloc[-20:-2]
+            avg_width_50 = df['bb_width'].iloc[-40:-2].mean()
+            min_width = recent_widths.min()
+
+            was_squeezed = min_width <= (avg_width_50 * 0.70)
+            breakout_up = (c_close > bb_upper) and (c_close > c_open)
+            vol_spike = c_vol >= (vol_ma * 2.5)
+            rsi_momentum = 50 <= c_rsi <= 72
+
+            if was_squeezed and breakout_up and vol_spike and rsi_momentum:
+                order_qty_usdc = f"{order_val:.2f}"
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                    active_positions[symbol] = {
+                        "strategy": "BB_SQUEEZE_BREAKOUT",
+                        "buy_price": c_close,
+                        "peak_price": c_close,
+                        "qty": qty_str
+                    }
+                    save_positions(active_positions)
+                    logging.info(f"💥🚀 [BB SQUEEZE KUPNO OK] {symbol}! Wybicie po kompresji! Vol: {c_vol/vol_ma:.1f}x")
+
+                    total_equity, free_usdc = get_balances()
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    if order_val <= 0: break
+        except Exception:
+            pass
+
+# ==============================================================================
+# STRATEGIA (POZIOM 6): CZYSTY CROSS EMA 21 / 89
+# ==============================================================================
+def run_ema21_89_pure_crossover_strategy():
+    global active_positions
+
+    current_cross_positions = sum(1 for p in active_positions.values() if p.get("strategy") == "EMA21_89_CROSS")
+    if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        return
+
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
+
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+
+    all_symbols = get_all_spot_usdc_symbols()
+    logging.info(f"=== [POZ 6: ŚREDNIO-WYŻSZE RYZYKO] CZYSTY CROSS EMA 21/89 ===")
+
+    if order_val <= 0: return
+
+    for symbol in all_symbols:
+        if symbol in active_positions: continue
+        if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
+
+        try:
+            df = get_market_data(symbol, interval="15", limit=120)
+            if df is None or len(df) < 95: continue
+
+            candle = df.iloc[-2]
+            prev_candle = df.iloc[-3]
+            c_open, c_close = candle['open'], candle['close']
+            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+
+            ema21_now, ema89_now = candle['ema21'], candle['ema89']
+            ema21_prev, ema89_prev = prev_candle['ema21'], prev_candle['ema89']
+
+            basic_crossover = (ema21_prev <= ema89_prev) and (ema21_now > ema89_now)
+            spread_pct = (ema21_now - ema89_now) / ema89_now
+            has_clean_spread = spread_pct >= EMA_CROSS_MIN_SPREAD_PCT
+            ema21_sloping_up = ema21_now > ema21_prev
+            price_confirmed = (c_close > ema21_now) and (c_close > c_open)
+            volume_confirmed = c_vol >= (vol_ma * EMA_CROSS_VOL_MULTIPLIER)
+
+            if basic_crossover and has_clean_spread and ema21_sloping_up and price_confirmed and volume_confirmed:
+                order_qty_usdc = f"{order_val:.2f}"
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                    active_positions[symbol] = {
+                        "strategy": "EMA21_89_CROSS",
+                        "buy_price": c_close,
+                        "peak_price": c_close,
+                        "qty": qty_str
+                    }
+                    current_cross_positions += 1
+                    save_positions(active_positions)
+                    logging.info(f"⚡🔥 [EMA CROSS 21/89 KUPNO OK] {symbol}! Złoty Krzyż (Spread: +{spread_pct*100:.2f}%)")
+
+                    total_equity, free_usdc = get_balances()
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    if order_val <= 0: break
+        except Exception:
+            pass
+
+# ==============================================================================
+# STRATEGIA (POZIOM 7): TOP DIP HUNTER
+# ==============================================================================
+def run_dip_hunter_strategy():
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
+
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+
+    top_losers = get_top_losers_symbols()
+    logging.info(f"=== [POZ 7: WYŻSZE RYZYKO] TOP DIP HUNTER ===")
+
+    if not top_losers or order_val <= 0: return
+
+    for symbol in top_losers:
+        if symbol in active_positions: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+
+        try:
+            if not check_quarterly_health(symbol): continue
+            df = get_market_data(symbol, interval="15")
+            if df is None or len(df) < 25: continue
+
+            candle, prev_candle = df.iloc[-2], df.iloc[-3]
+            c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
+            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+            c_rsi = candle['rsi']
+
+            body = abs(c_close - c_open)
+            lower_wick = min(c_open, c_close) - c_low
+            is_pinbar = lower_wick > (body * 2.0) and (c_close > c_open)
+            is_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
+            is_above_ema = (c_close > candle['ema9']) and (prev_candle['close'] <= prev_candle['ema9'])
+
+            vol_confirmed = c_vol >= (vol_ma * DIP_VOL_MULTIPLIER)
+            rsi_confirmed = c_rsi <= DIP_RSI_15M_MAX
+
+            if (is_pinbar or is_engulfing or is_above_ema) and vol_confirmed and rsi_confirmed:
+                order_qty_usdc = f"{order_val:.2f}"
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                    active_positions[symbol] = {
+                        "strategy": "DIP_HUNTER",
+                        "buy_price": c_close,
+                        "peak_price": c_close,
+                        "qty": qty_str
+                    }
+                    save_positions(active_positions)
+                    logging.info(f"🔥 [DIP KUPNO OK] {symbol}! RSI: {c_rsi:.1f}, Vol: {c_vol/vol_ma:.1f}x")
+                    
+                    total_equity, free_usdc = get_balances()
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    if order_val <= 0: break
+        except Exception:
+            pass
+
+# ==============================================================================
+# STRATEGIA (POZIOM 8): MOMENTUM PUMP HUNTER
+# ==============================================================================
+def scan_for_pumps():
+    global active_positions
+
+    pump_positions_count = sum(1 for p in active_positions.values() if p.get("strategy") == "PUMP_HUNTER")
+    if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        return
+
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
+
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+
+    all_symbols = get_all_spot_usdc_symbols()
+    logging.info(f"=== [POZ 8: WYSOKIE RYZYKO] MOMENTUM PUMP HUNTER ===")
+
+    if order_val <= 0: return
+
+    for symbol in all_symbols:
+        if symbol in active_positions: continue
+        if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
+
+        try:
+            df = get_market_data(symbol, interval="15")
+            if df is None or len(df) < 25: continue
+
+            candle = df.iloc[-2]
+            c_open, c_close = candle['open'], candle['close']
+            c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+            c_rsi = candle['rsi']
+
+            price_change = (c_close - c_open) / c_open
+            volume_spike = c_vol >= (vol_ma * PUMP_VOL_MULTIPLIER)
+            rsi_valid = 45 <= c_rsi <= 75
+
+            if price_change >= PUMP_PRICE_CHANGE_PCT and volume_spike and rsi_valid:
+                order_qty_usdc = f"{order_val:.2f}"
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                if res.get("retCode") == 0:
+                    qty_step, min_qty = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                    active_positions[symbol] = {
+                        "strategy": "PUMP_HUNTER",
+                        "buy_price": c_close,
+                        "peak_price": c_close,
+                        "qty": qty_str
+                    }
+                    pump_positions_count += 1
+                    save_positions(active_positions)
+                    logging.info(f"🚀 [PUMP KUPNO OK] {symbol}! Wzrost: +{price_change*100:.2f}%, Vol: {c_vol/vol_ma:.1f}x, RSI: {c_rsi:.1f}")
+                    
+                    total_equity, free_usdc = get_balances()
+                    order_val, risk_label = get_order_budget(total_equity, free_usdc, RISK_PCT_PER_TRADE)
+                    if order_val <= 0: break
+                else:
+                    logging.error(f"❌ Błąd zakupu {symbol}: {res}")
+
+        except Exception:
+            pass
+
+# ==============================================================================
+# STRATEGIA (POZIOM 9 - NAJBARDZIEJ RYZYKOWNA): DEDYKOWANY SKANER PEPE
+# ==============================================================================
+def scan_pepe_specialist():
+    global active_positions
+    pepe_symbol = "PEPEUSDC"
+
+    if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
+        return
+
+    if not is_btc_market_healthy(drop_threshold=-0.015): return
+
+    total_equity, free_usdc = get_balances()
+    
+    target_val_20 = total_equity * PEPE_RISK_HIGH_PCT
+    target_val_10 = total_equity * PEPE_RISK_LOW_PCT
+
+    if free_usdc >= target_val_20 and target_val_20 >= MIN_EXCHANGE_NOTIONAL:
+        order_val = round(target_val_20, 2)
+        risk_label = f"{PEPE_RISK_HIGH_PCT*100:.0f}%"
+    elif free_usdc >= target_val_10 and target_val_10 >= MIN_EXCHANGE_NOTIONAL:
+        order_val = round(target_val_10, 2)
+        risk_label = f"{PEPE_RISK_LOW_PCT*100:.0f}%"
+    else:
+        available_spend = math.floor(free_usdc * 0.995 * 100) / 100.0
+        if available_spend >= MIN_EXCHANGE_NOTIONAL:
+            order_val = available_spend
+            risk_label = "Reszta salda"
+        else:
+            order_val = 0.0
+            risk_label = "Brak wolnych środków"
+
+    logging.info(f"=== [POZ 9: NAJBARDZIEJ RYZYKOWNA / MEME] PEPE EMA SPECIALIST ===")
+
+    if order_val <= 0: return
+
+    try:
+        df = get_market_data(pepe_symbol, interval="15", limit=250)
+        if df is None or len(df) < 200: return
+
+        candle = df.iloc[-2]
+        prev_candle = df.iloc[-3]
+        c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
+        c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+        c_rsi = candle['rsi']
+        
+        ema21, ema89, ema200 = candle['ema21'], candle['ema89'], candle['ema200']
+        prev_ema21, prev_ema89 = prev_candle['ema21'], prev_candle['ema89']
+
+        macro_trend_ok = (c_close > ema200) and (ema21 > ema200)
+        ema_spread = (ema21 - ema89) / ema89
+        ema_rising = ema21 > prev_ema21
+        
+        ema_crossover = (prev_ema21 <= prev_ema89) and (ema21 > ema89) and (ema_spread >= 0.0015) and ema_rising
+        ema_bounce = (ema21 > ema89) and (c_low <= ema21) and (c_close > ema21) and (c_close > c_open) and ema_rising
+
+        rsi_valid = 45 <= c_rsi <= 70
+        volume_ok = c_vol >= vol_ma
+
+        if macro_trend_ok and (ema_crossover or ema_bounce) and rsi_valid and volume_ok:
+            order_qty_usdc = f"{order_val:.2f}"
+            res = session.place_order(category=CATEGORY, symbol=pepe_symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+            if res.get("retCode") == 0:
+                qty_step, min_qty = get_symbol_lot_filter(pepe_symbol)
+                qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
+                active_positions[pepe_symbol] = {
+                    "strategy": "PEPE_EMA_SPECIALIST",
+                    "buy_price": c_close,
+                    "peak_price": c_close,
+                    "qty": qty_str
+                }
+                save_positions(active_positions)
+                s_type = "Złoty Krzyż EMA21/89" if ema_crossover else "Odbicie EMA21"
+                logging.info(f"🐸🔥 [PEPE KUPNO OK] {s_type} | Zakup: {order_val:.2f} USDC ({risk_label})")
+
+    except Exception:
+        pass
+
+# ==============================================================================
+# MONITOROWANIE I SPRZEDAŻ (DLA WSZYSTKICH POZYCJI)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -1191,7 +1180,7 @@ def monitor_and_close_positions():
         save_positions(active_positions)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA I SERWER
+# PĘTLA GŁÓWNA - DYNAMICZNE FILTROWANIE STRATEGII WG SENTYMENTU
 # ==============================================================================
 def bot_loop():
     sync_positions_from_bybit()
@@ -1201,20 +1190,32 @@ def bot_loop():
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT USDC...")
 
-            # AKTUALIZACJA GŁÓWNEGO SENTYMENTU BTC (Zarządzanie Ryzykiem / Kapitałem)
-            update_market_sentiment()
+            # 1. Odczyt nadrzędnego sentymentu makro BTC 4H
+            current_sentiment = update_market_sentiment()
             sync_positions_from_bybit()
 
-            scan_for_pumps()
-            run_dip_hunter_strategy()
-            run_top_gainers_strategy()
-            run_ema21_89_pure_crossover_strategy()
-            run_bb_squeeze_strategy()
-            run_mtf_alignment_strategy()
-            run_relative_strength_strategy()
-            scan_top150_for_ema_signals()
-            scan_pepe_specialist()
-            
+            # 2. FILTR SENTYMENTU: ZAWSZE URUCHAMIANE BEZPIECZNE STRATEGIE (W KAŻDYCH WARUNKACH)
+            run_mtf_alignment_strategy()           # Poziom 1: Najbezpieczniejsza (Hossa 4H + Wyprzedanie 15M)
+            scan_top150_for_ema_signals()         # Poziom 2: Bardzo bezpieczna (EMA Trend + Strefa Wartości)
+            run_relative_strength_strategy()       # Poziom 4: Bezpieczna/Obronna (Siła względna vs spadki BTC)
+
+            # 3. STRATEGIE UMIARKOWANEGO RYZYKA (BLOKOWANE W OKRESIE SPADKÓW / BEARISH)
+            if "BEARISH" not in current_sentiment:
+                run_top_gainers_strategy()             # Poziom 3: Liderzy 24h na reteście EMA
+                run_bb_squeeze_strategy()              # Poziom 5: Wybicia z kompresji Bollingera
+                run_ema21_89_pure_crossover_strategy() # Poziom 6: Złote Krzyże EMA 21/89
+            else:
+                logging.info("🛡️ [TRYB BEARISH] Rynek w spadkach! Pomijam strategie średniego i wysokiego ryzyka (Poziomy 3, 5-9). Środki chronione w USDC.")
+
+            # 4. STRATEGIE WYSOKIEGO RYZYKA (URUCHAMIANE WYŁĄCZNIE W HOSSIE / BULLISH)
+            if "BULLISH" in current_sentiment:
+                run_dip_hunter_strategy()              # Poziom 7: Kupowanie spadków > 5%
+                scan_for_pumps()                       # Poziom 8: Momentum Pump Hunter
+                scan_pepe_specialist()                 # Poziom 9: Memecoin PEPE
+            elif "BEARISH" not in current_sentiment:
+                logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam strategie najwyższego ryzyka (Dip Hunter, Pump Hunter, PEPE).")
+
+            # 5. Monitorowanie otwartych pozycji
             monitor_and_close_positions()
 
             logging.info("💤 CYKL ZAKOŃCZONY. Następne skanowanie za 3 minuty...")
