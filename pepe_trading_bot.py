@@ -55,7 +55,7 @@ HIGH_RISK_PCT = 0.10         # Poziomy 7, 8, 9 (Ryzykowne / Memy)
 
 # --- SZYBKA DETEKCJA SPADKÓW BITCOINA (REAL-TIME 5M) ---
 BTC_FAST_DROP_BUY_BLOCK_PCT = -0.008   # Blokuj zakupy gdy BTC spadnie o -0.8% w 5-15M
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015   # Awaryjna ewakuacja altów gdy BTC spadnie o -1.5%
+BTC_FLASH_CRASH_EXIT_PCT    = -0.010   # Zaostrzony próg ewakuacji altów: -1.0%
 
 # --- FILTRY ANTY-SZUMOWE EMA 21/89 ---
 EMA_CROSS_MIN_SPREAD_PCT = 0.0020  
@@ -326,7 +326,7 @@ def update_market_sentiment():
 def get_btc_realtime_metrics():
     """
     Szybka analiza Bitcoina na interwale 5-minutowym:
-    1. Zmiana ceny na bieżącej świecy 5M (Close vs Open).
+    1. Zmiana ceny na bieżącej świecy 5M.
     2. Spadek bieżącej ceny od szczytu z ostatnich 15 minut (Rolling High 3 świec 5M).
     """
     try:
@@ -338,10 +338,7 @@ def get_btc_realtime_metrics():
         curr_price = current_candle['close']
         curr_open = current_candle['open']
 
-        # 1. Zmiana w bieżącej świecy 5M
         candle_change = (curr_price - curr_open) / curr_open
-
-        # 2. Maksymalny punkt z ostatnich 15 minut (3 ostatnie świece 5M)
         recent_15m_high = df_btc['high'].iloc[-3:].max()
         drop_from_recent_high = (curr_price - recent_15m_high) / recent_15m_high
 
@@ -351,14 +348,9 @@ def get_btc_realtime_metrics():
         return 0.0, 0.0
 
 def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
-    """
-    Natychmiastowe wstrzymanie zakupów w czasie rzeczywistym, gdy:
-    - Bieżąca świeca 5M gwałtownie spada LUB
-    - Cena zjechała od szczytu z ostatnich 15 minut o zadaną wartość.
-    """
     candle_change, drop_from_high = get_btc_realtime_metrics()
     if candle_change <= drop_threshold or drop_from_high <= drop_threshold:
-        logging.warning(f"⚠️ [BTC RAPID GUARD] Gwałtowny spadek BTC! Świeca 5M: {candle_change*100:.2f}%, Spadek od szczytu 15M: {drop_from_high*100:.2f}% (Limit: {drop_threshold*100:.1f}%). Wstrzymuję nowe zakupy.")
+        logging.warning(f"⚠️ [BTC RAPID GUARD] Spadek BTC! 5M: {candle_change*100:.2f}%, od szczytu 15M: {drop_from_high*100:.2f}% (Limit: {drop_threshold*100:.1f}%). Wstrzymuję zakupy.")
         return False
     return True
 
@@ -1029,8 +1021,8 @@ def scan_pepe_specialist():
     if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
         return
 
-    # Ochrona asekuracyjna PEPE przed gwałtownym tąpnięciem BTC
-    if not is_btc_market_healthy(drop_threshold=-0.012): return
+    # Zaostrzona ochrona wejścia dla PEPE
+    if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
@@ -1090,11 +1082,10 @@ def monitor_and_close_positions():
         logging.info("ℹ️ Brak otwartych pozycji SPOT do monitorowania.")
         return
 
-    # Szybki odczyt stanu Bitcoina w czasie rzeczywistym
     btc_5m_change, btc_drop_15m = get_btc_realtime_metrics()
     btc_flash_crash = (btc_5m_change <= BTC_FLASH_CRASH_EXIT_PCT) or (btc_drop_15m <= BTC_FLASH_CRASH_EXIT_PCT)
     if btc_flash_crash:
-        logging.warning(f"🚨 [BTC FLASH CRASH DETECTED] Spadek BTC {min(btc_5m_change, btc_drop_15m)*100:.2f}%! Uruchamiam procedurę awaryjnej ewakuacji pozycji stratnych!")
+        logging.warning(f"🚨 [BTC FLASH CRASH DETECTED] Spadek BTC {min(btc_5m_change, btc_drop_15m)*100:.2f}% (Próg: {BTC_FLASH_CRASH_EXIT_PCT*100:.1f}%)! Awaryjna ewakuacja stratnych altów!")
 
     logging.info(f"=== [MONITOROWANIE POZYCJI: {len(active_positions)}/{MAX_TOTAL_POSITIONS} AKTYWNYCH] ===")
     symbols_to_delete = []
@@ -1161,7 +1152,7 @@ def monitor_and_close_positions():
                 rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
                 vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
 
-            # Awaryjne wyjście gdy BTC ma krach a pozycja jest pod kreską
+            # Awaryjne wyjście gdy BTC ma krach i pozycja traci ponad -0.5%
             btc_emergency_exit = btc_flash_crash and (total_pnl < -0.005)
 
             if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit or ema_death_cross_sell or btc_emergency_exit:
@@ -1212,7 +1203,7 @@ def monitor_and_close_positions():
         save_positions(active_positions)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY (SZYBKA REAKCJA)
+# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY
 # ==============================================================================
 def bot_loop():
     sync_positions_from_bybit()
@@ -1222,18 +1213,14 @@ def bot_loop():
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT USDC...")
 
-            # 1. Odczyt nadrzędnego sentymentu makro BTC 4H
             current_sentiment = update_market_sentiment()
             sync_positions_from_bybit()
 
-            # 2. BEZWZGLĘDNA KONTROLA BEZPIECZEŃSTWA BTC PRZED URUCHOMIENIEM SKANERÓW
             if is_btc_market_healthy():
-                # Zawsze aktywne bezpieczne strategie
                 run_mtf_alignment_strategy()           # Poziom 1: Najbezpieczniejsza
                 scan_top150_for_ema_signals()         # Poziom 2: Bardzo bezpieczna
                 run_relative_strength_strategy()       # Poziom 4: Bezpieczna/Obronna
 
-                # Umiarkowane (blokowane w bessie / spadkach)
                 if "BEARISH" not in current_sentiment:
                     run_top_gainers_strategy()             # Poziom 3
                     run_bb_squeeze_strategy()              # Poziom 5
@@ -1241,7 +1228,6 @@ def bot_loop():
                 else:
                     logging.info("🛡️ [TRYB BEARISH] Rynek w spadkach! Pomijam strategie średniego i wysokiego ryzyka.")
 
-                # Wysokie ryzyko (wyłącznie w hossie)
                 if "BULLISH" in current_sentiment:
                     run_dip_hunter_strategy()              # Poziom 7
                     scan_for_pumps()                       # Poziom 8
@@ -1251,7 +1237,6 @@ def bot_loop():
             else:
                 logging.info("⛔ [ZAKUPY WSTRZYMANE] Wykryto presję spadkową na BTC. Pomijam wszystkie skanery zakupu.")
 
-            # 3. Monitorowanie otwartych pozycji z aktywnym hamulcem awaryjnym
             monitor_and_close_positions()
 
             logging.info("💤 CYKL ZAKOŃCZONY. Następna szybka weryfikacja za 45 sekund...")
