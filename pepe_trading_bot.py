@@ -44,10 +44,11 @@ MIN_SYNC_POSITION_VALUE = 8.0
 MIN_EXCHANGE_NOTIONAL = 5.0       
 
 # ==============================================================================
-# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA (POSZERZONE SLOTY)
+# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA
 # ==============================================================================
-MAX_TOTAL_POSITIONS = 12       # Podniesiono z 8 na 12 z uwagi na dużą bazę restaurowanych altów
+MAX_TOTAL_POSITIONS = 12
 MAX_EMA_CROSS_POSITIONS = 5
+SENTIMENT_STATE = "NEUTRAL"
 
 SAFE_RISK_PCT = 0.20
 MODERATE_RISK_PCT = 0.15
@@ -60,12 +61,13 @@ EMA_CROSS_MIN_SPREAD_PCT = 0.0020
 EMA_CROSS_VOL_MULTIPLIER = 1.10    
 EMA_EXIT_HYSTERESIS_PCT  = 0.0020  
 
-DIP_RSI_5M_MAX = 30          # Ekstremalne wyprzedanie w 5M do łapania dołków
-DIP_VOL_MULTIPLIER = 2.5     # Wolumen zrzutu/obrony 250% normy
+DIP_RSI_5M_MAX = 30          
+DIP_VOL_MULTIPLIER = 2.5     
 
 # Zabezpieczenia Take Profit & Breakeven
 PARTIAL_TP_PCT = 0.030          # Próg realizacji 50% zysków (+3.0%)
-BREAKEVEN_SL_PCT = 0.003        # Po TP zostawiamy +0.3% zysku jako twarde dno dla reszty
+BREAKEVEN_TRIGGER_PCT = 0.015   # Próg aktywacji Breakeven (+1.5% szczytu)
+BREAKEVEN_SL_PCT = 0.003        # Po TP zostawiamy +0.3% zysku jako dno
 
 RSI_OVERBOUGHT_SELL = 82     
 PUMP_VOL_MULTIPLIER = 2.5    
@@ -98,7 +100,7 @@ def get_order_budget(total_equity, free_usdc, target_pct, is_bearish_dip=False):
     effective_target = max(target_val, STANDARD_MIN_ORDER_VALUE)
 
     if is_bearish_dip:
-        effective_target = STANDARD_MIN_ORDER_VALUE  # W bessie łapiemy spadki wyłącznie minimalną stawką
+        effective_target = STANDARD_MIN_ORDER_VALUE
 
     if free_usdc >= effective_target:
         label = f"{target_pct * 100:.0f}%" if target_val >= STANDARD_MIN_ORDER_VALUE else f"Min. {STANDARD_MIN_ORDER_VALUE:.0f}$"
@@ -221,14 +223,13 @@ if not session:
     session.endpoint = "https://api.bybit.eu"
 
 # ==============================================================================
-# ZARZĄDZANIE PAMIĘCIĄ POZYCJI (Z MODUŁEM PARTIAL TP)
+# ZARZĄDZANIE PAMIĘCIĄ POZYCJI
 # ==============================================================================
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
         try:
             with open(POSITIONS_FILE, "r") as f:
                 pos = json.load(f)
-                # Kompatybilność wsteczna z nowym parametrem sprzedanej połowy
                 for p in pos.values():
                     if "sold_half" not in p:
                         p["sold_half"] = False
@@ -533,7 +534,7 @@ def get_market_data(symbol, interval="15", limit=250):
         df['tr2'] = abs(df['low'] - df['close'].shift())
         df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
         df['atr'] = df['tr'].rolling(14).mean()
-        df['atr_pct'] = df['atr'] / df['close']
+        df['atr_pct'] = (df['atr'] / df['close']).fillna(0.02)
 
         return df
     except Exception as e:
@@ -627,7 +628,7 @@ def scan_top150_for_ema_signals():
             bullish_pinbar = (c_close > c_open) and ((c_open - c_low) > (c_close - c_open) * 1.5)
             bullish_engulfing = (c_close > c_open) and (prev_candle['close'] < prev_candle['open']) and (c_close > prev_candle['open'])
 
-            rsi_ok = 40 <= c_rsi <= RSI_MAX_BUY_EMA
+            rsi_ok = 40 <= c_rsi <= 65
             vol_ok = c_vol >= vol_ma
 
             if bullish_trend and in_value_zone and (bullish_pinbar or bullish_engulfing) and rsi_ok and vol_ok:
@@ -863,7 +864,6 @@ def run_ema21_89_pure_crossover_strategy():
         except Exception:
             pass
 
-# POPRAWIONY DIP HUNTER - ŁAPANIE W CZASIE RZECZYWISTYM NA 5M!
 def run_dip_hunter_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
@@ -887,7 +887,7 @@ def run_dip_hunter_strategy():
             df = get_market_data(symbol, interval="5", limit=30)
             if df is None or len(df) < 25: continue
 
-            candle = df.iloc[-1]  # Analiza aktualnej świecy na bieżąco!
+            candle = df.iloc[-1]
             c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
             c_rsi = candle['rsi']
@@ -895,7 +895,6 @@ def run_dip_hunter_strategy():
             body = abs(c_close - c_open)
             lower_wick = min(c_open, c_close) - c_low
             
-            # Wymagamy dłuższego knota popytowego na dole i olbrzymiego wolumenu ratunkowego
             strong_defense = lower_wick > (body * 2.0)
             vol_confirmed = c_vol >= (vol_ma * DIP_VOL_MULTIPLIER)
             rsi_confirmed = c_rsi <= DIP_RSI_5M_MAX
@@ -1050,7 +1049,10 @@ def monitor_and_close_positions():
             current_price = candle['close']
             current_rsi = candle['rsi']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
-            atr_pct = candle['atr_pct']
+            
+            # Bezpieczny odczyt ATR z zabezpieczeniem przed NaN
+            atr_val = safe_float(candle.get('atr_pct'), 0.02)
+            atr_pct = atr_val if (atr_val > 0 and not math.isnan(atr_val)) else 0.02
 
             buy_price = pos["buy_price"]
             peak_price = pos.get("peak_price", buy_price)
@@ -1063,10 +1065,8 @@ def monitor_and_close_positions():
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price}")
 
             # DYNAMICZNY ATR: Adaptacja do zmienności monety
-            # Stop loss znajduje się poniżej rynkowego szumu (1.8x ATR)
-            dynamic_sl_pct = max(atr_pct * 1.8, 0.015)  # Minimum 1.5% sztywnego bufora
-            # Trailing stop pozwala na szum w granicach 1.5x ATR
-            trailing_drop_pct = max(atr_pct * 1.5, 0.010) 
+            dynamic_sl_pct = max(atr_pct * 1.8, 0.015)
+            trailing_drop_pct = max(atr_pct * 1.5, 0.010)
 
             drop_from_peak = (pos["peak_price"] - current_price) / pos["peak_price"]
             total_pnl = (current_price - buy_price) / buy_price
@@ -1089,7 +1089,7 @@ def monitor_and_close_positions():
                             save_positions(active_positions)
                             logging.info(f"💸 [PARTIAL TP] {symbol} wygenerowało zysk! Zabezpieczam 50% pozycji przy +{total_pnl*100:.2f}%. Reszta jedzie na trailingu.")
 
-            # Jeśli zrealizowano Partial TP lub osiągnięto 1.5%, podnosimy bezwzględne dno do Breakeven
+            # Jeśli zrealizowano Partial TP lub osiągnięto 1.5%, podnosimy dno do Breakeven
             if sold_half or peak_pnl >= BREAKEVEN_TRIGGER_PCT:
                 breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
                 stop_loss_sell = current_price <= breakeven_price
@@ -1159,7 +1159,7 @@ def monitor_and_close_positions():
                 else:
                     logging.warning(f"⚠️ Saldo {coin_name} zwrócone jako 0. Nie usuwam pozycji bez udanej sprzedaży.")
             else:
-                logging.info(f"ℹ️ [{symbol}] PnL: {total_pnl*100:.2f}% | Zmienna ATR: {atr_pct*100:.1f}% | Szczyt: {pos['peak_price']}")
+                logging.info(f"ℹ️ [{symbol}] PnL: {total_pnl*100:.2f}% | Szczyt: {pos['peak_price']}")
 
         except Exception as e:
             logging.error(f"Błąd monitorowania {symbol}: {e}")
@@ -1191,7 +1191,7 @@ def bot_loop():
                 run_mtf_alignment_strategy()           # Poziom 1
                 scan_top150_for_ema_signals()          # Poziom 2
                 run_relative_strength_strategy()       # Poziom 4
-                run_dip_hunter_strategy()              # Poziom 7 (Teraz działa w bessie by kupować tanio na 5M!)
+                run_dip_hunter_strategy()              # Poziom 7 (Działa w bessie na 5M)
 
                 if "BEARISH" not in current_sentiment:
                     run_top_gainers_strategy()             # Poziom 3
