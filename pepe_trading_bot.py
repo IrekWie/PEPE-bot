@@ -6,6 +6,7 @@ import threading
 import socket
 from decimal import Decimal
 import math
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import requests
@@ -75,6 +76,7 @@ PUMP_PRICE_CHANGE_PCT = 0.025
 
 APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
+TRADE_HISTORY_FILE = "trade_history.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +93,63 @@ def safe_float(val, default=0.0):
         return float(val)
     except (ValueError, TypeError):
         return default
+
+# ==============================================================================
+# MODUŁ KSIĘGOWANIA BILANSU I HISTORII TRANSAKCJI
+# ==============================================================================
+def load_trade_history():
+    if os.path.exists(TRADE_HISTORY_FILE):
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "total_realized_usd": 0.0,
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "daily": {}
+    }
+
+def save_trade_history(history):
+    try:
+        with open(TRADE_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=4)
+    except Exception as e:
+        logging.error(f"Błąd zapisu historii transakcji: {e}")
+
+trade_history = load_trade_history()
+
+def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
+    global trade_history
+    pnl_pct = (sell_price - buy_price) / buy_price
+    pnl_usd = (sell_price - buy_price) * qty
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+    trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
+    trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
+    if pnl_usd >= 0:
+        trade_history["wins"] = trade_history.get("wins", 0) + 1
+    else:
+        trade_history["losses"] = trade_history.get("losses", 0) + 1
+
+    if "daily" not in trade_history:
+        trade_history["daily"] = {}
+    if today_str not in trade_history["daily"]:
+        trade_history["daily"][today_str] = {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0}
+
+    d = trade_history["daily"][today_str]
+    d["pnl_usd"] = round(d["pnl_usd"] + pnl_usd, 2)
+    d["trades"] += 1
+    if pnl_usd >= 0:
+        d["wins"] += 1
+    else:
+        d["losses"] += 1
+
+    save_trade_history(trade_history)
+    sign = "+" if pnl_usd >= 0 else ""
+    logging.info(f"📊 [BILANS ZAPISANY] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Ilość: {qty} | Powód: {reason}")
 
 # ==============================================================================
 # ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU
@@ -528,7 +587,7 @@ def get_market_data(symbol, interval="15", limit=250):
         df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
 
-        # Average True Range (ATR) do oceny szumu
+        # Average True Range (ATR)
         df['tr0'] = abs(df['high'] - df['low'])
         df['tr1'] = abs(df['high'] - df['close'].shift())
         df['tr2'] = abs(df['low'] - df['close'].shift())
@@ -1050,7 +1109,6 @@ def monitor_and_close_positions():
             current_rsi = candle['rsi']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
             
-            # Bezpieczny odczyt ATR z zabezpieczeniem przed NaN
             atr_val = safe_float(candle.get('atr_pct'), 0.02)
             atr_pct = atr_val if (atr_val > 0 and not math.isnan(atr_val)) else 0.02
 
@@ -1064,7 +1122,6 @@ def monitor_and_close_positions():
                 save_positions(active_positions)
                 logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price}")
 
-            # DYNAMICZNY ATR: Adaptacja do zmienności monety
             dynamic_sl_pct = max(atr_pct * 1.8, 0.015)
             trailing_drop_pct = max(atr_pct * 1.5, 0.010)
 
@@ -1087,9 +1144,10 @@ def monitor_and_close_positions():
                         if res.get("retCode") == 0:
                             pos["sold_half"] = True
                             save_positions(active_positions)
+                            sold_qty_val = safe_float(qty_to_sell)
+                            record_closed_trade(symbol, strat_name, buy_price, current_price, sold_qty_val, "Partial TP (50%)")
                             logging.info(f"💸 [PARTIAL TP] {symbol} wygenerowało zysk! Zabezpieczam 50% pozycji przy +{total_pnl*100:.2f}%. Reszta jedzie na trailingu.")
 
-            # Jeśli zrealizowano Partial TP lub osiągnięto 1.5%, podnosimy dno do Breakeven
             if sold_half or peak_pnl >= BREAKEVEN_TRIGGER_PCT:
                 breakeven_price = buy_price * (1.0 + BREAKEVEN_SL_PCT)
                 stop_loss_sell = current_price <= breakeven_price
@@ -1152,6 +1210,8 @@ def monitor_and_close_positions():
                                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell_retry)
 
                         if res.get("retCode") == 0:
+                            sold_qty_val = safe_float(qty_to_sell)
+                            record_closed_trade(symbol, strat_name, buy_price, current_price, sold_qty_val, reason)
                             logging.info(f"💰 [SPOT SPRZEDAŻ - FULL] {symbol} | Powód: {reason} | PnL: {total_pnl*100:.2f}%")
                             symbols_to_delete.append(symbol)
                         else:
@@ -1170,7 +1230,7 @@ def monitor_and_close_positions():
         save_positions(active_positions)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY
+# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY Z WYŚWIETLANIEM BILANSU
 # ==============================================================================
 def bot_loop():
     sync_positions_from_bybit()
@@ -1182,7 +1242,20 @@ def bot_loop():
 
             current_sentiment = update_market_sentiment()
             
+            # Odczyt salda konta
             total_equity, free_usdc = get_balances()
+
+            # Odczyt i kalkulacja bilansu handlowego (Dziś vs Łącznie)
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            today_stats = trade_history.get("daily", {}).get(today_str, {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0})
+            total_realized = trade_history.get("total_realized_usd", 0.0)
+            total_trades = trade_history.get("total_trades", 0)
+            wins = trade_history.get("wins", 0)
+            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+            today_sign = "+" if today_stats['pnl_usd'] >= 0 else ""
+            total_sign = "+" if total_realized >= 0 else ""
+
+            logging.info(f"📈 [BILANS HANDLOWY] Dziś: {today_sign}{today_stats['pnl_usd']:.2f} USD ({today_stats['trades']} transakcji) | Łącznie: {total_sign}{total_realized:.2f} USD | Win Rate: {win_rate:.1f}% ({wins}/{total_trades})")
             logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
 
             sync_positions_from_bybit()
