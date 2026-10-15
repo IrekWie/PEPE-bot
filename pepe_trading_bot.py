@@ -129,7 +129,6 @@ def get_symbol_lot_filter(symbol):
                 list_data = res.get("result", {}).get("list", [])
                 if list_data:
                     lot_filter = list_data[0].get("lotSizeFilter", {})
-                    # Bybit SPOT używa parametru basePrecision (np. 0.000001 dla BTC, 0.0001 dla ETH)
                     base_prec = lot_filter.get("basePrecision")
                     qty_step = lot_filter.get("qtyStep")
                     min_qty = lot_filter.get("minOrderQty", "0.000001")
@@ -140,14 +139,13 @@ def get_symbol_lot_filter(symbol):
     except Exception as e:
         logging.warning(f"Nie udało się pobrać filtrów dla {symbol}: {e}")
 
-    # Inteligentny fallback w zależności od typu monety
     if any(m in symbol for m in ["BTC"]):
         return "0.00001", "0.00001"
     elif any(m in symbol for m in ["ETH", "SOL"]):
         return "0.0001", "0.0001"
     elif any(m in symbol for m in ["LINK", "UNI"]):
         return "0.01", "0.01"
-    elif symbol.startswith("1000") or any(m in symbol for m in ["SHIB", "PEPE", "BONK", "FLOKI", "ZEREBRO", "WAL"]):
+    elif symbol.startswith("1000") or any(m in symbol for m in ["SHIB", "PEPE", "BONK", "FLOKI", "ZEREBRO", "WAL", "PYTH", "STRK"]):
         return "1", "1"
     return "0.0001", "0.0001"
 
@@ -165,7 +163,6 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         if floored_dec < min_dec and floored_dec <= 0:
             return None
         
-        # Jeśli zaokrąglenie w dół dało 0 przez zbyt duży step, używamy precyzji surowego salda
         if floored_dec <= 0 and qty_dec > 0:
             floored_dec = qty_dec
 
@@ -276,7 +273,6 @@ def get_balances():
         return 0.0, 0.0
 
 def get_coin_available_balance(coin_name):
-    """Pobiera realny stan portfela UTA (walletBalance z fallbackiem do equity)."""
     if not session: return 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin_name)
@@ -314,7 +310,6 @@ def get_all_spot_usdc_symbols():
     return symbols
 
 def sync_positions_from_bybit():
-    """Wykrywa wszystkie zakupione monety (w tym BTC, ETH, SOL, LINK, ZEREBRO, WAL)."""
     global active_positions
     if not session: return
     try:
@@ -353,7 +348,6 @@ def sync_positions_from_bybit():
                         curr_price = df.iloc[-1]['close']
                         val_usd = bal * curr_price
                         
-                        # Próg 8 USD uwzględnia LINK (~9.94 USD) i odcina kurz
                         if val_usd >= MIN_SYNC_POSITION_VALUE:
                             buy_price = curr_price
                             try:
@@ -406,7 +400,7 @@ def update_market_sentiment():
             HIGH_RISK_PCT = 0.10
         elif c_close < ema89 or ema21 < ema89:
             sentiment = "BEARISH 🔴 (Defensywa)"
-            MAX_TOTAL_POSITIONS = 8       # Utrzymujemy limit 8, aby nie ucinać widoczności przywróconych pozycji
+            MAX_TOTAL_POSITIONS = 8
             MAX_EMA_CROSS_POSITIONS = 1
             SAFE_RISK_PCT = 0.15      
             MODERATE_RISK_PCT = 0.0   
@@ -1202,7 +1196,7 @@ def monitor_and_close_positions():
         save_positions(active_positions)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY
+# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY Z WYŚWIETLANIEM SALDA W NAGŁÓWKU
 # ==============================================================================
 def bot_loop():
     sync_positions_from_bybit()
@@ -1212,7 +1206,14 @@ def bot_loop():
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT...")
 
+            # 1. Odczyt nadrzędnego sentymentu makro BTC 4H
             current_sentiment = update_market_sentiment()
+            
+            # 2. Bezpośredni odczyt i prezentacja salda w logach
+            total_equity, free_usdc = get_balances()
+            logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
+
+            # 3. Synchronizacja pozycji portfela
             sync_positions_from_bybit()
 
             if is_btc_market_healthy():
