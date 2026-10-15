@@ -17,7 +17,7 @@ from pybit.unified_trading import HTTP
 socket.setdefaulttimeout(15)
 
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (RYNEK USDC - MICA COMPLIANT)
+# KONFIGURACJA BOTA SPOT (RYNEK USDC / USDT HYBRID)
 # ==============================================================================
 FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
 FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
@@ -39,8 +39,9 @@ TOP_GAINERS_COUNT = 4
 MAX_PUMP_POSITIONS = 4
 
 # --- LIMITY FINANSOWE ---
-STANDARD_MIN_ORDER_VALUE = 100.0
-MIN_EXCHANGE_NOTIONAL = 5.0
+STANDARD_MIN_ORDER_VALUE = 100.0  # Standardowe wejście: min. 100 USD
+MIN_SYNC_POSITION_VALUE = 8.0     # Próg przywracania z Bybit (obejmuje LINK ~9.94$)
+MIN_EXCHANGE_NOTIONAL = 5.0       # Techniczne minimum Bybit Spot (5 USD)
 
 # ==============================================================================
 # ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA
@@ -135,7 +136,7 @@ def get_symbol_lot_filter(symbol):
     except Exception as e:
         logging.warning(f"Nie udało się pobrać filtrów dla {symbol}: {e}")
 
-    if symbol.startswith("1000") or "SHIB" in symbol or "PEPE" in symbol or "BONK" in symbol or "FLOKI" in symbol:
+    if symbol.startswith("1000") or any(m in symbol for m in ["SHIB", "PEPE", "BONK", "FLOKI"]):
         return "1", "1"
     return "0.1", "0.1"
 
@@ -162,7 +163,7 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         else:
             return f"{int(floored_dec)}"
     except Exception as e:
-        logging.error(f"Błąd precyzyjnego formatowania ilości: {e}")
+        logging.error(f"Błąd formatowania ilości: {e}")
         return None
 
 # ==============================================================================
@@ -231,7 +232,7 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE, SALDO USDC, RSI, VOL & POPRAWIONY ODCZYT MONET
+# FUNKCJE POMOCNICZE, SALDO I POBIERANIE RYNKÓW
 # ==============================================================================
 def get_balances():
     if not session:
@@ -260,7 +261,7 @@ def get_balances():
         return 0.0, 0.0
 
 def get_coin_available_balance(coin_name):
-    """Odczytuje realną liczbę monet w portfelu UTA (walletBalance z fallbackiem do equity)."""
+    """Pobiera realny stan portfela UTA (walletBalance z fallbackiem do equity)."""
     if not session: return 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin_name)
@@ -276,6 +277,100 @@ def get_coin_available_balance(coin_name):
     except Exception:
         pass
     return 0.0
+
+def get_all_spot_trading_symbols():
+    """Zwraca wszystkie aktywne pary SPOT (zarówno USDC jak i USDT)."""
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        return [t["symbol"] for t in tickers if "symbol" in t]
+    except Exception:
+        pass
+    return []
+
+def get_all_spot_usdc_symbols():
+    symbols = []
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in ["USDTUSDC", "USDCUSDT"]]
+    except Exception:
+        pass
+    if not symbols:
+        symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "PEPEUSDC", "XRPUSDC", "ADAUSDC", "DOGEUSDC", "LINKUSDC", "NEARUSDC"]
+    if "PEPEUSDC" not in symbols: symbols.append("PEPEUSDC")
+    return symbols
+
+def sync_positions_from_bybit():
+    """Wykrywa wszystkie zakupione monety (zarówno pary USDC, jak i USDT dla ZEREBRO, WAL itp.)."""
+    global active_positions
+    if not session: return
+    try:
+        res = session.get_wallet_balance(accountType="UNIFIED")
+        if res.get("retCode") != 0: return
+        account_list = res.get("result", {}).get("list", [])
+        if not account_list: return
+
+        all_trading_symbols = get_all_spot_trading_symbols()
+        restored = False
+
+        for coin_info in account_list[0].get("coin", []):
+            try:
+                coin = coin_info.get("coin")
+                if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
+                    continue
+
+                # Prawidłowy odczyt: walletBalance z kolumny Saldo Portfela
+                wb = safe_float(coin_info.get("walletBalance"))
+                eq = safe_float(coin_info.get("equity"))
+                bal = wb if wb > 0 else eq
+
+                if bal <= 0: continue
+
+                # Sprawdzenie pary: priorytet USDC, fallback USDT
+                matched_symbol = None
+                if f"{coin}USDC" in all_trading_symbols:
+                    matched_symbol = f"{coin}USDC"
+                elif f"{coin}USDT" in all_trading_symbols:
+                    matched_symbol = f"{coin}USDT"
+
+                if not matched_symbol:
+                    continue
+
+                if matched_symbol not in active_positions:
+                    df = get_market_data(matched_symbol, interval="15", limit=5)
+                    if df is not None and len(df) > 0:
+                        curr_price = df.iloc[-1]['close']
+                        val_usd = bal * curr_price
+                        
+                        # Próg 8 USD uwzględnia pozycję LINK (~9.94 USD) i odcina kurz
+                        if val_usd >= MIN_SYNC_POSITION_VALUE:
+                            buy_price = curr_price
+                            try:
+                                exec_res = session.get_executions(category=CATEGORY, symbol=matched_symbol, limit=10)
+                                if exec_res.get("retCode") == 0:
+                                    exec_list = exec_res.get("result", {}).get("list", [])
+                                    buys = [e for e in exec_list if e.get("side") == "Buy"]
+                                    if buys: buy_price = safe_float(buys[0].get("execPrice"), curr_price)
+                            except Exception:
+                                pass
+
+                            qty_step, min_qty = get_symbol_lot_filter(matched_symbol)
+                            qty_str = format_qty_with_step(bal, qty_step, min_qty)
+                            if qty_str:
+                                active_positions[matched_symbol] = {
+                                    "strategy": "AUTO_RESTORED",
+                                    "buy_price": buy_price,
+                                    "peak_price": max(curr_price, buy_price),
+                                    "qty": qty_str
+                                }
+                                restored = True
+                                logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono {matched_symbol}: {qty_str} monet | Wartość: ~{val_usd:.2f} USD")
+            except Exception as e:
+                logging.warning(f"Błąd synchronizacji monety {coin_info.get('coin')}: {e}")
+
+        if restored: 
+            save_positions(active_positions)
+    except Exception as e:
+        logging.error(f"Błąd ogólny synchronizacji z Bybit: {e}")
 
 def update_market_sentiment():
     global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, SAFE_RISK_PCT, MODERATE_RISK_PCT, HIGH_RISK_PCT
@@ -334,13 +429,12 @@ def get_btc_realtime_metrics():
 
         return candle_change, drop_from_recent_high
     except Exception as e:
-        logging.warning(f"Błąd szybkiej metryki BTC: {e}")
         return 0.0, 0.0
 
 def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
     candle_change, drop_from_high = get_btc_realtime_metrics()
     if candle_change <= drop_threshold or drop_from_high <= drop_threshold:
-        logging.warning(f"⚠️ [BTC RAPID GUARD] Spadek BTC! 5M: {candle_change*100:.2f}%, od szczytu 15M: {drop_from_high*100:.2f}% (Limit: {drop_threshold*100:.1f}%). Wstrzymuję zakupy.")
+        logging.warning(f"⚠️ [BTC RAPID GUARD] Spadek BTC! 5M: {candle_change*100:.2f}%, od szczytu 15M: {drop_from_high*100:.2f}%. Wstrzymuję zakupy.")
         return False
     return True
 
@@ -365,90 +459,6 @@ def check_quarterly_health(symbol):
         return True
     except Exception:
         return False
-
-def get_all_spot_usdc_symbols():
-    symbols = []
-    try:
-        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in ["USDTUSDC", "USDCUSDT"]]
-    except Exception:
-        pass
-    if not symbols:
-        try:
-            instruments = session.get_instruments_info(category=CATEGORY).get("result", {}).get("list", [])
-            symbols = [i["symbol"] for i in instruments if i.get("symbol", "").endswith(QUOTE_COIN) and i.get("status") == "Trading"]
-        except Exception:
-            pass
-    if not symbols:
-        symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "PEPEUSDC", "XRPUSDC", "ADAUSDC", "DOGEUSDC", "LINKUSDC", "NEARUSDC"]
-    if "PEPEUSDC" not in symbols: symbols.append("PEPEUSDC")
-    return symbols
-
-def sync_positions_from_bybit():
-    """Odporna autorekuperacja: przywraca wszystkie pozycje z saldem portfela bez przerywania pętli."""
-    global active_positions
-    if not session: return
-    try:
-        res = session.get_wallet_balance(accountType="UNIFIED")
-        if res.get("retCode") != 0: return
-        account_list = res.get("result", {}).get("list", [])
-        if not account_list: return
-
-        valid_usdc_symbols = get_all_spot_usdc_symbols()
-        restored = False
-
-        for coin_info in account_list[0].get("coin", []):
-            try:
-                coin = coin_info.get("coin")
-                if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
-                    continue
-
-                wb = safe_float(coin_info.get("walletBalance"))
-                eq = safe_float(coin_info.get("equity"))
-                avail = safe_float(coin_info.get("availableToWithdraw"))
-                bal = wb if wb > 0 else (eq if eq > 0 else avail)
-
-                if bal <= 0: continue
-
-                symbol = f"{coin}USDC"
-                if symbol not in valid_usdc_symbols: 
-                    continue
-
-                if symbol not in active_positions:
-                    df = get_market_data(symbol, interval="15", limit=5)
-                    if df is not None and len(df) > 0:
-                        curr_price = df.iloc[-1]['close']
-                        val_in_usdc = bal * curr_price
-                        
-                        if val_in_usdc >= MIN_EXCHANGE_NOTIONAL:
-                            buy_price = curr_price
-                            try:
-                                exec_res = session.get_executions(category=CATEGORY, symbol=symbol, limit=10)
-                                if exec_res.get("retCode") == 0:
-                                    exec_list = exec_res.get("result", {}).get("list", [])
-                                    buys = [e for e in exec_list if e.get("side") == "Buy"]
-                                    if buys: buy_price = safe_float(buys[0].get("execPrice"), curr_price)
-                            except Exception:
-                                pass
-
-                            qty_step, min_qty = get_symbol_lot_filter(symbol)
-                            qty_str = format_qty_with_step(bal, qty_step, min_qty)
-                            if qty_str:
-                                active_positions[symbol] = {
-                                    "strategy": "AUTO_RESTORED",
-                                    "buy_price": buy_price,
-                                    "peak_price": max(curr_price, buy_price),
-                                    "qty": qty_str
-                                }
-                                restored = True
-                                logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono pozycję {symbol}: {qty_str} monet | Realna cena zakupu: {buy_price} USDC (~{val_in_usdc:.2f} USDC)")
-            except Exception as e:
-                logging.warning(f"Błąd synchronizacji monety {coin_info.get('coin')}: {e}")
-
-        if restored: 
-            save_positions(active_positions)
-    except Exception as e:
-        logging.error(f"Błąd ogólny synchronizacji z Bybit: {e}")
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
@@ -526,7 +536,7 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIE 1 - 9 (ZGODNIE ZE SKALĄ RYZYKA)
+# STRATEGIE 1 - 9
 # ==============================================================================
 def run_mtf_alignment_strategy():
     global active_positions
@@ -1053,7 +1063,7 @@ def scan_pepe_specialist():
         pass
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (BEZPIECZNE ZARZĄDZANIE PAMIĘCIĄ)
+# MONITOROWANIE I SPRZEDAŻ (Z OCHRONĄ PRZED KRWOTOKIEM BTC)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -1064,7 +1074,7 @@ def monitor_and_close_positions():
     btc_5m_change, btc_drop_15m = get_btc_realtime_metrics()
     btc_flash_crash = (btc_5m_change <= BTC_FLASH_CRASH_EXIT_PCT) or (btc_drop_15m <= BTC_FLASH_CRASH_EXIT_PCT)
     if btc_flash_crash:
-        logging.warning(f"🚨 [BTC FLASH CRASH DETECTED] Spadek BTC {min(btc_5m_change, btc_drop_15m)*100:.2f}% (Próg: {BTC_FLASH_CRASH_EXIT_PCT*100:.1f}%)! Awaryjna ewakuacja stratnych altów!")
+        logging.warning(f"🚨 [BTC FLASH CRASH DETECTED] Spadek BTC {min(btc_5m_change, btc_drop_15m)*100:.2f}%! Awaryjna ewakuacja stratnych altów!")
 
     logging.info(f"=== [MONITOROWANIE POZYCJI: {len(active_positions)}/{MAX_TOTAL_POSITIONS} AKTYWNYCH] ===")
     symbols_to_delete = []
@@ -1087,9 +1097,9 @@ def monitor_and_close_positions():
             if current_price > peak_price:
                 pos["peak_price"] = current_price
                 save_positions(active_positions)
-                logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price} USDC")
+                logging.info(f"📈 [{symbol}] Nowy szczyt: {current_price}")
 
-            if symbol == "PEPEUSDC":
+            if "PEPE" in symbol:
                 trailing_drop_pct = PEPE_TRAILING_DROP_PCT
             elif any(m in symbol for m in ["SHIB", "DOGE", "BONK", "FLOKI"]):
                 trailing_drop_pct = MEME_TRAILING_DROP_PCT
@@ -1122,7 +1132,7 @@ def monitor_and_close_positions():
                 two_candles_below_ema89 = (current_price < ema89) and (prev_candle['close'] < prev_candle['ema89'])
                 if hysteresis_exit or two_candles_below_ema89:
                     ema_death_cross_sell = True
-            elif symbol == "PEPEUSDC":
+            elif "PEPE" in symbol:
                 ema89 = candle['ema89']
                 ema21 = candle['ema21']
                 if current_price < ema89 or ema21 < ema89:
@@ -1142,7 +1152,7 @@ def monitor_and_close_positions():
                 elif rsi_overbought_sell: reason = "RSI Overbought (>80)"
                 else: reason = "Volume Dump Exit"
 
-                coin_name = symbol.replace(QUOTE_COIN, "")
+                coin_name = symbol.replace("USDC", "").replace("USDT", "")
                 real_balance = get_coin_available_balance(coin_name)
 
                 if real_balance > 0:
@@ -1188,7 +1198,7 @@ def bot_loop():
     while True:
         try:
             logging.info("--------------------------------------------------------------------------------")
-            logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT USDC...")
+            logging.info("🚀 ROZPOCZYNAM NOWY CYKL SKANOWANIA RYNKU SPOT...")
 
             current_sentiment = update_market_sentiment()
             sync_positions_from_bybit()
@@ -1235,7 +1245,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit USDC SPOT Bot is Running 24/7!")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
