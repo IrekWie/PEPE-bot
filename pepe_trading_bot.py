@@ -14,7 +14,7 @@ from pybit.unified_trading import HTTP
 # ==============================================================================
 # OCHRONA PRZED ZAWIESZENIEM POŁĄCZEŃ SIECIOWYCH (SOCKET TIMEOUT)
 # ==============================================================================
-socket.setdefaulttimeout(15)  # Maksymalnie 15 sekund na odpowiedź sieciową
+socket.setdefaulttimeout(15)
 
 # ==============================================================================
 # KONFIGURACJA BOTA SPOT (RYNEK USDC - MICA COMPLIANT)
@@ -29,55 +29,48 @@ print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY
 print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
 
 TESTNET = False
-CATEGORY = "spot"  # Rynek SPOT (zgodny z Bybit EU / MiCA)
-QUOTE_COIN = "USDC" # Waluta bazowa do handlu
+CATEGORY = "spot"
+QUOTE_COIN = "USDC"
 
 # --- USTAWIENIA SKANOWANIA ---
-TOP_MARKETS_COUNT = 150      # Skanuj TOP 150 par USDC
-TOP_DIPS_COUNT = 4           # Skanuj 4 monety o największym spadku 24h
-TOP_GAINERS_COUNT = 4        # Skanuj 4 monety o największym wzroście 24h
-MAX_PUMP_POSITIONS = 4       # Maksymalnie 4 pozycje typu PUMP
+TOP_MARKETS_COUNT = 150
+TOP_DIPS_COUNT = 4
+TOP_GAINERS_COUNT = 4
+MAX_PUMP_POSITIONS = 4
 
 # --- LIMITY FINANSOWE ---
-STANDARD_MIN_ORDER_VALUE = 100.0  # Standardowe minimum pozycji: 100 USDC
-MIN_EXCHANGE_NOTIONAL = 5.0       # Techniczne minimum zlecenia SPOT na Bybit (5 USDC)
+STANDARD_MIN_ORDER_VALUE = 100.0
+MIN_EXCHANGE_NOTIONAL = 5.0
 
 # ==============================================================================
-# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA (MODYFIKOWANE PRZEZ SENTYMENT)
+# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA
 # ==============================================================================
 MAX_TOTAL_POSITIONS = 8
 MAX_EMA_CROSS_POSITIONS = 5
 
-# Procenty alokacji wg stopnia bezpieczeństwa strategii
-SAFE_RISK_PCT = 0.20         # Poziomy 1, 2, 4 (Najbezpieczniejsze)
-MODERATE_RISK_PCT = 0.15     # Poziomy 3, 5, 6 (Umiarkowane)
-HIGH_RISK_PCT = 0.10         # Poziomy 7, 8, 9 (Ryzykowne / Memy)
+SAFE_RISK_PCT = 0.20
+MODERATE_RISK_PCT = 0.15
+HIGH_RISK_PCT = 0.10
 
-# --- SZYBKA DETEKCJA SPADKÓW BITCOINA (REAL-TIME 5M) ---
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.008   # Blokuj zakupy gdy BTC spadnie o -0.8% w 5-15M
-BTC_FLASH_CRASH_EXIT_PCT    = -0.010   # Zaostrzony próg ewakuacji altów: -1.0%
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.008
+BTC_FLASH_CRASH_EXIT_PCT    = -0.010
 
-# --- FILTRY ANTY-SZUMOWE EMA 21/89 ---
 EMA_CROSS_MIN_SPREAD_PCT = 0.0020  
 EMA_CROSS_VOL_MULTIPLIER = 1.10    
 EMA_EXIT_HYSTERESIS_PCT  = 0.0020  
 
-# --- STRATEGIA 2 (TOP DIP HUNTER) ---
 MIN_DIP_24H_PCT = -0.050     
 DIP_RSI_15M_MAX = 40         
 DIP_VOL_MULTIPLIER = 1.5     
 
-# --- PROGI ZABEZPIECZAJĄCE ---
-TRAILING_DROP_PCT = 0.015       # Standardowy Trailing Stop (-1.5% od szczytu)
-PEPE_TRAILING_DROP_PCT = 0.028  # Dedykowany Trailing Stop dla PEPE (-2.8% od szczytu)
-MEME_TRAILING_DROP_PCT = 0.025  # Trailing Stop dla pozostałych Memecoinów (-2.5%)
-HARD_STOP_LOSS_PCT = 0.02       # Sztywny Stop Loss (-2.0% od ceny zakupu)
+TRAILING_DROP_PCT = 0.015
+PEPE_TRAILING_DROP_PCT = 0.028
+MEME_TRAILING_DROP_PCT = 0.025
+HARD_STOP_LOSS_PCT = 0.02
 
-# --- MECHANIZM BREAKEVEN ---
 BREAKEVEN_TRIGGER_PCT = 0.015   
 BREAKEVEN_SL_PCT = 0.002        
 
-# --- PROGI RSI & VOL ---
 RSI_OVERBOUGHT_SELL = 80     
 RSI_MAX_BUY_EMA = 65         
 PUMP_VOL_MULTIPLIER = 2.5    
@@ -120,7 +113,7 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     return 0.0, f"Brak środków (< {MIN_EXCHANGE_NOTIONAL}$)"
 
 # ==============================================================================
-# PRECYZYJNY SILNIK FORMOWANIA ILOŚCI (DECIMAL QUANTIZATION)
+# PRECYZYJNY SILNIK FORMOWANIA ILOŚCI
 # ==============================================================================
 instrument_filters = {}
 
@@ -173,7 +166,7 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         return None
 
 # ==============================================================================
-# INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT (EU PRIORITY)
+# INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT
 # ==============================================================================
 endpoints_to_test = [
     ("EU Region / MiCA", "https://api.bybit.eu"),
@@ -217,7 +210,7 @@ if not session:
     session.endpoint = "https://api.bybit.eu"
 
 # ==============================================================================
-# ZARZĄDZANIE PAMIĘCIĄ POZYCJI SPOT (JSON)
+# ZARZĄDZANIE PAMIĘCIĄ POZYCJI SPOT
 # ==============================================================================
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
@@ -238,7 +231,7 @@ def save_positions(positions):
 active_positions = load_positions()
 
 # ==============================================================================
-# FUNKCJE POMOCNICZE, SALDO USDC, RSI, VOL & DYNAMICZNE RYZYKO
+# FUNKCJE POMOCNICZE, SALDO USDC, RSI, VOL & POPRAWIONY ODCZYT MONET
 # ==============================================================================
 def get_balances():
     if not session:
@@ -267,6 +260,7 @@ def get_balances():
         return 0.0, 0.0
 
 def get_coin_available_balance(coin_name):
+    """Odczytuje realną liczbę monet w portfelu UTA (walletBalance z fallbackiem do equity)."""
     if not session: return 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin_name)
@@ -275,9 +269,10 @@ def get_coin_available_balance(coin_name):
             if account_list:
                 for c in account_list[0].get("coin", []):
                     if c.get("coin") == coin_name:
-                        avail = c.get("availableToWithdraw")
-                        eq = c.get("equity")
-                        return safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
+                        wb = safe_float(c.get("walletBalance"))
+                        eq = safe_float(c.get("equity"))
+                        avail = safe_float(c.get("availableToWithdraw"))
+                        return wb if wb > 0 else (eq if eq > 0 else avail)
     except Exception:
         pass
     return 0.0
@@ -324,11 +319,6 @@ def update_market_sentiment():
         return "UNKNOWN"
 
 def get_btc_realtime_metrics():
-    """
-    Szybka analiza Bitcoina na interwale 5-minutowym:
-    1. Zmiana ceny na bieżącej świecy 5M.
-    2. Spadek bieżącej ceny od szczytu z ostatnich 15 minut (Rolling High 3 świec 5M).
-    """
     try:
         df_btc = get_market_data("BTCUSDC", interval="5", limit=6)
         if df_btc is None or len(df_btc) < 4:
@@ -356,7 +346,7 @@ def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
 
 def check_quarterly_health(symbol):
     try:
-        time.sleep(0.05)
+        time.sleep(0.04)
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval="D", limit=90)
         candles = res.get("result", {}).get("list", [])
         if not candles or len(candles) < 60: return False
@@ -384,11 +374,18 @@ def get_all_spot_usdc_symbols():
     except Exception:
         pass
     if not symbols:
+        try:
+            instruments = session.get_instruments_info(category=CATEGORY).get("result", {}).get("list", [])
+            symbols = [i["symbol"] for i in instruments if i.get("symbol", "").endswith(QUOTE_COIN) and i.get("status") == "Trading"]
+        except Exception:
+            pass
+    if not symbols:
         symbols = ["BTCUSDC", "ETHUSDC", "SOLUSDC", "PEPEUSDC", "XRPUSDC", "ADAUSDC", "DOGEUSDC", "LINKUSDC", "NEARUSDC"]
     if "PEPEUSDC" not in symbols: symbols.append("PEPEUSDC")
     return symbols
 
 def sync_positions_from_bybit():
+    """Odporna autorekuperacja: przywraca wszystkie pozycje z saldem portfela bez przerywania pętli."""
     global active_positions
     if not session: return
     try:
@@ -401,50 +398,57 @@ def sync_positions_from_bybit():
         restored = False
 
         for coin_info in account_list[0].get("coin", []):
-            coin = coin_info.get("coin")
-            if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: continue
+            try:
+                coin = coin_info.get("coin")
+                if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
+                    continue
 
-            avail = coin_info.get("availableToWithdraw")
-            eq = coin_info.get("equity")
-            bal = safe_float(avail) if (avail is not None and str(avail).strip() != "") else safe_float(eq)
+                wb = safe_float(coin_info.get("walletBalance"))
+                eq = safe_float(coin_info.get("equity"))
+                avail = safe_float(coin_info.get("availableToWithdraw"))
+                bal = wb if wb > 0 else (eq if eq > 0 else avail)
 
-            if bal <= 0: continue
+                if bal <= 0: continue
 
-            symbol = f"{coin}USDC"
-            if symbol not in valid_usdc_symbols: continue
+                symbol = f"{coin}USDC"
+                if symbol not in valid_usdc_symbols: 
+                    continue
 
-            if symbol not in active_positions:
-                df = get_market_data(symbol, interval="15", limit=5)
-                if df is not None and len(df) > 0:
-                    curr_price = df.iloc[-1]['close']
-                    val_in_usdc = bal * curr_price
-                    
-                    if val_in_usdc >= 10.0:
-                        buy_price = curr_price
-                        try:
-                            exec_res = session.get_executions(category=CATEGORY, symbol=symbol, limit=10)
-                            if exec_res.get("retCode") == 0:
-                                exec_list = exec_res.get("result", {}).get("list", [])
-                                buys = [e for e in exec_list if e.get("side") == "Buy"]
-                                if buys: buy_price = safe_float(buys[0].get("execPrice"), curr_price)
-                        except Exception:
-                            pass
+                if symbol not in active_positions:
+                    df = get_market_data(symbol, interval="15", limit=5)
+                    if df is not None and len(df) > 0:
+                        curr_price = df.iloc[-1]['close']
+                        val_in_usdc = bal * curr_price
+                        
+                        if val_in_usdc >= MIN_EXCHANGE_NOTIONAL:
+                            buy_price = curr_price
+                            try:
+                                exec_res = session.get_executions(category=CATEGORY, symbol=symbol, limit=10)
+                                if exec_res.get("retCode") == 0:
+                                    exec_list = exec_res.get("result", {}).get("list", [])
+                                    buys = [e for e in exec_list if e.get("side") == "Buy"]
+                                    if buys: buy_price = safe_float(buys[0].get("execPrice"), curr_price)
+                            except Exception:
+                                pass
 
-                        qty_step, min_qty = get_symbol_lot_filter(symbol)
-                        qty_str = format_qty_with_step(bal, qty_step, min_qty)
-                        if qty_str:
-                            active_positions[symbol] = {
-                                "strategy": "AUTO_RESTORED",
-                                "buy_price": buy_price,
-                                "peak_price": max(curr_price, buy_price),
-                                "qty": qty_str
-                            }
-                            restored = True
-                            logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono pozycję {symbol}: {qty_str} monet | Realna cena: {buy_price} USDC")
+                            qty_step, min_qty = get_symbol_lot_filter(symbol)
+                            qty_str = format_qty_with_step(bal, qty_step, min_qty)
+                            if qty_str:
+                                active_positions[symbol] = {
+                                    "strategy": "AUTO_RESTORED",
+                                    "buy_price": buy_price,
+                                    "peak_price": max(curr_price, buy_price),
+                                    "qty": qty_str
+                                }
+                                restored = True
+                                logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono pozycję {symbol}: {qty_str} monet | Realna cena zakupu: {buy_price} USDC (~{val_in_usdc:.2f} USDC)")
+            except Exception as e:
+                logging.warning(f"Błąd synchronizacji monety {coin_info.get('coin')}: {e}")
 
-        if restored: save_positions(active_positions)
+        if restored: 
+            save_positions(active_positions)
     except Exception as e:
-        logging.error(f"Błąd synchronizacji z Bybit: {e}")
+        logging.error(f"Błąd ogólny synchronizacji z Bybit: {e}")
 
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
@@ -522,7 +526,7 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIA (POZIOM 1 - NAJBEZPIECZNIEJSZA): MULTI-TIMEFRAME ALIGNMENT (4H + 15M)
+# STRATEGIE 1 - 9 (ZGODNIE ZE SKALĄ RYZYKA)
 # ==============================================================================
 def run_mtf_alignment_strategy():
     global active_positions
@@ -580,9 +584,6 @@ def run_mtf_alignment_strategy():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 2): EMA TREND SCANNER (TOP 150)
-# ==============================================================================
 def scan_top150_for_ema_signals():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
@@ -640,9 +641,6 @@ def scan_top150_for_ema_signals():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 3): TOP 4 GAINERS EMA PULLBACK
-# ==============================================================================
 def run_top_gainers_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
@@ -699,9 +697,6 @@ def run_top_gainers_strategy():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 4): RELATIVE STRENGTH VS BITCOIN
-# ==============================================================================
 def run_relative_strength_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
@@ -764,9 +759,6 @@ def run_relative_strength_strategy():
     except Exception:
         pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 5): BOLLINGER BANDS SQUEEZE BREAKOUT
-# ==============================================================================
 def run_bb_squeeze_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
@@ -824,9 +816,6 @@ def run_bb_squeeze_strategy():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 6): CZYSTY CROSS EMA 21 / 89
-# ==============================================================================
 def run_ema21_89_pure_crossover_strategy():
     global active_positions
 
@@ -889,9 +878,6 @@ def run_ema21_89_pure_crossover_strategy():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 7): TOP DIP HUNTER
-# ==============================================================================
 def run_dip_hunter_strategy():
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
@@ -949,9 +935,6 @@ def run_dip_hunter_strategy():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 8): MOMENTUM PUMP HUNTER
-# ==============================================================================
 def scan_for_pumps():
     global active_positions
 
@@ -1011,9 +994,6 @@ def scan_for_pumps():
         except Exception:
             pass
 
-# ==============================================================================
-# STRATEGIA (POZIOM 9 - NAJBARDZIEJ RYZYKOWNA): DEDYKOWANY SKANER PEPE
-# ==============================================================================
 def scan_pepe_specialist():
     global active_positions
     pepe_symbol = "PEPEUSDC"
@@ -1021,7 +1001,6 @@ def scan_pepe_specialist():
     if pepe_symbol in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS:
         return
 
-    # Zaostrzona ochrona wejścia dla PEPE
     if not is_btc_market_healthy(drop_threshold=-0.010): return
 
     total_equity, free_usdc = get_balances()
@@ -1074,7 +1053,7 @@ def scan_pepe_specialist():
         pass
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (Z OCHRONĄ PRZED KRWOTOKIEM BTC)
+# MONITOROWANIE I SPRZEDAŻ (BEZPIECZNE ZARZĄDZANIE PAMIĘCIĄ)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -1152,7 +1131,6 @@ def monitor_and_close_positions():
                 rsi_overbought_sell = current_rsi >= RSI_OVERBOUGHT_SELL and total_pnl > 0
                 vol_dump_sell = (c_vol > vol_ma * 2.0) and (candle['close'] < candle['open']) and (total_pnl < -0.01)
 
-            # Awaryjne wyjście gdy BTC ma krach i pozycja traci ponad -0.5%
             btc_emergency_exit = btc_flash_crash and (total_pnl < -0.005)
 
             if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit or ema_death_cross_sell or btc_emergency_exit:
@@ -1172,7 +1150,7 @@ def monitor_and_close_positions():
                     qty_to_sell = format_qty_with_step(real_balance, qty_step, min_qty)
 
                     if not qty_to_sell:
-                        logging.warning(f"⚠️ Saldo {coin_name} ({real_balance}) poniżej wymaganego minimum. Usuwam z pamięci.")
+                        logging.warning(f"⚠️ Saldo {coin_name} ({real_balance}) poniżej minimalnego kroku giełdy. Usuwam z pamięci bota.")
                         symbols_to_delete.append(symbol)
                     else:
                         res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
@@ -1187,10 +1165,9 @@ def monitor_and_close_positions():
                             logging.info(f"💰 [SPOT SPRZEDAŻ - {symbol}] Strategia: {strat_name} | Powód: {reason} | PnL: {total_pnl*100:.2f}% | Szczyt: {pos['peak_price']}")
                             symbols_to_delete.append(symbol)
                         else:
-                            logging.error(f"❌ Błąd sprzedaży {symbol}: {res}")
+                            logging.error(f"❌ Błąd sprzedaży {symbol}: {res} — pozycja pozostaje w pamięci.")
                 else:
-                    logging.warning(f"⚠️ Brak monet {coin_name} na koncie. Usuwam z pamięci.")
-                    symbols_to_delete.append(symbol)
+                    logging.warning(f"⚠️ Saldo {coin_name} zwrócone jako 0. Nie usuwam pozycji bez udanej sprzedaży.")
             else:
                 logging.info(f"ℹ️ [{symbol}] [{strat_name}] PnL: {total_pnl*100:.2f}% | Szczyt: {pos['peak_price']} | Cena: {current_price}")
 
@@ -1217,9 +1194,9 @@ def bot_loop():
             sync_positions_from_bybit()
 
             if is_btc_market_healthy():
-                run_mtf_alignment_strategy()           # Poziom 1: Najbezpieczniejsza
-                scan_top150_for_ema_signals()         # Poziom 2: Bardzo bezpieczna
-                run_relative_strength_strategy()       # Poziom 4: Bezpieczna/Obronna
+                run_mtf_alignment_strategy()           # Poziom 1
+                scan_top150_for_ema_signals()         # Poziom 2
+                run_relative_strength_strategy()       # Poziom 4
 
                 if "BEARISH" not in current_sentiment:
                     run_top_gainers_strategy()             # Poziom 3
