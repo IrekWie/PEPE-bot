@@ -114,7 +114,7 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     return 0.0, f"Brak środków (< {MIN_EXCHANGE_NOTIONAL}$)"
 
 # ==============================================================================
-# PRECYZYJNY SILNIK FORMOWANIA ILOŚCI
+# PRECYZYJNY SILNIK FORMOWANIA ILOŚCI (POPRAWIONY DLA BYBIT SPOT)
 # ==============================================================================
 instrument_filters = {}
 
@@ -129,16 +129,27 @@ def get_symbol_lot_filter(symbol):
                 list_data = res.get("result", {}).get("list", [])
                 if list_data:
                     lot_filter = list_data[0].get("lotSizeFilter", {})
-                    qty_step = lot_filter.get("qtyStep", "1")
-                    min_qty = lot_filter.get("minOrderQty", "1")
-                    instrument_filters[symbol] = (qty_step, min_qty)
-                    return qty_step, min_qty
+                    # Bybit SPOT używa parametru basePrecision (np. 0.000001 dla BTC, 0.0001 dla ETH)
+                    base_prec = lot_filter.get("basePrecision")
+                    qty_step = lot_filter.get("qtyStep")
+                    min_qty = lot_filter.get("minOrderQty", "0.000001")
+                    
+                    eff_step = base_prec if (base_prec and str(base_prec).strip() != "") else (qty_step if qty_step else "0.000001")
+                    instrument_filters[symbol] = (eff_step, min_qty)
+                    return eff_step, min_qty
     except Exception as e:
         logging.warning(f"Nie udało się pobrać filtrów dla {symbol}: {e}")
 
-    if symbol.startswith("1000") or any(m in symbol for m in ["SHIB", "PEPE", "BONK", "FLOKI"]):
+    # Inteligentny fallback w zależności od typu monety
+    if any(m in symbol for m in ["BTC"]):
+        return "0.00001", "0.00001"
+    elif any(m in symbol for m in ["ETH", "SOL"]):
+        return "0.0001", "0.0001"
+    elif any(m in symbol for m in ["LINK", "UNI"]):
+        return "0.01", "0.01"
+    elif symbol.startswith("1000") or any(m in symbol for m in ["SHIB", "PEPE", "BONK", "FLOKI", "ZEREBRO", "WAL"]):
         return "1", "1"
-    return "0.1", "0.1"
+    return "0.0001", "0.0001"
 
 def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
     try:
@@ -151,9 +162,13 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         else:
             floored_dec = (qty_dec // step_dec) * step_dec
         
-        if floored_dec < min_dec:
+        if floored_dec < min_dec and floored_dec <= 0:
             return None
         
+        # Jeśli zaokrąglenie w dół dało 0 przez zbyt duży step, używamy precyzji surowego salda
+        if floored_dec <= 0 and qty_dec > 0:
+            floored_dec = qty_dec
+
         normalized_step = step_dec.normalize()
         exp = normalized_step.as_tuple().exponent
         
@@ -164,7 +179,7 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
             return f"{int(floored_dec)}"
     except Exception as e:
         logging.error(f"Błąd formatowania ilości: {e}")
-        return None
+        return str(raw_qty)
 
 # ==============================================================================
 # INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT
@@ -279,7 +294,6 @@ def get_coin_available_balance(coin_name):
     return 0.0
 
 def get_all_spot_trading_symbols():
-    """Zwraca wszystkie aktywne pary SPOT (zarówno USDC jak i USDT)."""
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
         return [t["symbol"] for t in tickers if "symbol" in t]
@@ -300,7 +314,7 @@ def get_all_spot_usdc_symbols():
     return symbols
 
 def sync_positions_from_bybit():
-    """Wykrywa wszystkie zakupione monety (zarówno pary USDC, jak i USDT dla ZEREBRO, WAL itp.)."""
+    """Wykrywa wszystkie zakupione monety (w tym BTC, ETH, SOL, LINK, ZEREBRO, WAL)."""
     global active_positions
     if not session: return
     try:
@@ -318,14 +332,12 @@ def sync_positions_from_bybit():
                 if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
                     continue
 
-                # Prawidłowy odczyt: walletBalance z kolumny Saldo Portfela
                 wb = safe_float(coin_info.get("walletBalance"))
                 eq = safe_float(coin_info.get("equity"))
                 bal = wb if wb > 0 else eq
 
                 if bal <= 0: continue
 
-                # Sprawdzenie pary: priorytet USDC, fallback USDT
                 matched_symbol = None
                 if f"{coin}USDC" in all_trading_symbols:
                     matched_symbol = f"{coin}USDC"
@@ -341,7 +353,7 @@ def sync_positions_from_bybit():
                         curr_price = df.iloc[-1]['close']
                         val_usd = bal * curr_price
                         
-                        # Próg 8 USD uwzględnia pozycję LINK (~9.94 USD) i odcina kurz
+                        # Próg 8 USD uwzględnia LINK (~9.94 USD) i odcina kurz
                         if val_usd >= MIN_SYNC_POSITION_VALUE:
                             buy_price = curr_price
                             try:
@@ -394,14 +406,14 @@ def update_market_sentiment():
             HIGH_RISK_PCT = 0.10
         elif c_close < ema89 or ema21 < ema89:
             sentiment = "BEARISH 🔴 (Defensywa)"
-            MAX_TOTAL_POSITIONS = 3
+            MAX_TOTAL_POSITIONS = 8       # Utrzymujemy limit 8, aby nie ucinać widoczności przywróconych pozycji
             MAX_EMA_CROSS_POSITIONS = 1
             SAFE_RISK_PCT = 0.15      
             MODERATE_RISK_PCT = 0.0   
             HIGH_RISK_PCT = 0.0       
         else:
             sentiment = "NEUTRAL 🟡"
-            MAX_TOTAL_POSITIONS = 5
+            MAX_TOTAL_POSITIONS = 8
             MAX_EMA_CROSS_POSITIONS = 3
             SAFE_RISK_PCT = 0.18
             MODERATE_RISK_PCT = 0.12
@@ -1074,7 +1086,7 @@ def monitor_and_close_positions():
     btc_5m_change, btc_drop_15m = get_btc_realtime_metrics()
     btc_flash_crash = (btc_5m_change <= BTC_FLASH_CRASH_EXIT_PCT) or (btc_drop_15m <= BTC_FLASH_CRASH_EXIT_PCT)
     if btc_flash_crash:
-        logging.warning(f"🚨 [BTC FLASH CRASH DETECTED] Spadek BTC {min(btc_5m_change, btc_drop_15m)*100:.2f}%! Awaryjna ewakuacja stratnych altów!")
+        logging.warning(f"🚨 [BTC FLASH CRASH DETECTED] Spadek BTC {min(btc_5m_change, btc_drop_15m)*100:.2f}% (Próg: {BTC_FLASH_CRASH_EXIT_PCT*100:.1f}%)! Awaryjna ewakuacja stratnych altów!")
 
     logging.info(f"=== [MONITOROWANIE POZYCJI: {len(active_positions)}/{MAX_TOTAL_POSITIONS} AKTYWNYCH] ===")
     symbols_to_delete = []
