@@ -1,0 +1,135 @@
+import os
+import time
+from decimal import Decimal
+from pybit.unified_trading import HTTP
+
+# Pobranie kluczy ze zmiennych środowiskowych
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "TUTAJ_TWÓJ_KEY").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "TUTAJ_TWÓJ_SECRET").strip()
+
+CATEGORY = "spot"
+MAX_DUST_USD = 10.0   # Próg górny: monety warte poniżej 10 USD
+MIN_DUST_USD = 5.0    # Próg dolny: minimum notional dla Bybit Spot
+
+session = HTTP(
+    testnet=False,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+    recv_window=20000
+)
+session.endpoint = "https://api.bybit.eu"
+
+def safe_float(val, default=0.0):
+    try:
+        return float(val) if val is not None and str(val).strip() != "" else default
+    except (ValueError, TypeError):
+        return default
+
+def get_symbol_step(symbol):
+    try:
+        res = session.get_instruments_info(category=CATEGORY, symbol=symbol)
+        if res.get("retCode") == 0:
+            item = res["result"]["list"][0]
+            lot_filter = item.get("lotSizeFilter", {})
+            base_prec = lot_filter.get("basePrecision")
+            qty_step = lot_filter.get("qtyStep")
+            min_qty = lot_filter.get("minOrderQty", "0.0001")
+            step = base_prec if base_prec else (qty_step if qty_step else "0.0001")
+            return step, min_qty
+    except Exception:
+        pass
+    return "0.0001", "0.0001"
+
+def format_qty(raw_qty, step_str, min_str):
+    try:
+        q_dec = Decimal(str(raw_qty))
+        s_dec = Decimal(str(step_str))
+        m_dec = Decimal(str(min_str))
+        floored = (q_dec // s_dec) * s_dec if s_dec > 0 else q_dec
+        if floored < m_dec:
+            return None
+        norm = s_dec.normalize()
+        decimals = abs(norm.as_tuple().exponent) if norm.as_tuple().exponent < 0 else 0
+        return f"{floored:.{decimals}f}"
+    except Exception:
+        return None
+
+def sweep_small_balances():
+    print("🔍 Sprawdzam saldo konta UTA pod kątem małych pozycji (< 10 USD)...")
+    res = session.get_wallet_balance(accountType="UNIFIED")
+    if res.get("retCode") != 0:
+        print(f"❌ Błąd odczytu konta: {res.get('retMsg')}")
+        return
+
+    account = res["result"]["list"][0]
+    
+    # Pobranie listy aktywnych par SPOT
+    tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+    active_symbols = {t["symbol"]: safe_float(t.get("lastPrice")) for t in tickers if "symbol" in t}
+
+    converted_count = 0
+
+    for coin_data in account.get("coin", []):
+        coin = coin_data.get("coin")
+        if coin in ["USDC", "USDT", "USD", "EUR", "PLN"]:
+            continue
+
+        wb = safe_float(coin_data.get("walletBalance"))
+        eq = safe_float(coin_data.get("equity"))
+        bal = wb if wb > 0 else eq
+
+        if bal <= 0:
+            continue
+
+        # Szukamy pary z USDC, a jeśli brak - z USDT
+        symbol = None
+        price = 0.0
+        if f"{coin}USDC" in active_symbols:
+            symbol = f"{coin}USDC"
+            price = active_symbols[symbol]
+        elif f"{coin}USDT" in active_symbols:
+            symbol = f"{coin}USDT"
+            price = active_symbols[symbol]
+
+        if not symbol or price <= 0:
+            continue
+
+        val_usd = bal * price
+
+        # Sprawdzamy czy to małe saldo (< 10 USD)
+        if val_usd < MAX_DUST_USD:
+            print(f"\n🪙 Wykryto: {coin} | Ilość: {bal} | Wartość: ~{val_usd:.2f} USD ({symbol})")
+            
+            if val_usd < MIN_DUST_USD:
+                print(f"   ⏭️ Wartość ({val_usd:.2f} USD) jest poniżej limitu zlecenia Spot (min. 5 USD).")
+                print("   👉 Użyj przycisku 'Konwertuj małe salda' w panelu giełdy Bybit.")
+                continue
+
+            step, min_qty = get_symbol_step(symbol)
+            qty_to_sell = format_qty(bal, step, min_qty)
+
+            if not qty_to_sell:
+                print(f"   ⚠️ Nie udało się sformatować ilości dla kroku {step}.")
+                continue
+
+            print(f"   🚀 Wysyłam zlecenie Market Sell: {qty_to_sell} {coin} na parze {symbol}...")
+            order = session.place_order(
+                category=CATEGORY,
+                symbol=symbol,
+                side="Sell",
+                orderType="Market",
+                qty=qty_to_sell
+            )
+
+            if order.get("retCode") == 0:
+                print(f"   ✅ Sukces! Zamieniono {coin} na walutę kwotowaną (~{val_usd:.2f} USD).")
+                converted_count += 1
+            else:
+                print(f"   ❌ Giełda odrzuciła zlecenie: {order.get('retMsg')} (Kod: {order.get('retCode')})")
+            
+            time.sleep(0.5)
+
+    print(f"\n✨ Zakończono. Pomyślnie zlikwidowano pozycji: {converted_count}.")
+
+if __name__ == "__main__":
+    sweep_small_balances()
