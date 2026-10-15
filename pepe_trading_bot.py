@@ -1242,11 +1242,10 @@ def bot_loop():
 
             current_sentiment = update_market_sentiment()
             
-            # Odczyt salda konta
             total_equity, free_usdc = get_balances()
 
-            # Odczyt i kalkulacja bilansu handlowego (Dziś vs Łącznie)
-            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            # Odczyt i kalkulacja bilansu handlowego (format zgodny z Python 3.14)
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_stats = trade_history.get("daily", {}).get(today_str, {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0})
             total_realized = trade_history.get("total_realized_usd", 0.0)
             total_trades = trade_history.get("total_trades", 0)
@@ -1264,7 +1263,7 @@ def bot_loop():
                 run_mtf_alignment_strategy()           # Poziom 1
                 scan_top150_for_ema_signals()          # Poziom 2
                 run_relative_strength_strategy()       # Poziom 4
-                run_dip_hunter_strategy()              # Poziom 7 (Działa w bessie na 5M)
+                run_dip_hunter_strategy()              # Poziom 7
 
                 if "BEARISH" not in current_sentiment:
                     run_top_gainers_strategy()             # Poziom 3
