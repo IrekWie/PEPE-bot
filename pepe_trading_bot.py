@@ -6,7 +6,7 @@ import threading
 import socket
 from decimal import Decimal
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import requests
@@ -125,7 +125,7 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     global trade_history
     pnl_pct = (sell_price - buy_price) / buy_price
     pnl_usd = (sell_price - buy_price) * qty
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
     trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
