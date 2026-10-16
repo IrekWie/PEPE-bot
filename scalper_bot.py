@@ -24,12 +24,12 @@ BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
 CATEGORY = "spot"
-SCALP_SYMBOL = "SOLUSDC"         # Główna para scalpingowa
+SCALP_SYMBOL = "SOLUSDC"
 QUOTE_COIN = "USDC"
-INTERVAL = "1"                   # Świece 1-minutowe
+INTERVAL = "1"
 
 # --- PARAMETRY WEJŚCIA I WYJŚCIA ---
-SCALP_BUDGET_USD = 100.0         # Kwota pojedynczego wejścia (min. 100 USD)
+SCALP_BUDGET_USD = 80.0          # Kwota pojedynczego wejścia (dostosowana do wolnego salda ~93 USDC)
 TAKE_PROFIT_PCT = 0.008          # TP: +0.80% (czysty zysk ~0.60% po prowizjach Bybit)
 HARD_STOP_LOSS_PCT = 0.005       # Sztywny SL: -0.50% (szybkie ucięcie błędu)
 BREAKEVEN_TRIGGER_PCT = 0.0035   # Aktywacja BE po osiągnięciu +0.35% zysku
@@ -38,7 +38,7 @@ MAX_HOLD_SECONDS = 480           # Time-Stop: 8 minut (zrzut zastygłej pozycji)
 
 RSI_OVERSOLD = 25                # Poziom wyprzedania RSI 7 na 1M
 POLL_INTERVAL_SEC = 2            # Szybki cykl odpytywania rynku (co 2 sekundy)
-HEARTBEAT_INTERVAL_SEC = 60      # Częstotliwość raportu o stanie bota w logach (co 60s)
+HEARTBEAT_INTERVAL_SEC = 60      # Częstotliwość raportu w logach (co 60s)
 
 SCALP_POS_FILE = "scalp_active_pos.json"
 SCALP_HIST_FILE = "scalp_trade_history.json"
@@ -190,7 +190,6 @@ def get_1m_candles():
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
 
-        # Wskaźniki 1M: RSI (7), Wstęgi Bollingera (20, 2)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(7).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(7).mean()
@@ -228,7 +227,7 @@ def scalper_loop():
             current_price = current_candle['close']
             rsi7 = current_candle['rsi7']
 
-            # --- PULS BOTA (RAPORTOWANIE CO 60 SEKUND) ---
+            # Raport co 60 sekund
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 free_bal = get_free_usdc()
                 if active_scalp:
@@ -240,7 +239,7 @@ def scalper_loop():
                 logging.info(f"💓 [STATUS 1M] {SCALP_SYMBOL}: {current_price:.2f} USD | RSI(7): {rsi7:.1f} | Stan: {status_str} | Wolne środki: {free_bal:.2f} USDC")
                 last_heartbeat = now
             
-            # --- FAZA 1: ZARZĄDZANIE OTWARTĄ POZYCJĄ ---
+            # FAZA 1: ZARZĄDZANIE OTWARTĄ POZYCJĄ
             if active_scalp:
                 buy_price = active_scalp["buy_price"]
                 peak_price = max(active_scalp.get("peak_price", buy_price), current_price)
@@ -277,7 +276,7 @@ def scalper_loop():
                 else:
                     save_position(active_scalp)
 
-            # --- FAZA 2: POSZUKIWANIE MIKRO-WEJŚCIA ---
+            # FAZA 2: POSZUKIWANIE MIKRO-WEJŚCIA
             else:
                 c_open = current_candle['open']
                 c_low = current_candle['low']
