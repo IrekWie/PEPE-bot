@@ -468,7 +468,7 @@ def update_market_sentiment():
         elif c_close < ema89 or ema21 < ema89:
             sentiment = "BEARISH 🔴 (Defensywa)"
             SENTIMENT_STATE = "BEARISH"
-            MAX_TOTAL_POSITIONS = 3    # ZMIANA: Max 3 pozycje w bessie (bardzo rygorystycznie)
+            MAX_TOTAL_POSITIONS = 3    # Limit 3 pozycji w bessie
             MAX_EMA_CROSS_POSITIONS = 0
             SAFE_RISK_PCT = 0.15      
             MODERATE_RISK_PCT = 0.0   
@@ -510,18 +510,16 @@ def get_btc_realtime_metrics():
 def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
     candle_change, drop_from_high = get_btc_realtime_metrics()
     
-    # 1. Klasyczna ochrona 5M
     if candle_change <= drop_threshold or drop_from_high <= drop_threshold:
         logging.warning(f"⚠️ [BTC RAPID GUARD] Spadek BTC! 5M: {candle_change*100:.2f}%. Wstrzymuję zakupy.")
         return False
         
-    # 2. NOWOŚĆ: Twarda ochrona 15M (Blokada zakupów na krwawiącej świecy 15M)
     try:
         df_btc = get_market_data("BTCUSDC", interval="15", limit=3)
         if df_btc is not None and len(df_btc) > 1:
             c15 = df_btc.iloc[-1]
             change_15m = (c15['close'] - c15['open']) / c15['open']
-            if change_15m <= -0.003: # BTC spada ponad 0.3% w ciągu 15 minut
+            if change_15m <= -0.003:
                 logging.warning(f"⚠️ [BTC 15M GUARD] Aktywna czerwona świeca na BTC ({change_15m*100:.2f}%). Zakaz wchodzenia w alty!")
                 return False
     except Exception:
@@ -615,7 +613,7 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIE 1 - 9
+# STRATEGIE 1 - 9 (Z FILTREM EMA 200 W BESSIE)
 # ==============================================================================
 def run_mtf_alignment_strategy():
     global active_positions
@@ -641,13 +639,18 @@ def run_mtf_alignment_strategy():
             macro_uptrend = (candle_4h['close'] > candle_4h['ema50']) and (candle_4h['ema21'] > candle_4h['ema50'])
             if not macro_uptrend: continue
 
-            df_15m = get_market_data(symbol, interval="15", limit=35)
-            if df_15m is None or len(df_15m) < 20: continue
+            df_15m = get_market_data(symbol, interval="15", limit=250)
+            if df_15m is None or len(df_15m) < 200: continue
 
             c_15m = df_15m.iloc[-2]
             c_open, c_close, c_low = c_15m['open'], c_15m['close'], c_15m['low']
             rsi_15m = c_15m['rsi']
+            ema200_15m = c_15m['ema200']
             
+            # FILTR ZŁOTEJ LINII: W trybie niedźwiedzia kupujemy WYŁĄCZNIE powyżej EMA 200
+            if SENTIMENT_STATE == "BEARISH" and c_close <= ema200_15m:
+                continue
+
             oversold_on_15m = rsi_15m <= 36
             rebound_reaction = (c_close > c_open) or ((c_open - c_low) > abs(c_close - c_open) * 1.5)
 
@@ -659,7 +662,7 @@ def run_mtf_alignment_strategy():
                     qty_str = format_qty_with_step(order_val / c_close, qty_step, min_qty) or "1"
                     active_positions[symbol] = {"strategy": "MTF_ALIGNMENT_4H_15M", "buy_price": c_close, "peak_price": c_close, "qty": qty_str, "sold_half": False}
                     save_positions(active_positions)
-                    logging.info(f"💎🎯 [MTF KUPNO OK] {symbol}! Hossa 4H + Dołek 15M (RSI: {rsi_15m:.1f}) | Zakup: {order_val:.2f}$ ({risk_label})")
+                    logging.info(f"💎🎯 [MTF KUPNO OK] {symbol}! Hossa 4H + Dołek 15M (RSI: {rsi_15m:.1f}, >EMA200) | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
                     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
@@ -684,15 +687,18 @@ def scan_top150_for_ema_signals():
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
-            df = get_market_data(symbol, interval="15")
-            if df is None or len(df) < 25: continue
+            df = get_market_data(symbol, interval="15", limit=250)
+            if df is None or len(df) < 200: continue
 
             candle = df.iloc[-2]
             prev_candle = df.iloc[-3]
             c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
             c_rsi = candle['rsi']
-            ema21, ema89 = candle['ema21'], candle['ema89']
+            ema21, ema89, ema200 = candle['ema21'], candle['ema89'], candle['ema200']
+
+            if SENTIMENT_STATE == "BEARISH" and c_close <= ema200:
+                continue
 
             bullish_trend = ema21 > ema89
             in_value_zone = (c_low <= max(ema21, ema89)) and (c_low >= min(ema21, ema89))
@@ -743,7 +749,10 @@ def run_top_gainers_strategy():
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
             c_rsi = candle['rsi']
             
-            ema9, ema21, ema89 = candle['ema9'], candle['ema21'], candle['ema89']
+            ema9, ema21, ema89, ema200 = candle['ema9'], candle['ema21'], candle['ema89'], candle['ema200']
+
+            if SENTIMENT_STATE == "BEARISH" and c_close <= ema200:
+                continue
 
             bullish_structure = (c_close > ema89) and (ema21 > ema89)
             tested_ema_support = (c_low <= max(ema9, ema21)) and (c_close >= ema21)
@@ -793,8 +802,8 @@ def run_relative_strength_strategy():
             if symbol in active_positions or symbol == "BTCUSDC": continue
             if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
-            df_alt = get_market_data(symbol, interval="15", limit=20)
-            if df_alt is None or len(df_alt) < 10: continue
+            df_alt = get_market_data(symbol, interval="15", limit=250)
+            if df_alt is None or len(df_alt) < 200: continue
 
             c_now = df_alt.iloc[-2]
             alt_close = c_now['close']
@@ -804,6 +813,11 @@ def run_relative_strength_strategy():
             c_vol, vol_ma = c_now['volume'], c_now['vol_ma20']
             c_rsi = c_now['rsi']
             ema21 = c_now['ema21']
+            ema200 = c_now['ema200']
+
+            # FILTR ZŁOTEJ LINII: Wymóg znajdowania się powyżej EMA 200 w bessie
+            if SENTIMENT_STATE == "BEARISH" and alt_close <= ema200:
+                continue
 
             alt_outperforms = (alt_1h_change >= 0.010) and (alt_close > ema21)
             vol_valid = c_vol >= (vol_ma * 1.3)
@@ -817,7 +831,7 @@ def run_relative_strength_strategy():
                     qty_str = format_qty_with_step(order_val / alt_close, qty_step, min_qty) or "1"
                     active_positions[symbol] = {"strategy": "RELATIVE_STRENGTH_BTC", "buy_price": alt_close, "peak_price": alt_close, "qty": qty_str, "sold_half": False}
                     save_positions(active_positions)
-                    logging.info(f"🛡️🚀 [RS KUPNO OK] {symbol}! Rośnie (+{alt_1h_change*100:.2f}%) mimo spadku BTC! | Zakup: {order_val:.2f}$ ({risk_label})")
+                    logging.info(f"🛡️🚀 [RS KUPNO OK] {symbol}! Rośnie (+{alt_1h_change*100:.2f}%, >EMA200) mimo spadku BTC! | Zakup: {order_val:.2f}$ ({risk_label})")
 
                     total_equity, free_usdc = get_balances()
                     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
@@ -1080,7 +1094,7 @@ def scan_pepe_specialist():
         pass
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (Z OCHRONĄ PRZED KRWOTOKIEM BTC)
+# MONITOROWANIE I SPRZEDAŻ (Z BEZPIECZNIKIEM EMA 200 I DYNAMICZNYM ATR)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -1106,6 +1120,7 @@ def monitor_and_close_positions():
             current_price = candle['close']
             current_rsi = candle['rsi']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
+            ema200 = candle['ema200']
             
             atr_val = safe_float(candle.get('atr_pct'), 0.02)
             atr_pct = atr_val if (atr_val > 0 and not math.isnan(atr_val)) else 0.02
@@ -1156,6 +1171,9 @@ def monitor_and_close_positions():
 
             trailing_sell = drop_from_peak >= trailing_drop_pct and current_price > buy_price
 
+            # NOWOŚĆ: Bezpiecznik załamania trendu poniżej EMA 200 (15M)
+            ema200_break_sell = (ema200 > 0) and (current_price < ema200)
+
             ema_death_cross_sell = False
             pepe_ema_break_exit = False
             rsi_overbought_sell = False
@@ -1179,8 +1197,9 @@ def monitor_and_close_positions():
 
             btc_emergency_exit = btc_flash_crash and (total_pnl < -0.005)
 
-            if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit or ema_death_cross_sell or btc_emergency_exit:
+            if trailing_sell or stop_loss_sell or rsi_overbought_sell or vol_dump_sell or pepe_ema_break_exit or ema_death_cross_sell or btc_emergency_exit or ema200_break_sell:
                 if btc_emergency_exit: reason = "BTC Flash Crash Circuit Breaker"
+                elif ema200_break_sell: reason = "Załamanie trendu (Cena poniżej EMA 200)"
                 elif trailing_sell: reason = f"Dynamic ATR Trailing Up (-{trailing_drop_pct*100:.1f}%)"
                 elif stop_loss_sell: reason = sl_type
                 elif ema_death_cross_sell: reason = "Krzyż Śmierci EMA 21/89"
@@ -1228,7 +1247,7 @@ def monitor_and_close_positions():
         save_positions(active_positions)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY Z ZAAWANSOWANĄ OCHRONĄ BESSY
+# PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY
 # ==============================================================================
 def bot_loop():
     sync_positions_from_bybit()
@@ -1256,19 +1275,17 @@ def bot_loop():
             sync_positions_from_bybit()
 
             if is_btc_market_healthy():
-                # Zawsze dozwolone, o ile nie ma nagłego krwotoku na BTC
-                run_mtf_alignment_strategy()           # Poziom 1 (Najsilniejszy trend 4H)
-                run_relative_strength_strategy()       # Poziom 4 (Ochrona przed spadkami BTC)
+                run_mtf_alignment_strategy()           # Poziom 1 (Najsilniejszy trend 4H + weryfikacja EMA200)
+                run_relative_strength_strategy()       # Poziom 4 (Ochrona przed spadkami BTC + weryfikacja EMA200)
 
                 if "BEARISH" not in current_sentiment:
-                    # Działają tylko podczas HOSSY lub trybu NEUTRALNEGO
                     scan_top150_for_ema_signals()          # Poziom 2
                     run_top_gainers_strategy()             # Poziom 3
                     run_bb_squeeze_strategy()              # Poziom 5
                     run_ema21_89_pure_crossover_strategy() # Poziom 6
-                    run_dip_hunter_strategy()              # Poziom 7 (Blokada w Bessie!)
+                    run_dip_hunter_strategy()              # Poziom 7
                 else:
-                    logging.info("🛡️ [TRYB BEARISH - HARD SHIELD] Skanuję tylko żelazne setupy (MTF 4H i RS). Blokada łapania noży 5M i EMA!")
+                    logging.info("🛡️ [TRYB BEARISH - HARD SHIELD] Skanuję tylko żelazne setupy powyżej EMA 200. Blokada łapania noży 5M i EMA!")
 
                 if "BULLISH" in current_sentiment:
                     scan_for_pumps()                       # Poziom 8
