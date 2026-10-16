@@ -1,4 +1,4 @@
-Oto zaktualizowany kod scalper_bot.py z dodanym licznikiem tętna (Heartbeat).Co 60 sekund bot wyśle do logów pojedynczy, czytelny komunikat informujący o:bieżącej cenie rynkowej SOL,aktualnym poziomie wskaźnika $RSI_7$,statusie pozycji (czy szuka wejścia, czy prowadzi transakcję i z jakim wynikiem),dostępnych wolnych środkach USDC.Zaktualizowany kod: scalper_bot.pyPodmień zawartość pliku scalper_bot.py na GitHubie i zatwierdź zmiany (Commit changes...):Pythonimport os
+import os
 import time
 import json
 import logging
