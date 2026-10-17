@@ -15,7 +15,7 @@ from pybit.unified_trading import HTTP
 socket.setdefaulttimeout(10)
 
 # ==============================================================================
-# KONFIGURACJA SCALPERA SPOT
+# KONFIGURACJA SCALPERA MULTI-COIN SPOT
 # ==============================================================================
 FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
 FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
@@ -24,19 +24,32 @@ BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
 CATEGORY = "spot"
-SCALP_SYMBOL = "SOLUSDC"
 QUOTE_COIN = "USDC"
 INTERVAL = "1"
 
-# --- PARAMETRY WEJŚCIA I WYJŚCIA ---
-SCALP_BUDGET_USD = 80.0          # Kwota pojedynczego wejścia (80 USD)
-TAKE_PROFIT_PCT = 0.008          # TP: +0.80% (czysty zysk ~0.60% po prowizjach Bybit)
-HARD_STOP_LOSS_PCT = 0.005       # Sztywny SL: -0.50% (szybkie ucięcie błędu)
-BREAKEVEN_TRIGGER_PCT = 0.0035   # Aktywacja BE po osiągnięciu +0.35% zysku
-BREAKEVEN_LOCK_PCT = 0.0010      # Przesunięcie SL na +0.10% (zabezpieczenie prowizji)
-MAX_HOLD_SECONDS = 480           # Time-Stop: 8 minut (zrzut zastygłej pozycji)
+# --- ZAAWANSOWANE PARAMETRY DLA KAŻDEJ MONETY ---
+SCALP_PARAMS = {
+    "SOLUSDC": {
+        "budget": 80.0,
+        "tp": 0.008,          # Take Profit: +0.80%
+        "sl": 0.005,          # Stop Loss: -0.50%
+        "be_trigger": 0.0035, # Aktywacja Breakeven: +0.35%
+        "be_lock": 0.0010,    # Poziom Breakeven: +0.10%
+        "max_hold": 480       # Time-Stop: 8 minut
+    },
+    "PEPEUSDC": {
+        "budget": 80.0,
+        "tp": 0.012,          # Take Profit: +1.20% (Wyższa zmienność PEPE)
+        "sl": 0.008,          # Stop Loss: -0.80% (Szerszy oddech na szum 1M)
+        "be_trigger": 0.0050, # Aktywacja Breakeven: +0.50%
+        "be_lock": 0.0015,    # Poziom Breakeven: +0.15%
+        "max_hold": 600       # Time-Stop: 10 minut
+    }
+}
 
-RSI_OVERSOLD = 25                # Poziom wyprzedania RSI 7 na 1M
+SCALP_SYMBOLS = list(SCALP_PARAMS.keys())
+
+RSI_OVERSOLD = 25                # Wspólny poziom wyprzedania RSI 7 na 1M
 POLL_INTERVAL_SEC = 2            # Szybki cykl odpytywania rynku (co 2 sekundy)
 HEARTBEAT_INTERVAL_SEC = 60      # Częstotliwość raportu w logach (co 60s)
 
@@ -105,25 +118,29 @@ def format_qty(raw_qty, step_str, min_str):
         return None
 
 # ==============================================================================
-# ZARZĄDZANIE PAMIĘCIĄ I BILANSEM
+# ZARZĄDZANIE PAMIĘCIĄ (MULTI-SYMBOL)
 # ==============================================================================
-def load_position():
+def load_positions():
     if os.path.exists(SCALP_POS_FILE):
         try:
             with open(SCALP_POS_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Migracja starego formatu (pojedynczy słownik) do nowego (słownik słowników)
+                if "buy_price" in data and "symbol" in data:
+                    return {data["symbol"]: data}
+                return data if isinstance(data, dict) else {}
         except Exception:
-            return None
-    return None
+            pass
+    return {}
 
-def save_position(pos):
+def save_positions(pos_dict):
     try:
         with open(SCALP_POS_FILE, "w") as f:
-            json.dump(pos, f, indent=4)
+            json.dump(pos_dict, f, indent=4)
     except Exception as e:
         logging.error(f"Błąd zapisu pozycji scalpera: {e}")
 
-def record_trade(buy_price, sell_price, qty, reason):
+def record_trade(symbol, buy_price, sell_price, qty, reason):
     pnl_usd = (sell_price - buy_price) * qty
     pnl_pct = (sell_price - buy_price) / buy_price
     history = {"trades": []}
@@ -135,11 +152,11 @@ def record_trade(buy_price, sell_price, qty, reason):
             pass
     history["trades"].append({
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": SCALP_SYMBOL,
+        "symbol": symbol,
         "buy": buy_price,
         "sell": sell_price,
         "qty": qty,
-        "pnl_usd": round(pnl_usd, 3),
+        "pnl_usd": round(pnl_usd, 4),
         "pnl_pct": round(pnl_pct * 100, 2),
         "reason": reason
     })
@@ -149,7 +166,7 @@ def record_trade(buy_price, sell_price, qty, reason):
     except Exception:
         pass
     sign = "+" if pnl_usd >= 0 else ""
-    logging.info(f"📊 [BILANS SCALP] Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Powód: {reason}")
+    logging.info(f"📊 [BILANS SCALP] {symbol} Wynik: {sign}{pnl_usd:.4f} USD ({sign}{pnl_pct*100:.2f}%) | Powód: {reason}")
 
 # ==============================================================================
 # SALDO I DANE RYNKOWE
@@ -180,9 +197,9 @@ def get_coin_balance(coin_name):
         pass
     return 0.0
 
-def get_1m_candles():
+def get_1m_candles(symbol):
     try:
-        res = session.get_kline(category=CATEGORY, symbol=SCALP_SYMBOL, interval=INTERVAL, limit=50)
+        res = session.get_kline(category=CATEGORY, symbol=symbol, interval=INTERVAL, limit=50)
         candles = res.get("result", {}).get("list", [])
         if not candles or len(candles) < 30:
             return None
@@ -203,108 +220,116 @@ def get_1m_candles():
         df['bb_upper'] = df['bb_mid'] + (2.0 * df['bb_std'])
         return df
     except Exception as e:
-        logging.error(f"Błąd pobierania świec 1M: {e}")
+        logging.error(f"Błąd pobierania świec 1M dla {symbol}: {e}")
         return None
 
 # ==============================================================================
 # SILNIK SCALPINGOWY
 # ==============================================================================
-active_scalp = load_position()
+active_scalps = load_positions()
 
 def scalper_loop():
-    global active_scalp
-    logging.info(f"⚡ Start Scalpera na parze {SCALP_SYMBOL} (Interwał 1M, polling co {POLL_INTERVAL_SEC}s)...")
+    global active_scalps
+    logging.info(f"⚡ Start Scalpera MULTI-COIN: {SCALP_SYMBOLS} (Interwał 1M, polling co {POLL_INTERVAL_SEC}s)...")
     last_heartbeat = 0.0
 
     while True:
         try:
             now = time.time()
-            df = get_1m_candles()
-            if df is None:
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            current_candle = df.iloc[-1]
-            current_price = current_candle['close']
-            rsi7 = current_candle['rsi7']
-
-            # Raport pulsu co 60 sekund
+            do_heartbeat = False
+            
+            # Globalny Raport pulsu co 60 sekund
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 free_bal = get_free_usdc()
-                if active_scalp:
-                    pnl_now = ((current_price - active_scalp['buy_price']) / active_scalp['buy_price']) * 100
-                    status_str = f"POZYCJA OTWARTA (PnL: {pnl_now:+.2f}%)"
-                else:
-                    status_str = "Szukam wejścia (Oczekiwanie)"
-                
-                logging.info(f"💓 [STATUS 1M] {SCALP_SYMBOL}: {current_price:.2f} USD | RSI(7): {rsi7:.1f} | Stan: {status_str} | Wolne środki: {free_bal:.2f} USDC")
+                logging.info(f"💓 --- RAPORT SCALPERA | Wolne środki: {free_bal:.2f} USDC ---")
+                do_heartbeat = True
                 last_heartbeat = now
             
-            # FAZA 1: ZARZĄDZANIE OTWARTĄ POZYCJĄ
-            if active_scalp:
-                buy_price = active_scalp["buy_price"]
-                peak_price = max(active_scalp.get("peak_price", buy_price), current_price)
-                active_scalp["peak_price"] = peak_price
+            for symbol in SCALP_SYMBOLS:
+                df = get_1m_candles(symbol)
+                if df is None:
+                    continue
+
+                current_candle = df.iloc[-1]
+                current_price = current_candle['close']
+                rsi7 = current_candle['rsi7']
+                params = SCALP_PARAMS[symbol]
                 
-                pnl = (current_price - buy_price) / buy_price
-                peak_pnl = (peak_price - buy_price) / buy_price
-                elapsed_time = now - active_scalp["entry_timestamp"]
-
-                hit_tp = pnl >= TAKE_PROFIT_PCT or (current_price >= current_candle['bb_upper'] and pnl >= 0.005)
-                hit_be = peak_pnl >= BREAKEVEN_TRIGGER_PCT and current_price <= (buy_price * (1.0 + BREAKEVEN_LOCK_PCT))
-                hit_sl = pnl <= -HARD_STOP_LOSS_PCT
-                hit_time_stop = elapsed_time >= MAX_HOLD_SECONDS and pnl < 0.003
-
-                if hit_tp or hit_be or hit_sl or hit_time_stop:
-                    reason = "Take Profit (+0.8%)" if hit_tp else ("Breakeven Lock" if hit_be else ("Stop Loss (-0.5%)" if hit_sl else "Time-Stop (8 min)"))
-                    base_coin = SCALP_SYMBOL.replace(QUOTE_COIN, "")
-                    real_bal = get_coin_balance(base_coin)
-
-                    if real_bal > 0:
-                        step, min_qty = get_symbol_precision(SCALP_SYMBOL)
-                        qty_str = format_qty(real_bal, step, min_qty)
-                        if qty_str:
-                            res = session.place_order(category=CATEGORY, symbol=SCALP_SYMBOL, side="Sell", orderType="Market", qty=qty_str)
-                            if res.get("retCode") == 0:
-                                record_trade(buy_price, current_price, safe_float(qty_str), reason)
-                                logging.info(f"🎯 [WYJŚCIE SCALP] {reason} | Cena: {current_price} | PnL: {pnl*100:.2f}%")
-                                active_scalp = None
-                                save_position({})
-                                if os.path.exists(SCALP_POS_FILE): os.remove(SCALP_POS_FILE)
+                pos = active_scalps.get(symbol)
+                
+                # Raportowanie poszczególnych monet
+                if do_heartbeat:
+                    if pos:
+                        pnl_now = ((current_price - pos['buy_price']) / pos['buy_price']) * 100
+                        status_str = f"POZYCJA OTWARTA (PnL: {pnl_now:+.2f}%)"
                     else:
-                        active_scalp = None
-                        if os.path.exists(SCALP_POS_FILE): os.remove(SCALP_POS_FILE)
+                        status_str = "Szukam wejścia (Oczekiwanie)"
+                    logging.info(f"  > [1M] {symbol}: {current_price} USD | RSI(7): {rsi7:.1f} | Stan: {status_str}")
+
+                # FAZA 1: ZARZĄDZANIE OTWARTĄ POZYCJĄ
+                if pos:
+                    buy_price = pos["buy_price"]
+                    peak_price = max(pos.get("peak_price", buy_price), current_price)
+                    pos["peak_price"] = peak_price
+                    
+                    pnl = (current_price - buy_price) / buy_price
+                    peak_pnl = (peak_price - buy_price) / buy_price
+                    elapsed_time = now - pos["entry_timestamp"]
+
+                    hit_tp = pnl >= params["tp"] or (current_price >= current_candle['bb_upper'] and pnl >= 0.005)
+                    hit_be = peak_pnl >= params["be_trigger"] and current_price <= (buy_price * (1.0 + params["be_lock"]))
+                    hit_sl = pnl <= -params["sl"]
+                    hit_time_stop = elapsed_time >= params["max_hold"] and pnl < 0.003
+
+                    if hit_tp or hit_be or hit_sl or hit_time_stop:
+                        reason = f"Take Profit (+{params['tp']*100:.1f}%)" if hit_tp else ("Breakeven Lock" if hit_be else (f"Stop Loss (-{params['sl']*100:.1f}%)" if hit_sl else f"Time-Stop ({params['max_hold']//60} min)"))
+                        base_coin = symbol.replace(QUOTE_COIN, "")
+                        real_bal = get_coin_balance(base_coin)
+
+                        if real_bal > 0:
+                            step, min_qty = get_symbol_precision(symbol)
+                            qty_str = format_qty(real_bal, step, min_qty)
+                            if qty_str:
+                                res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_str)
+                                if res.get("retCode") == 0:
+                                    record_trade(symbol, buy_price, current_price, safe_float(qty_str), reason)
+                                    logging.info(f"🎯 [WYJŚCIE SCALP] {symbol} | {reason} | Cena: {current_price} | PnL: {pnl*100:.2f}%")
+                                    del active_scalps[symbol]
+                                    save_positions(active_scalps)
+                        else:
+                            del active_scalps[symbol]
+                            save_positions(active_scalps)
+                    else:
+                        save_positions(active_scalps)
+
+                # FAZA 2: POSZUKIWANIE MIKRO-WEJŚCIA
                 else:
-                    save_position(active_scalp)
+                    c_open = current_candle['open']
+                    c_low = current_candle['low']
+                    bb_lower = current_candle['bb_lower']
+                    
+                    touched_bb = c_low <= (bb_lower * 1.0005)
+                    oversold = rsi7 <= RSI_OVERSOLD
+                    rebounding = (current_price > c_open) or ((min(c_open, current_price) - c_low) > abs(current_price - c_open) * 1.5)
 
-            # FAZA 2: POSZUKIWANIE MIKRO-WEJŚCIA
-            else:
-                c_open = current_candle['open']
-                c_low = current_candle['low']
-                bb_lower = current_candle['bb_lower']
-                
-                touched_bb = c_low <= (bb_lower * 1.0005)
-                oversold = rsi7 <= RSI_OVERSOLD
-                rebounding = (current_price > c_open) or ((min(c_open, current_price) - c_low) > abs(current_price - c_open) * 1.5)
-
-                if touched_bb and oversold and rebounding:
-                    free_usdc = get_free_usdc()
-                    if free_usdc >= SCALP_BUDGET_USD:
-                        step, min_qty = get_symbol_precision(SCALP_SYMBOL)
-                        order_qty_coin = format_qty(SCALP_BUDGET_USD / current_price, step, min_qty)
-                        
-                        if order_qty_coin:
-                            res = session.place_order(category=CATEGORY, symbol=SCALP_SYMBOL, side="Buy", orderType="Market", qty=f"{SCALP_BUDGET_USD:.2f}")
-                            if res.get("retCode") == 0:
-                                active_scalp = {
-                                    "symbol": SCALP_SYMBOL,
-                                    "buy_price": current_price,
-                                    "peak_price": current_price,
-                                    "qty": order_qty_coin,
-                                    "entry_timestamp": now
-                                }
-                                save_position(active_scalp)
-                                logging.info(f"⚡ [WEJŚCIE SCALP] {SCALP_SYMBOL} po {current_price} USD | RSI7: {rsi7:.1f} | Budżet: {SCALP_BUDGET_USD}$")
+                    if touched_bb and oversold and rebounding:
+                        free_usdc = get_free_usdc()
+                        if free_usdc >= params["budget"]:
+                            step, min_qty = get_symbol_precision(symbol)
+                            order_qty_coin = format_qty(params["budget"] / current_price, step, min_qty)
+                            
+                            if order_qty_coin:
+                                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{params['budget']:.2f}")
+                                if res.get("retCode") == 0:
+                                    active_scalps[symbol] = {
+                                        "symbol": symbol,
+                                        "buy_price": current_price,
+                                        "peak_price": current_price,
+                                        "qty": order_qty_coin,
+                                        "entry_timestamp": now
+                                    }
+                                    save_positions(active_scalps)
+                                    logging.info(f"⚡ [WEJŚCIE SCALP] {symbol} po {current_price} USD | RSI7: {rsi7:.1f} | Budżet: {params['budget']}$")
 
         except Exception as e:
             logging.error(f"Błąd w pętli scalpera: {e}")
@@ -322,16 +347,21 @@ def self_ping_loop():
             logging.info("PING: Scalper aktywny (Render Keep-Alive 24/7 OK)")
         except Exception:
             pass
-        time.sleep(240)  # Pętla odpytuje serwer co 4 minuty, blokując uśpienie po 15 min
+        time.sleep(240)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit 1M Scalper Bot is Running 24/7!")
+        self.wfile.write(b"Bybit Multi-Coin Scalper Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('', port), HealthHandler)
+    server.serve_forever()
 
 if __name__ == "__main__":
     t_scalp = threading.Thread(target=scalper_loop, daemon=True)
@@ -340,6 +370,4 @@ if __name__ == "__main__":
     t_ping = threading.Thread(target=self_ping_loop, daemon=True)
     t_ping.start()
 
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('', port), HealthHandler)
-    server.serve_forever()
+    run_health_server()
