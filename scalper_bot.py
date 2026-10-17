@@ -29,7 +29,7 @@ QUOTE_COIN = "USDC"
 INTERVAL = "1"
 
 # --- PARAMETRY WEJŚCIA I WYJŚCIA ---
-SCALP_BUDGET_USD = 80.0          # Kwota pojedynczego wejścia (dostosowana do wolnego salda ~93 USDC)
+SCALP_BUDGET_USD = 80.0          # Kwota pojedynczego wejścia (80 USD)
 TAKE_PROFIT_PCT = 0.008          # TP: +0.80% (czysty zysk ~0.60% po prowizjach Bybit)
 HARD_STOP_LOSS_PCT = 0.005       # Sztywny SL: -0.50% (szybkie ucięcie błędu)
 BREAKEVEN_TRIGGER_PCT = 0.0035   # Aktywacja BE po osiągnięciu +0.35% zysku
@@ -40,6 +40,7 @@ RSI_OVERSOLD = 25                # Poziom wyprzedania RSI 7 na 1M
 POLL_INTERVAL_SEC = 2            # Szybki cykl odpytywania rynku (co 2 sekundy)
 HEARTBEAT_INTERVAL_SEC = 60      # Częstotliwość raportu w logach (co 60s)
 
+SCALP_APP_URL = "https://bybit-scalper-d4xb.onrender.com"
 SCALP_POS_FILE = "scalp_active_pos.json"
 SCALP_HIST_FILE = "scalp_trade_history.json"
 
@@ -227,7 +228,7 @@ def scalper_loop():
             current_price = current_candle['close']
             rsi7 = current_candle['rsi7']
 
-            # Raport co 60 sekund
+            # Raport pulsu co 60 sekund
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 free_bal = get_free_usdc()
                 if active_scalp:
@@ -311,13 +312,23 @@ def scalper_loop():
         time.sleep(POLL_INTERVAL_SEC)
 
 # ==============================================================================
-# KEEP-ALIVE SERVER (RENDER COMPATIBILITY)
+# KEEP-ALIVE SERVER ORAZ SELF-PING LOOP (RENDER COMPATIBILITY 24/7)
 # ==============================================================================
+def self_ping_loop():
+    time.sleep(15)
+    while True:
+        try:
+            requests.get(SCALP_APP_URL, timeout=10)
+            logging.info("PING: Scalper aktywny (Render Keep-Alive 24/7 OK)")
+        except Exception:
+            pass
+        time.sleep(240)  # Pętla odpytuje serwer co 4 minuty, blokując uśpienie po 15 min
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit 1M Scalper Bot is Running!")
+        self.wfile.write(b"Bybit 1M Scalper Bot is Running 24/7!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
@@ -325,6 +336,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     t_scalp = threading.Thread(target=scalper_loop, daemon=True)
     t_scalp.start()
+
+    t_ping = threading.Thread(target=self_ping_loop, daemon=True)
+    t_ping.start()
 
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('', port), HealthHandler)
