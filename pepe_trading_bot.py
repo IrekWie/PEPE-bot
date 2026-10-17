@@ -66,7 +66,7 @@ DIP_RSI_5M_MAX = 30
 DIP_VOL_MULTIPLIER = 2.5     
 
 # Zabezpieczenia Take Profit & Breakeven
-PARTIAL_TP_PCT = 0.030          # Próg realizacji 50% zysków (+3.0%)
+PARTIAL_TP_PCT = 0.030          # Bazowy próg częściowej realizacji zysków (+3.0%)
 BREAKEVEN_TRIGGER_PCT = 0.015   # Próg aktywacji Breakeven (+1.5% szczytu)
 BREAKEVEN_SL_PCT = 0.003        # Po TP zostawiamy +0.3% zysku jako dno
 
@@ -519,7 +519,7 @@ def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
         if df_btc is not None and len(df_btc) > 1:
             c15 = df_btc.iloc[-1]
             change_15m = (c15['close'] - c15['open']) / c15['open']
-            if change_15m <= -0.002: # BTC spada o ponad 0.2% na świecy 15M
+            if change_15m <= -0.002:
                 logging.warning(f"⚠️ [BTC 15M GUARD] Spadek BTC 15M ({change_15m*100:.2f}%). Zakaz zakupów!")
                 return False
     except Exception:
@@ -613,11 +613,9 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIE HANDLOWE (Z POLOWANIEM NA DNO SINUSOIDY)
+# STRATEGIE HANDLOWE
 # ==============================================================================
-
 def run_support_bounce_strategy():
-    """Polowanie na dół sinusoidy z potwierdzeniem świecowym i ciasnym SL pod knotem."""
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
 
@@ -637,8 +635,8 @@ def run_support_bounce_strategy():
             df = get_market_data(symbol, interval="15", limit=120)
             if df is None or len(df) < 60: continue
 
-            closed_candle = df.iloc[-2]  # Ostatnia w pełni uformowana świeca 15M
-            curr_candle = df.iloc[-1]    # Świeca bieżąca
+            closed_candle = df.iloc[-2]
+            curr_candle = df.iloc[-1]
 
             c_open, c_close = closed_candle['open'], closed_candle['close']
             c_high, c_low = closed_candle['high'], closed_candle['low']
@@ -647,10 +645,8 @@ def run_support_bounce_strategy():
             c_vol, vol_ma = closed_candle['volume'], closed_candle['vol_ma20']
             ema200 = closed_candle['ema200']
 
-            # 1. Sprawdzenie, czy dotknęliśmy dna sinusoidy
             touched_floor = (c_low <= bb_lower * 1.002) or (c_rsi <= 35.0)
 
-            # 2. Potwierdzenie świecowe (Zero spadających noży):
             body = abs(c_close - c_open)
             lower_wick = min(c_open, c_close) - c_low
             green_candle = c_close > c_open
@@ -659,7 +655,6 @@ def run_support_bounce_strategy():
             confirmed_reversal = green_candle or hammer_rejection
             volume_confirmed = c_vol >= (vol_ma * 0.85)
 
-            # 3. Przestrzeń do zysku: Cena jest poniżej EMA200 lub środka Bollingera
             has_upside = (curr_candle['close'] < ema200) or (curr_candle['close'] < closed_candle['bb_mid'])
             not_breaking_low = curr_candle['close'] >= c_low
 
@@ -671,7 +666,6 @@ def run_support_bounce_strategy():
                     curr_p = curr_candle['close']
                     qty_str = format_qty_with_step(order_val / curr_p, qty_step, min_qty) or "1"
                     
-                    # Stop loss pod knotem świecy (max -0.5% pod dnem)
                     structural_sl = round(c_low * 0.996, 6)
 
                     active_positions[symbol] = {
@@ -975,7 +969,7 @@ def run_ema21_89_pure_crossover_strategy():
 
             candle = df.iloc[-2]
             prev_candle = df.iloc[-3]
-            c_open, c_close = candle['open'], candle['close']
+            c_open, c_close, c_low = candle['open'], candle['close'], candle['low']
             c_vol, vol_ma = candle['volume'], candle['vol_ma20']
 
             ema21_now, ema89_now = candle['ema21'], candle['ema89']
@@ -1154,7 +1148,7 @@ def scan_pepe_specialist():
         pass
 
 # ==============================================================================
-# MONITOROWANIE I SPRZEDAŻ (Z OBSŁUGĄ SL POD KNOTEM I TP PRZY EMA 200)
+# MONITOROWANIE I SPRZEDAŻ (Z ADAPTACYJNYM PARTIAL TP I TRAILING STOPEM)
 # ==============================================================================
 def monitor_and_close_positions():
     global active_positions
@@ -1201,15 +1195,29 @@ def monitor_and_close_positions():
             total_pnl = (current_price - buy_price) / buy_price
             peak_pnl = (peak_price - buy_price) / buy_price
 
-            # 1. MECHANIZM PARTIAL TAKE PROFIT (50% przy +3.0%)
-            if not sold_half and total_pnl >= PARTIAL_TP_PCT:
+            # 1. ADAPTACYJNY PARTIAL TAKE PROFIT
+            # 50% w bessie (szybki cash-out), 33% neutralnie, 25% w hossie (75% jedzie na trailingu)
+            if SENTIMENT_STATE == "BULLISH":
+                tp_ratio = 0.25
+                tp_ratio_label = "25%"
+            elif SENTIMENT_STATE == "BEARISH":
+                tp_ratio = 0.50
+                tp_ratio_label = "50%"
+            else:
+                tp_ratio = 0.33
+                tp_ratio_label = "33%"
+
+            hit_standard_tp = (total_pnl >= PARTIAL_TP_PCT)
+            hit_ema200_resistance = (strat_name == "SUPPORT_BOUNCE" and total_pnl >= 0.012 and (current_price >= ema200 or current_price >= bb_upper))
+
+            if not sold_half and (hit_standard_tp or hit_ema200_resistance):
                 coin_name = symbol.replace("USDC", "").replace("USDT", "")
                 real_balance = get_coin_available_balance(coin_name)
                 
                 if real_balance > 0:
-                    half_qty = real_balance / 2.0
+                    partial_qty = real_balance * tp_ratio
                     qty_step, min_qty = get_symbol_lot_filter(symbol)
-                    qty_to_sell = format_qty_with_step(half_qty, qty_step, min_qty)
+                    qty_to_sell = format_qty_with_step(partial_qty, qty_step, min_qty)
 
                     if qty_to_sell:
                         res = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_to_sell)
@@ -1217,8 +1225,11 @@ def monitor_and_close_positions():
                             pos["sold_half"] = True
                             save_positions(active_positions)
                             sold_qty_val = safe_float(qty_to_sell)
-                            record_closed_trade(symbol, strat_name, buy_price, current_price, sold_qty_val, "Partial TP (50%)")
-                            logging.info(f"💸 [PARTIAL TP] {symbol} wygenerowało zysk! Zabezpieczam 50% pozycji przy +{total_pnl*100:.2f}%.")
+                            
+                            trigger_name = "opór EMA 200 / BB Upper" if hit_ema200_resistance else "+3.0% TP"
+                            reason_msg = f"Partial TP ({tp_ratio_label}) [{trigger_name}] | Tryb: {SENTIMENT_STATE}"
+                            record_closed_trade(symbol, strat_name, buy_price, current_price, sold_qty_val, reason_msg)
+                            logging.info(f"💸 [PARTIAL TP] {symbol} zabezpiecza zysk! {reason_msg} | Wynik: +{total_pnl*100:.2f}%. Reszta na Trailing Stopie!")
 
             # 2. DEFINIOWANIE STOP LOSS
             structural_sl_hit = False
@@ -1234,13 +1245,6 @@ def monitor_and_close_positions():
                 sl_type = f"Dynamic ATR Stop Loss (-{dynamic_sl_pct*100:.1f}%)"
 
             trailing_sell = drop_from_peak >= trailing_drop_pct and current_price > buy_price
-
-            # 3. ZYSK NA ŚRODKU LUB GÓRZE SINUSOIDY (Mean Reversion TP)
-            reversion_tp = False
-            if strat_name == "SUPPORT_BOUNCE" and total_pnl >= 0.012:
-                # Osiągnięcie EMA200 lub górnej wstęgi Bollingera po zakupie na dnie
-                if current_price >= ema200 or current_price >= bb_upper:
-                    reversion_tp = True
 
             ema_death_cross_sell = False
             pepe_ema_break_exit = False
@@ -1265,10 +1269,9 @@ def monitor_and_close_positions():
 
             btc_emergency_exit = btc_flash_crash and (total_pnl < -0.005)
 
-            # 4. WERYFIKACJA WARUNKU WYJŚCIA
+            # 3. WERYFIKACJA WARUNKU CAŁKOWITEGO WYJŚCIA
             should_exit = (
                 structural_sl_hit or 
-                reversion_tp or 
                 trailing_sell or 
                 stop_loss_sell or 
                 rsi_overbought_sell or 
@@ -1281,7 +1284,6 @@ def monitor_and_close_positions():
             if should_exit:
                 if btc_emergency_exit: reason = "BTC Flash Crash Circuit Breaker"
                 elif structural_sl_hit: reason = sl_type
-                elif reversion_tp: reason = "TP: Dotarcie do EMA 200 / Górnego Bollingera"
                 elif trailing_sell: reason = f"Dynamic ATR Trailing Up (-{trailing_drop_pct*100:.1f}%)"
                 elif stop_loss_sell: reason = sl_type
                 elif ema_death_cross_sell: reason = "Krzyż Śmierci EMA 21/89"
@@ -1357,7 +1359,6 @@ def bot_loop():
             sync_positions_from_bybit()
 
             if is_btc_market_healthy():
-                # Dno sinusoidy działa ZAWSZE (szczególnie w bessie i trybie neutralnym)
                 run_support_bounce_strategy()          # Poziom 0 (Dno sinusoidy + potwierdzenie)
                 run_relative_strength_strategy()       # Poziom 4 (Odporność na spadki BTC)
 
