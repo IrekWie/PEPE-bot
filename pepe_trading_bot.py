@@ -45,7 +45,7 @@ MIN_SYNC_POSITION_VALUE = 8.0
 MIN_EXCHANGE_NOTIONAL = 5.0       
 
 # --- TWARDE BEZPIECZNIKI PORTFELA (TYLKO DLA RYNKU BEARISH) ---
-MAX_DAILY_EQUITY_DROP_USD = 15.0  # Bezwzględny limit w bessie: spadek realnego salda konta o 15 USD = STOP
+MAX_DAILY_EQUITY_DROP_USD = 15.0  # Bezwzględny limit w bessie: spadek salda konta o 15 USD = STOP
 MAX_CONSECUTIVE_LOSSES = 3        # 3 błędne decyzje pod rząd w bessie = STOP
 LOSS_COOLDOWN_HOURS = 12          # Czas blokady zakupów po 3 stratach w bessie (w godzinach)
 
@@ -140,7 +140,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     global trade_history
     raw_pnl_usd = (sell_price - buy_price) * qty
     
-    # Uwzględnienie prowizji Taker Bybit (ok. 0.1% kupno + 0.1% sprzedaż)
     turnover = (buy_price + sell_price) * qty
     estimated_fee = turnover * 0.001
     pnl_usd = round(raw_pnl_usd - estimated_fee, 2)
@@ -152,7 +151,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
     trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
 
-    # Weryfikacja serii porażek
     if pnl_usd >= 0:
         trade_history["wins"] = trade_history.get("wins", 0) + 1
         trade_history["consecutive_losses"] = 0
@@ -161,7 +159,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
         streak = trade_history.get("consecutive_losses", 0) + 1
         trade_history["consecutive_losses"] = streak
         
-        # Osiągnięcie limitu 3 porażek z rzędu -> aktywacja blokady
         if streak >= MAX_CONSECUTIVE_LOSSES:
             trade_history["cooldown_until"] = now_ts + (LOSS_COOLDOWN_HOURS * 3600)
 
@@ -183,7 +180,7 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     logging.info(f"📊 [BILANS ZAPISANY (NETTO)] {symbol} | Wynik po fee: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Ilość: {qty} | Powód: {reason}")
 
 def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
-    """Weryfikuje realny spadek salda na Bybit oraz limit 3 strat z rzędu TYLKO w trybie BEARISH."""
+    """Weryfikuje realny spadek salda oraz limit 3 strat z rzędu TYLKO w trybie BEARISH."""
     global trade_history
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now_ts = time.time()
@@ -191,7 +188,6 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
     if "equity_baseline" not in trade_history:
         trade_history["equity_baseline"] = {}
 
-    # Zapis punktu odniesienia kapitału na początku dnia
     if trade_history["equity_baseline"].get("date") != today_str:
         trade_history["equity_baseline"] = {
             "date": today_str,
@@ -203,16 +199,16 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
     starting_equity = safe_float(trade_history["equity_baseline"].get("starting_equity"), current_total_equity)
     real_equity_drop = starting_equity - current_total_equity
 
-    # >>> KLUCZOWA ZMIANA: Zabezpieczenia działają TYLKO w trybie BEARISH <<<
+    # Bezpieczniki działają wyłącznie w trybie bessy
     if "BEARISH" not in current_sentiment:
         return True
 
-    # 1. TWARDY WYŁĄCZNIK: Realny spadek salda konta Bybit o 15 USDC
+    # 1. Twardy wyłącznik salda konta Bybit o 15 USDC
     if real_equity_drop >= MAX_DAILY_EQUITY_DROP_USD:
         logging.warning(f"🛑 [TWARDY WYŁĄCZNIK SALDA] Kapitał spadł o {real_equity_drop:.2f} USD od początku dnia. Rynek BEARISH! Zakupy zablokowane do 00:00 UTC.")
         return False
 
-    # 2. BEZPIECZNIK: 3 straty z rzędu
+    # 2. Bezpiecznik 3 strat z rzędu
     cooldown_until = safe_float(trade_history.get("cooldown_until", 0))
     consecutive_losses = trade_history.get("consecutive_losses", 0)
 
@@ -543,7 +539,7 @@ def update_market_sentiment():
         elif c_close < ema89 or ema21 < ema89:
             sentiment = "BEARISH 🔴 (Defensywa)"
             SENTIMENT_STATE = "BEARISH"
-            MAX_TOTAL_POSITIONS = 3    # Limit 3 pozycji w defensywie
+            MAX_TOTAL_POSITIONS = 3
             MAX_EMA_CROSS_POSITIONS = 0
             SAFE_RISK_PCT = 0.15      
             MODERATE_RISK_PCT = 0.0   
@@ -1437,8 +1433,6 @@ def bot_loop():
 
             sync_positions_from_bybit()
 
-            # BEZWZGLĘDNA WERYFIKACJA BEZPIECZNIKÓW KAPITAŁOWYCH (Drop 15 USD lub 3 straty)
-            # Przekazujemy current_sentiment, by zignorować je w hossie
             can_buy = check_and_update_circuit_breakers(total_equity, current_sentiment)
 
             if can_buy and is_btc_market_healthy():
