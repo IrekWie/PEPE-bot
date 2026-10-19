@@ -1,15 +1,3 @@
-To świetne podejście strategiczne. W hossie lub na rynku neutralnym naturalne korekty mogą chwilowo uszczuplić saldo lub wywołać serię 3 Stop Lossów, po których rynek od razu gwałtownie odbija w górę. Blokowanie wtedy bota odbierałoby mu szansę na odrobienie strat.
-
-Wprowadziłem modyfikację: blokady kapitałowe (wyłącznik -15 USD oraz limit 3 porażek) aktywują się TYLKO, gdy sentyment Bitcoina to BEARISH 🔴.
-Jeśli rynek wejdzie w fazę NEUTRAL lub BULLISH, bot zignoruje te limity i będzie handlował dalej, wiedząc, że trend mu sprzyja.
-
-Co się zmieniło w kodzie?
-Do funkcji check_and_update_circuit_breakers dodałem sprawdzanie aktualnego trendu. Jeśli w sentymencie nie ma słowa "BEARISH", bot po prostu pomija te blokady i zezwala na zakupy (zwraca True).
-
-Zaktualizowany kod (pepe_trading_bot.py)
-Podmień całą zawartość pliku pepe_trading_bot.py na GitHubie i zatwierdź zmiany (Commit changes...):
-
-Python
 import os
 import time
 import json
