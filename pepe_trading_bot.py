@@ -1,3 +1,15 @@
+To świetne podejście strategiczne. W hossie lub na rynku neutralnym naturalne korekty mogą chwilowo uszczuplić saldo lub wywołać serię 3 Stop Lossów, po których rynek od razu gwałtownie odbija w górę. Blokowanie wtedy bota odbierałoby mu szansę na odrobienie strat.
+
+Wprowadziłem modyfikację: blokady kapitałowe (wyłącznik -15 USD oraz limit 3 porażek) aktywują się TYLKO, gdy sentyment Bitcoina to BEARISH 🔴.
+Jeśli rynek wejdzie w fazę NEUTRAL lub BULLISH, bot zignoruje te limity i będzie handlował dalej, wiedząc, że trend mu sprzyja.
+
+Co się zmieniło w kodzie?
+Do funkcji check_and_update_circuit_breakers dodałem sprawdzanie aktualnego trendu. Jeśli w sentymencie nie ma słowa "BEARISH", bot po prostu pomija te blokady i zezwala na zakupy (zwraca True).
+
+Zaktualizowany kod (pepe_trading_bot.py)
+Podmień całą zawartość pliku pepe_trading_bot.py na GitHubie i zatwierdź zmiany (Commit changes...):
+
+Python
 import os
 import time
 import json
@@ -43,6 +55,11 @@ MAX_PUMP_POSITIONS = 4
 STANDARD_MIN_ORDER_VALUE = 100.0  
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
+
+# --- TWARDE BEZPIECZNIKI PORTFELA (TYLKO DLA RYNKU BEARISH) ---
+MAX_DAILY_EQUITY_DROP_USD = 15.0  # Bezwzględny limit w bessie: spadek realnego salda konta o 15 USD = STOP
+MAX_CONSECUTIVE_LOSSES = 3        # 3 błędne decyzje pod rząd w bessie = STOP
+LOSS_COOLDOWN_HOURS = 12          # Czas blokady zakupów po 3 stratach w bessie (w godzinach)
 
 # ==============================================================================
 # ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA
@@ -101,7 +118,14 @@ def load_trade_history():
     if os.path.exists(TRADE_HISTORY_FILE):
         try:
             with open(TRADE_HISTORY_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if "consecutive_losses" not in data:
+                    data["consecutive_losses"] = 0
+                if "cooldown_until" not in data:
+                    data["cooldown_until"] = 0
+                if "equity_baseline" not in data:
+                    data["equity_baseline"] = {}
+                return data
         except Exception:
             pass
     return {
@@ -109,6 +133,9 @@ def load_trade_history():
         "total_trades": 0,
         "wins": 0,
         "losses": 0,
+        "consecutive_losses": 0,
+        "cooldown_until": 0,
+        "equity_baseline": {},
         "daily": {}
     }
 
@@ -123,16 +150,32 @@ trade_history = load_trade_history()
 
 def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     global trade_history
-    pnl_pct = (sell_price - buy_price) / buy_price
-    pnl_usd = (sell_price - buy_price) * qty
+    raw_pnl_usd = (sell_price - buy_price) * qty
+    
+    # Uwzględnienie prowizji Taker Bybit (ok. 0.1% kupno + 0.1% sprzedaż)
+    turnover = (buy_price + sell_price) * qty
+    estimated_fee = turnover * 0.001
+    pnl_usd = round(raw_pnl_usd - estimated_fee, 2)
+    pnl_pct = (pnl_usd / (buy_price * qty)) if (buy_price * qty) > 0 else 0.0
+
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_ts = time.time()
 
     trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
     trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
+
+    # Weryfikacja serii porażek
     if pnl_usd >= 0:
         trade_history["wins"] = trade_history.get("wins", 0) + 1
+        trade_history["consecutive_losses"] = 0
     else:
         trade_history["losses"] = trade_history.get("losses", 0) + 1
+        streak = trade_history.get("consecutive_losses", 0) + 1
+        trade_history["consecutive_losses"] = streak
+        
+        # Osiągnięcie limitu 3 porażek z rzędu -> aktywacja blokady
+        if streak >= MAX_CONSECUTIVE_LOSSES:
+            trade_history["cooldown_until"] = now_ts + (LOSS_COOLDOWN_HOURS * 3600)
 
     if "daily" not in trade_history:
         trade_history["daily"] = {}
@@ -149,7 +192,51 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
 
     save_trade_history(trade_history)
     sign = "+" if pnl_usd >= 0 else ""
-    logging.info(f"📊 [BILANS ZAPISANY] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Ilość: {qty} | Powód: {reason}")
+    logging.info(f"📊 [BILANS ZAPISANY (NETTO)] {symbol} | Wynik po fee: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Ilość: {qty} | Powód: {reason}")
+
+def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
+    """Weryfikuje realny spadek salda na Bybit oraz limit 3 strat z rzędu TYLKO w trybie BEARISH."""
+    global trade_history
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_ts = time.time()
+
+    if "equity_baseline" not in trade_history:
+        trade_history["equity_baseline"] = {}
+
+    # Zapis punktu odniesienia kapitału na początku dnia
+    if trade_history["equity_baseline"].get("date") != today_str:
+        trade_history["equity_baseline"] = {
+            "date": today_str,
+            "starting_equity": current_total_equity
+        }
+        save_trade_history(trade_history)
+        logging.info(f"🌅 [NOWY DZIEŃ UTC] Ustalono kapitał bazowy dla dnia {today_str}: {current_total_equity:.2f} USD")
+
+    starting_equity = safe_float(trade_history["equity_baseline"].get("starting_equity"), current_total_equity)
+    real_equity_drop = starting_equity - current_total_equity
+
+    # >>> KLUCZOWA ZMIANA: Zabezpieczenia działają TYLKO w trybie BEARISH <<<
+    if "BEARISH" not in current_sentiment:
+        return True
+
+    # 1. TWARDY WYŁĄCZNIK: Realny spadek salda konta Bybit o 15 USDC
+    if real_equity_drop >= MAX_DAILY_EQUITY_DROP_USD:
+        logging.warning(f"🛑 [TWARDY WYŁĄCZNIK SALDA] Kapitał spadł o {real_equity_drop:.2f} USD od początku dnia. Rynek BEARISH! Zakupy zablokowane do 00:00 UTC.")
+        return False
+
+    # 2. BEZPIECZNIK: 3 straty z rzędu
+    cooldown_until = safe_float(trade_history.get("cooldown_until", 0))
+    consecutive_losses = trade_history.get("consecutive_losses", 0)
+
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES or now_ts < cooldown_until:
+        if now_ts < cooldown_until:
+            rem_minutes = int((cooldown_until - now_ts) / 60)
+            logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Wstrzymuję zakupy w trybie BEARISH po serii porażek. Pozostało: {rem_minutes} min.")
+        else:
+            logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Zanotowano {consecutive_losses} porażek w trybie BEARISH. Zakupy zablokowane.")
+        return False
+
+    return True
 
 # ==============================================================================
 # ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU
@@ -1196,7 +1283,6 @@ def monitor_and_close_positions():
             peak_pnl = (peak_price - buy_price) / buy_price
 
             # 1. ADAPTACYJNY PARTIAL TAKE PROFIT
-            # 50% w bessie (szybki cash-out), 33% neutralnie, 25% w hossie (75% jedzie na trailingu)
             if SENTIMENT_STATE == "BULLISH":
                 tp_ratio = 0.25
                 tp_ratio_label = "25%"
@@ -1353,12 +1439,21 @@ def bot_loop():
             today_sign = "+" if today_stats['pnl_usd'] >= 0 else ""
             total_sign = "+" if total_realized >= 0 else ""
 
-            logging.info(f"📈 [BILANS HANDLOWY] Dziś: {today_sign}{today_stats['pnl_usd']:.2f} USD ({today_stats['trades']} transakcji) | Łącznie: {total_sign}{total_realized:.2f} USD | Win Rate: {win_rate:.1f}% ({wins}/{total_trades})")
+            consec_losses = trade_history.get("consecutive_losses", 0)
+            start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
+            real_day_diff = total_equity - start_eq
+            diff_sign = "+" if real_day_diff >= 0 else ""
+
+            logging.info(f"📈 [BILANS HANDLOWY] Dziś (Netto): {today_sign}{today_stats['pnl_usd']:.2f} USD ({today_stats['trades']} transakcji) | Zmiana Salda Bybit: {diff_sign}{real_day_diff:.2f} USD | Strat z rzędu: {consec_losses}/3")
             logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
 
             sync_positions_from_bybit()
 
-            if is_btc_market_healthy():
+            # BEZWZGLĘDNA WERYFIKACJA BEZPIECZNIKÓW KAPITAŁOWYCH (Drop 15 USD lub 3 straty)
+            # Przekazujemy current_sentiment, by zignorować je w hossie
+            can_buy = check_and_update_circuit_breakers(total_equity, current_sentiment)
+
+            if can_buy and is_btc_market_healthy():
                 run_support_bounce_strategy()          # Poziom 0 (Dno sinusoidy + potwierdzenie)
                 run_relative_strength_strategy()       # Poziom 4 (Odporność na spadki BTC)
 
@@ -1378,7 +1473,10 @@ def bot_loop():
                 elif "BEARISH" not in current_sentiment:
                     logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam pompy i memecoiny.")
             else:
-                logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard. Czekam na uspokojenie rynków.")
+                if not can_buy:
+                    logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna w trybie BEARISH: przekroczono limit dziennego spadku 15 USD lub odnotowano 3 straty z rzędu.")
+                else:
+                    logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard. Czekam na uspokojenie rynków.")
 
             monitor_and_close_positions()
 
