@@ -114,6 +114,8 @@ def load_trade_history():
                     data["cooldown_until"] = 0
                 if "equity_baseline" not in data:
                     data["equity_baseline"] = {}
+                if "trades_log" not in data:
+                    data["trades_log"] = []
                 return data
         except Exception:
             pass
@@ -125,6 +127,7 @@ def load_trade_history():
         "consecutive_losses": 0,
         "cooldown_until": 0,
         "equity_baseline": {},
+        "trades_log": [],
         "daily": {}
     }
 
@@ -142,7 +145,7 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     raw_pnl_usd = (sell_price - buy_price) * qty
     
     turnover = (buy_price + sell_price) * qty
-    estimated_fee = turnover * 0.001
+    estimated_fee = turnover * 0.001  # Taker Bybit Spot: ~0.1% kupno + 0.1% sprzedaż
     pnl_usd = round(raw_pnl_usd - estimated_fee, 2)
     pnl_pct = (pnl_usd / (buy_price * qty)) if (buy_price * qty) > 0 else 0.0
 
@@ -151,6 +154,23 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
 
     trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
     trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
+
+    # Zapis do szczegółowej listy operacji
+    if "trades_log" not in trade_history:
+        trade_history["trades_log"] = []
+
+    trade_history["trades_log"].append({
+        "timestamp": now_ts,
+        "symbol": symbol,
+        "turnover": round(turnover, 2),
+        "fee": round(estimated_fee, 4),
+        "gross_pnl": round(raw_pnl_usd, 2),
+        "net_pnl": pnl_usd
+    })
+
+    # Ograniczenie rozmiaru historii do ostatnich 200 transakcji
+    if len(trade_history["trades_log"]) > 200:
+        trade_history["trades_log"] = trade_history["trades_log"][-200:]
 
     if pnl_usd >= 0:
         trade_history["wins"] = trade_history.get("wins", 0) + 1
@@ -166,19 +186,76 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     if "daily" not in trade_history:
         trade_history["daily"] = {}
     if today_str not in trade_history["daily"]:
-        trade_history["daily"][today_str] = {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0}
+        trade_history["daily"][today_str] = {
+            "pnl_usd": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_fees": 0.0,
+            "total_turnover": 0.0
+        }
 
     d = trade_history["daily"][today_str]
-    d["pnl_usd"] = round(d["pnl_usd"] + pnl_usd, 2)
-    d["trades"] += 1
+    d["pnl_usd"] = round(d.get("pnl_usd", 0.0) + pnl_usd, 2)
+    d["trades"] = d.get("trades", 0) + 1
+    d["total_fees"] = round(d.get("total_fees", 0.0) + estimated_fee, 4)
+    d["total_turnover"] = round(d.get("total_turnover", 0.0) + turnover, 2)
+
     if pnl_usd >= 0:
-        d["wins"] += 1
+        d["wins"] = d.get("wins", 0) + 1
     else:
-        d["losses"] += 1
+        d["losses"] = d.get("losses", 0) + 1
 
     save_trade_history(trade_history)
     sign = "+" if pnl_usd >= 0 else ""
-    logging.info(f"📊 [BILANS ZAPISANY (NETTO)] {symbol} | Wynik po fee: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Ilość: {qty} | Powód: {reason}")
+    logging.info(f"📊 [BILANS ZAPISANY (NETTO)] {symbol} | Wynik po fee: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Fee: -{estimated_fee:.2f}$ | Powód: {reason}")
+
+# ==============================================================================
+# MODUŁ GODZINOWEJ ANALIZY KOSZTÓW I PROWIZJI
+# ==============================================================================
+last_hourly_cost_report = 0.0
+
+def report_hourly_costs(total_equity):
+    """Generuje co godzinę raport prowizji giełdowych, obrotu i kosztów handlu."""
+    global last_hourly_cost_report, trade_history
+    now_ts = time.time()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    trades_log = trade_history.get("trades_log", [])
+    one_hour_ago = now_ts - 3600
+
+    recent_trades = [t for t in trades_log if t.get("timestamp", 0) >= one_hour_ago]
+
+    h_trades_count = len(recent_trades)
+    h_turnover = sum(t.get("turnover", 0.0) for t in recent_trades)
+    h_fees = sum(t.get("fee", 0.0) for t in recent_trades)
+    h_gross = sum(t.get("gross_pnl", 0.0) for t in recent_trades)
+    h_net = sum(t.get("net_pnl", 0.0) for t in recent_trades)
+
+    today_stats = trade_history.get("daily", {}).get(today_str, {})
+    d_fees = today_stats.get("total_fees", 0.0)
+    d_turnover = today_stats.get("total_turnover", 0.0)
+    d_trades = today_stats.get("trades", 0)
+    avg_fee_per_trade = (d_fees / d_trades) if d_trades > 0 else 0.0
+    fee_drag_pct = ((d_fees / total_equity) * 100) if total_equity > 0 else 0.0
+
+    sign_gross = "+" if h_gross >= 0 else ""
+    sign_net = "+" if h_net >= 0 else ""
+
+    logging.info("================================================================================")
+    logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
+    logging.info("--------------------------------------------------------------------------------")
+    logging.info(f"⏱️ Ostatnie 60 minut:")
+    logging.info(f"   • Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f} USD")
+    logging.info(f"   • Prowizje Bybit (Taker 0.1%): -{h_fees:.2f} USD")
+    logging.info(f"   • Wynik Brutto: {sign_gross}{h_gross:.2f} USD | Wynik Netto: {sign_net}{h_net:.2f} USD")
+    logging.info(f"📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
+    logging.info(f"   • Suma prowizji oddanych giełdzie: -{d_fees:.2f} USD ({fee_drag_pct:.2f}% wartości konta)")
+    logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
+    logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
+    logging.info("================================================================================")
+
+    last_hourly_cost_report = now_ts
 
 def check_btc_significant_surge():
     """Weryfikuje, czy Bitcoin notuje wyraźny skok w górę (min. +1.5% w ciągu 2h)."""
@@ -224,7 +301,6 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
 
     drop_from_peak = peak_equity - current_total_equity
 
-    # Bezpieczniki działają wyłącznie w trybie bessy
     if "BEARISH" not in current_sentiment:
         return True, drop_from_peak, peak_equity
 
@@ -234,23 +310,20 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
     is_blocked_by_drop = drop_from_peak >= MAX_TRAILING_EQUITY_DROP_USD
     is_blocked_by_losses = (consecutive_losses >= MAX_CONSECUTIVE_LOSSES) or (now_ts < cooldown_until)
 
-    # >>> MECHANIZM ZWALNIANIA BLOKADY PRZY SILNYM WZROŚCIE BITCOINA <<<
     if is_blocked_by_drop or is_blocked_by_losses:
         btc_surging, btc_gain = check_btc_significant_surge()
         if btc_surging:
             logging.info(f"🚀⚡ [BTC SURGE UNLOCK] Bitcoin dynamicznie rośnie (+{btc_gain*100:.2f}% w 2h)! Znoszę blokadę zakupów i odblokowuję bota.")
             trade_history["cooldown_until"] = 0
             trade_history["consecutive_losses"] = 0
-            baseline["peak_equity"] = current_total_equity  # Resetujemy punkt odniesienia do aktualnego salda
+            baseline["peak_equity"] = current_total_equity
             save_trade_history(trade_history)
             return True, 0.0, current_total_equity
 
-    # 1. TWARDY WYŁĄCZNIK: Kroczący spadek o 15 USDC od szczytu dnia
     if is_blocked_by_drop:
         logging.warning(f"🛑 [TRAILING CIRCUIT BREAKER] Kapitał spadł o {drop_from_peak:.2f} USD od dzisiejszego szczytu ({peak_equity:.2f} USD)! Limit: {MAX_TRAILING_EQUITY_DROP_USD:.2f} USD. Zakupy zablokowane w trybie BEARISH do 00:00 UTC (Chyba że BTC mocno odbije).")
         return False, drop_from_peak, peak_equity
 
-    # 2. BEZPIECZNIK: 3 straty z rzędu
     if is_blocked_by_losses:
         if now_ts < cooldown_until:
             rem_minutes = int((cooldown_until - now_ts) / 60)
@@ -1444,7 +1517,9 @@ def monitor_and_close_positions():
 # PĘTLA GŁÓWNA - 45 SEKUNDOWY CYKL PRACY
 # ==============================================================================
 def bot_loop():
+    global last_hourly_cost_report
     sync_positions_from_bybit()
+    last_hourly_cost_report = time.time()  # Start timera raportu godzinowego
 
     while True:
         try:
@@ -1475,6 +1550,10 @@ def bot_loop():
             logging.info(f"📈 [BILANS HANDLOWY] Dziś (Netto): {today_sign}{today_stats['pnl_usd']:.2f} USD ({today_stats['trades']} transakcji) | Zmiana Salda Bybit: {diff_sign}{real_day_diff:.2f} USD | Strat z rzędu: {consec_losses}/3")
             logging.info(f"🛡️ [TRAILING DRAWDOWN] Szczyt dnia: {peak_eq:.2f} USD | Spadek od szczytu: -{drop_from_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f} USD | Poziom blokady: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f} USD")
             logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
+
+            # GODZINNY RAPORT KOSZTÓW I PROWIZJI (Co 3600 sekund)
+            if time.time() - last_hourly_cost_report >= 3600:
+                report_hourly_costs(total_equity)
 
             sync_positions_from_bybit()
 
