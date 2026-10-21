@@ -334,7 +334,6 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
 
     baseline = trade_history["equity_baseline"]
 
-    # Reset o północy UTC
     if baseline.get("date") != today_str:
         baseline["date"] = today_str
         baseline["starting_equity"] = current_total_equity
@@ -914,7 +913,7 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIE HANDLOWE
+# STRATEGIE HANDLOWE (Z POPRAWNĄ INDENTACJĄ TRY/EXCEPT)
 # ==============================================================================
 def run_support_bounce_strategy():
     global active_positions
@@ -1162,37 +1161,40 @@ def run_relative_strength_strategy():
             if symbol in active_positions or symbol == "BTCUSDC": continue
             if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
-            df_alt = get_market_data(symbol, interval="15", limit=60)
-            if df_alt is None or len(df_alt) < 40: continue
+            try:
+                df_alt = get_market_data(symbol, interval="15", limit=60)
+                if df_alt is None or len(df_alt) < 40: continue
 
-            c_now = df_alt.iloc[-2]
-            alt_close = c_now['close']
-            alt_open_1h = df_alt.iloc[-5]['open']
-            alt_1h_change = (alt_close - alt_open_1h) / alt_open_1h
+                c_now = df_alt.iloc[-2]
+                alt_close = c_now['close']
+                alt_open_1h = df_alt.iloc[-5]['open']
+                alt_1h_change = (alt_close - alt_open_1h) / alt_open_1h
 
-            c_vol, vol_ma = c_now['volume'], c_now['vol_ma20']
-            c_rsi = c_now['rsi']
-            ema21 = c_now['ema21']
+                c_vol, vol_ma = c_now['volume'], c_now['vol_ma20']
+                c_rsi = c_now['rsi']
+                ema21 = c_now['ema21']
 
-            alt_outperforms = (alt_1h_change >= 0.010) and (alt_close > ema21)
-            vol_valid = c_vol >= (vol_ma * 1.3)
-            rsi_ok = 50 <= c_rsi <= 72
+                alt_outperforms = (alt_1h_change >= 0.010) and (alt_close > ema21)
+                vol_valid = c_vol >= (vol_ma * 1.3)
+                rsi_ok = 50 <= c_rsi <= 72
 
-            if alt_outperforms and vol_valid and rsi_ok:
-                order_qty_usdc = f"{order_val:.2f}"
-                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
-                if res.get("retCode") == 0:
-                    qty_step, min_qty = get_symbol_lot_filter(symbol)
-                    qty_str = format_qty_with_step(order_val / alt_close, qty_step, min_qty) or "1"
-                    active_positions[symbol] = {"strategy": "RELATIVE_STRENGTH_BTC", "buy_price": alt_close, "peak_price": alt_close, "qty": qty_str, "sold_half": False}
-                    save_positions(active_positions)
-                    logging.info(f"🛡️🚀 [RS KUPNO OK] {symbol}! Rośnie (+{alt_1h_change*100:.2f}%) mimo spadku BTC! | Zakup: {order_val:.2f}$ ({risk_label})")
+                if alt_outperforms and vol_valid and rsi_ok:
+                    order_qty_usdc = f"{order_val:.2f}"
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=order_qty_usdc)
+                    if res.get("retCode") == 0:
+                        qty_step, min_qty = get_symbol_lot_filter(symbol)
+                        qty_str = format_qty_with_step(order_val / alt_close, qty_step, min_qty) or "1"
+                        active_positions[symbol] = {"strategy": "RELATIVE_STRENGTH_BTC", "buy_price": alt_close, "peak_price": alt_close, "qty": qty_str, "sold_half": False}
+                        save_positions(active_positions)
+                        logging.info(f"🛡️🚀 [RS KUPNO OK] {symbol}! Rośnie (+{alt_1h_change*100:.2f}%) mimo spadku BTC! | Zakup: {order_val:.2f}$ ({risk_label})")
 
-                    total_equity, free_usdc = get_balances()
-                    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
-                    if order_val <= 0: break
-        except Exception:
-            pass
+                        total_equity, free_usdc = get_balances()
+                        order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+                        if order_val <= 0: break
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def run_bb_squeeze_strategy():
     global active_positions
@@ -1496,7 +1498,6 @@ def monitor_and_close_positions():
             total_pnl = (current_price - buy_price) / buy_price
             peak_pnl = (peak_price - buy_price) / buy_price
 
-            # 1. ADAPTACYJNY PARTIAL TAKE PROFIT
             if SENTIMENT_STATE == "BULLISH":
                 tp_ratio = 0.25
                 tp_ratio_label = "25%"
@@ -1531,7 +1532,6 @@ def monitor_and_close_positions():
                             record_closed_trade(symbol, strat_name, buy_price, current_price, sold_qty_val, reason_msg)
                             logging.info(f"💸 [PARTIAL TP] {symbol} zabezpiecza zysk! {reason_msg} | Wynik: +{total_pnl*100:.2f}%. Reszta na Trailing Stopie!")
 
-            # 2. DEFINIOWANIE STOP LOSS
             structural_sl_hit = False
             if structural_sl is not None and current_price <= structural_sl:
                 structural_sl_hit = True
@@ -1569,7 +1569,6 @@ def monitor_and_close_positions():
 
             btc_emergency_exit = btc_flash_crash and (total_pnl < -0.005)
 
-            # 3. WERYFIKACJA WARUNKU CAŁKOWITEGO WYJŚCIA
             should_exit = (
                 structural_sl_hit or 
                 trailing_sell or 
