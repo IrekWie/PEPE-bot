@@ -15,7 +15,7 @@ from pybit.unified_trading import HTTP
 socket.setdefaulttimeout(10)
 
 # ==============================================================================
-# KONFIGURACJA SCALPERA MULTI-COIN SPOT
+# KONFIGURACJA SCALPERA MULTI-COIN SPOT (TYLKO DLA HOSSY)
 # ==============================================================================
 FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
 FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
@@ -39,8 +39,8 @@ SCALP_PARAMS = {
     },
     "PEPEUSDC": {
         "budget": 80.0,
-        "tp": 0.012,          # Take Profit: +1.20% (Wyższa zmienność PEPE)
-        "sl": 0.008,          # Stop Loss: -0.80% (Szerszy oddech na szum 1M)
+        "tp": 0.012,          # Take Profit: +1.20%
+        "sl": 0.008,          # Stop Loss: -0.80%
         "be_trigger": 0.0050, # Aktywacja Breakeven: +0.50%
         "be_lock": 0.0015,    # Poziom Breakeven: +0.15%
         "max_hold": 600       # Time-Stop: 10 minut
@@ -49,9 +49,10 @@ SCALP_PARAMS = {
 
 SCALP_SYMBOLS = list(SCALP_PARAMS.keys())
 
-RSI_OVERSOLD = 25                # Wspólny poziom wyprzedania RSI 7 na 1M
+RSI_OVERSOLD = 25                # Poziom wyprzedania RSI 7 na 1M
 POLL_INTERVAL_SEC = 2            # Szybki cykl odpytywania rynku (co 2 sekundy)
 HEARTBEAT_INTERVAL_SEC = 60      # Częstotliwość raportu w logach (co 60s)
+SENTIMENT_CHECK_INTERVAL = 300   # Weryfikacja sentymentu BTC 4H co 5 minut
 
 SCALP_APP_URL = "https://bybit-scalper-d4xb.onrender.com"
 SCALP_POS_FILE = "scalp_active_pos.json"
@@ -125,7 +126,6 @@ def load_positions():
         try:
             with open(SCALP_POS_FILE, "r") as f:
                 data = json.load(f)
-                # Migracja starego formatu (pojedynczy słownik) do nowego (słownik słowników)
                 if "buy_price" in data and "symbol" in data:
                     return {data["symbol"]: data}
                 return data if isinstance(data, dict) else {}
@@ -224,13 +224,59 @@ def get_1m_candles(symbol):
         return None
 
 # ==============================================================================
+# FILTR MAKRO-HOSSY DLA SCALPERA (BTC 4H)
+# ==============================================================================
+cached_sentiment = "UNKNOWN"
+last_sentiment_check = 0.0
+
+def update_macro_sentiment():
+    """Weryfikuje, czy rynek jest w stanie HOSSY (BULLISH) na BTC 4H."""
+    global cached_sentiment, last_sentiment_check
+    now = time.time()
+    if now - last_sentiment_check < SENTIMENT_CHECK_INTERVAL and cached_sentiment != "UNKNOWN":
+        return cached_sentiment
+
+    try:
+        res = session.get_kline(category=CATEGORY, symbol="BTCUSDC", interval="240", limit=100)
+        candles = res.get("result", {}).get("list", [])
+        if candles and len(candles) >= 55:
+            df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
+            df = df.iloc[::-1].reset_index(drop=True)
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+
+            df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+            df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+            df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
+
+            c_close = df.iloc[-1]['close']
+            ema21 = df.iloc[-1]['ema21']
+            ema50 = df.iloc[-1]['ema50']
+            ema89 = df.iloc[-1]['ema89']
+
+            if c_close > ema50 and ema21 > ema50:
+                cached_sentiment = "BULLISH"
+            elif c_close < ema89 or ema21 < ema89:
+                cached_sentiment = "BEARISH"
+            else:
+                cached_sentiment = "NEUTRAL"
+
+            last_sentiment_check = now
+            return cached_sentiment
+    except Exception as e:
+        logging.warning(f"Błąd sprawdzania makro sentymentu BTC dla scalpera: {e}")
+
+    last_sentiment_check = now
+    return cached_sentiment
+
+# ==============================================================================
 # SILNIK SCALPINGOWY
 # ==============================================================================
 active_scalps = load_positions()
 
 def scalper_loop():
     global active_scalps
-    logging.info(f"⚡ Start Scalpera MULTI-COIN: {SCALP_SYMBOLS} (Interwał 1M, polling co {POLL_INTERVAL_SEC}s)...")
+    logging.info(f"⚡ Start Scalpera MULTI-COIN: {SCALP_SYMBOLS} (Warunek startu: HOSSA / BULLISH)...")
     last_heartbeat = 0.0
 
     while True:
@@ -238,10 +284,15 @@ def scalper_loop():
             now = time.time()
             do_heartbeat = False
             
+            # Weryfikacja sentymentu BTC 4H
+            current_sentiment = update_macro_sentiment()
+            is_bullish = (current_sentiment == "BULLISH")
+
             # Globalny Raport pulsu co 60 sekund
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 free_bal = get_free_usdc()
-                logging.info(f"💓 --- RAPORT SCALPERA | Wolne środki: {free_bal:.2f} USDC ---")
+                mode_str = "AKTYWNY (HOSSA 🟢)" if is_bullish else f"UŚPIONY (Czekam na hossę | Stan BTC: {current_sentiment})"
+                logging.info(f"💓 --- RAPORT SCALPERA | Tryb: {mode_str} | Wolne środki: {free_bal:.2f} USDC ---")
                 do_heartbeat = True
                 last_heartbeat = now
             
@@ -263,10 +314,10 @@ def scalper_loop():
                         pnl_now = ((current_price - pos['buy_price']) / pos['buy_price']) * 100
                         status_str = f"POZYCJA OTWARTA (PnL: {pnl_now:+.2f}%)"
                     else:
-                        status_str = "Szukam wejścia (Oczekiwanie)"
+                        status_str = "Szukam wejścia" if is_bullish else "Blokada zakupów (Poza hossą)"
                     logging.info(f"  > [1M] {symbol}: {current_price} USD | RSI(7): {rsi7:.1f} | Stan: {status_str}")
 
-                # FAZA 1: ZARZĄDZANIE OTWARTĄ POZYCJĄ
+                # FAZA 1: ZARZĄDZANIE OTWARTĄ POZYCJĄ (Działa ZAWSZE, nawet po utracie hossy)
                 if pos:
                     buy_price = pos["buy_price"]
                     peak_price = max(pos.get("peak_price", buy_price), current_price)
@@ -302,8 +353,11 @@ def scalper_loop():
                     else:
                         save_positions(active_scalps)
 
-                # FAZA 2: POSZUKIWANIE MIKRO-WEJŚCIA
+                # FAZA 2: POSZUKIWANIE MIKRO-WEJŚCIA (WYŁĄCZNIE W HOSSIE)
                 else:
+                    if not is_bullish:
+                        continue
+
                     c_open = current_candle['open']
                     c_low = current_candle['low']
                     bb_lower = current_candle['bb_lower']
@@ -329,7 +383,7 @@ def scalper_loop():
                                         "entry_timestamp": now
                                     }
                                     save_positions(active_scalps)
-                                    logging.info(f"⚡ [WEJŚCIE SCALP] {symbol} po {current_price} USD | RSI7: {rsi7:.1f} | Budżet: {params['budget']}$")
+                                    logging.info(f"⚡ [WEJŚCIE SCALP - HOSSA] {symbol} po {current_price} USD | RSI7: {rsi7:.1f} | Budżet: {params['budget']}$")
 
         except Exception as e:
             logging.error(f"Błąd w pętli scalpera: {e}")
@@ -353,15 +407,15 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Multi-Coin Scalper Bot is Running 24/7!")
+        self.wfile.write(b"Bybit Scalper Bot is Running 24/7 (Bullish Filter Active)!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('', port), HealthHandler)
-    server.serve_forever()
+    httpd = HTTPServer(('', port), HealthHandler)
+    httpd.serve_forever()
 
 if __name__ == "__main__":
     t_scalp = threading.Thread(target=scalper_loop, daemon=True)
