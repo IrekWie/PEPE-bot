@@ -249,11 +249,11 @@ def report_hourly_costs(total_equity):
     logging.info("================================================================================")
     logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
     logging.info("--------------------------------------------------------------------------------")
-    logging.info("⏱️ Ostatnie 60 minut:")
+    logging.info(f"⏱️ Ostatnie 60 minut:")
     logging.info(f"   • Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f} USD")
     logging.info(f"   • Prowizje Bybit (Taker 0.1%): -{h_fees:.2f} USD")
     logging.info(f"   • Wynik Brutto: {sign_gross}{h_gross:.2f} USD | Wynik Netto: {sign_net}{h_net:.2f} USD")
-    logging.info("📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
+    logging.info(f"📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
     logging.info(f"   • Suma prowizji oddanych giełdzie: -{d_fees:.2f} USD ({fee_drag_pct:.2f}% wartości konta)")
     logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
     logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
@@ -290,7 +290,7 @@ def check_usdc_market_dependencies():
                 logging.warning(f"⚠️ [USDC MICRO-DUMP GUARD] Nagły spadek BTCUSDC 1M ({chg_1m*100:.2f}%). Chwilowa pauza przed zakupem!")
                 return False, f"USDC_DUMP_{chg_1m*100:.2f}%"
 
-        # 3. GLOBALNY PARYTET USDC (OPCJONALNY ODCZYT PUBLICZNY BEZ KLUCZY)
+        # 3. GLOBALNY PARYTET USDC (OPCJONALNY ODCZYT PUBLICZNY BEZ UŻYCIA SESJI EU)
         try:
             r = requests.get("https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDCUSDT", timeout=2)
             if r.status_code == 200:
@@ -924,7 +924,7 @@ def run_support_bounce_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols(80)
-    logging.info(f"=== [POZ 0: DNO SINUSOIDY] CONFIRMED BOLLINGER / SUPPORT BOUNCE (15M) ===")
+    logging.info("=== [POZ 0: DNO SINUSOIDY] CONFIRMED BOLLINGER / SUPPORT BOUNCE (15M) ===")
 
     if order_val <= 0: return
 
@@ -994,7 +994,7 @@ def run_mtf_alignment_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols(80)
-    logging.info(f"=== [POZ 1: NAJBEZPIECZNIEJSZA] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
+    logging.info("=== [POZ 1: NAJBEZPIECZNIEJSZA] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
 
     if order_val <= 0: return
 
@@ -1044,7 +1044,7 @@ def scan_top150_for_ema_signals():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols()
-    logging.info(f"=== [POZ 2: BARDZO BEZPIECZNA] EMA TREND SCANNER ===")
+    logging.info("=== [POZ 2: BARDZO BEZPIECZNA] EMA TREND SCANNER ===")
 
     if order_val <= 0: return
 
@@ -1095,7 +1095,7 @@ def run_top_gainers_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
 
     top_gainers = get_top_gainers_symbols()
-    logging.info(f"=== [POZ 3: UMIARKOWANIE BEZPIECZNA] TOP GAINERS PULLBACK ===")
+    logging.info("=== [POZ 3: UMIARKOWANIE BEZPIECZNA] TOP GAINERS PULLBACK ===")
 
     if not top_gainers or order_val <= 0: return
 
@@ -1202,7 +1202,7 @@ def run_bb_squeeze_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
 
     top_symbols = get_top_volume_symbols(TOP_MARKETS_COUNT)
-    logging.info(f"=== [POZ 5: ŚREDNIE RYZYKO] BOLLINGER BANDS SQUEEZE ===")
+    logging.info("=== [POZ 5: ŚREDNIE RYZYKO] BOLLINGER BANDS SQUEEZE ===")
 
     if order_val <= 0: return
 
@@ -1256,7 +1256,7 @@ def run_ema21_89_pure_crossover_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
 
     all_symbols = get_all_spot_usdc_symbols()
-    logging.info(f"=== [POZ 6: ŚREDNIO-WYŻSZE RYZYKO] CZYSTY CROSS EMA 21/89 ===")
+    logging.info("=== [POZ 6: ŚREDNIO-WYŻSZE RYZYKO] CZYSTY CROSS EMA 21/89 ===")
 
     if order_val <= 0: return
 
@@ -1308,7 +1308,7 @@ def run_dip_hunter_strategy():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
 
     top_losers = get_top_losers_symbols(limit_count=6)
-    logging.info(f"=== [POZ 7: WYŻSZE RYZYKO] REAL-TIME DIP HUNTER (5M) ===")
+    logging.info("=== [POZ 7: WYŻSZE RYZYKO] REAL-TIME DIP HUNTER (5M) ===")
 
     if not top_losers or order_val <= 0: return
 
@@ -1359,7 +1359,7 @@ def scan_for_pumps():
     order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
 
     all_symbols = get_all_spot_usdc_symbols()
-    logging.info(f"=== [POZ 8: WYSOKIE RYZYKO] MOMENTUM PUMP HUNTER ===")
+    logging.info("=== [POZ 8: WYSOKIE RYZYKO] MOMENTUM PUMP HUNTER ===")
 
     if order_val <= 0: return
 
@@ -1407,7 +1407,7 @@ def scan_pepe_specialist():
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
 
-    logging.info(f"=== [POZ 9: NAJBARDZIEJ RYZYKOWNA / MEME] PEPE EMA SPECIALIST ===")
+    logging.info("=== [POZ 9: NAJBARDZIEJ RYZYKOWNA / MEME] PEPE EMA SPECIALIST ===")
 
     if order_val <= 0: return
 
