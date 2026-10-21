@@ -51,11 +51,13 @@ LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach w bes
 BTC_SURGE_UNLOCK_PCT = 0.015         # +1.5% wzrostu BTC w 2h zwalnia blokadę zakupów
 
 # ==============================================================================
-# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA
+# ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA I MAKRO-SENTYMENTU
 # ==============================================================================
 MAX_TOTAL_POSITIONS = 10
 MAX_EMA_CROSS_POSITIONS = 5
 SENTIMENT_STATE = "NEUTRAL"
+ETH_SENTIMENT_STATE = "NEUTRAL"
+ALTCOIN_FLOW_STATE = "ALT_PRESSURE"
 
 SAFE_RISK_PCT = 0.20
 MODERATE_RISK_PCT = 0.15
@@ -243,11 +245,11 @@ def report_hourly_costs(total_equity):
     logging.info("================================================================================")
     logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
     logging.info("--------------------------------------------------------------------------------")
-    logging.info(f"⏱️ Ostatnie 60 minut:")
+    logging.info("⏱️ Ostatnie 60 minut:")
     logging.info(f"   • Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f} USD")
     logging.info(f"   • Prowizje Bybit (Taker 0.1%): -{h_fees:.2f} USD")
     logging.info(f"   • Wynik Brutto: {sign_gross}{h_gross:.2f} USD | Wynik Netto: {sign_net}{h_net:.2f} USD")
-    logging.info(f"📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
+    logging.info("📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
     logging.info(f"   • Suma prowizji oddanych giełdzie: -{d_fees:.2f} USD ({fee_drag_pct:.2f}% wartości konta)")
     logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
     logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
@@ -623,30 +625,79 @@ def sync_positions_from_bybit():
     except Exception as e:
         logging.error(f"Błąd ogólny synchronizacji z Bybit: {e}")
 
+# ==============================================================================
+# FILTRY MAKROEKONOMICZNE BTC + ETH + ROTACJA ETH/BTC
+# ==============================================================================
 def update_market_sentiment():
     global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, SAFE_RISK_PCT, MODERATE_RISK_PCT, HIGH_RISK_PCT
-    global SENTIMENT_STATE
+    global SENTIMENT_STATE, ETH_SENTIMENT_STATE, ALTCOIN_FLOW_STATE
     try:
-        df = get_market_data("BTCUSDC", interval="240", limit=100)
-        if df is None or len(df) < 50:
-            SENTIMENT_STATE = "NEUTRAL"
-            return "NEUTRAL (Brak danych)"
-        
-        candle = df.iloc[-1]
-        c_close = candle['close']
-        ema21 = candle['ema21']
-        ema50 = candle['ema50']
-        ema89 = candle['ema89']
+        # 1. POBRANIE DANYCH 4H DLA BITCOINA ORAZ ETHEREUM
+        df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
+        df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
 
-        if c_close > ema50 and ema21 > ema50:
-            sentiment = "BULLISH 🟢"
+        if df_btc is None or len(df_btc) < 50:
+            SENTIMENT_STATE = "NEUTRAL"
+            return "NEUTRAL (Brak danych BTC)"
+
+        # 2. ANALIZA KONDYCJI BITCOINA (FILAR GŁÓWNY)
+        btc_candle = df_btc.iloc[-1]
+        btc_close = btc_candle['close']
+        btc_ema21 = btc_candle['ema21']
+        btc_ema50 = btc_candle['ema50']
+        btc_ema89 = btc_candle['ema89']
+
+        if btc_close > btc_ema50 and btc_ema21 > btc_ema50:
+            btc_sentiment = "BULLISH"
+        elif btc_close < btc_ema89 or btc_ema21 < btc_ema89:
+            btc_sentiment = "BEARISH"
+        else:
+            btc_sentiment = "NEUTRAL"
+
+        # 3. ANALIZA KONDYCJI ETHEREUM ORAZ WSKAŹNIKA ROTACJI ETH/BTC
+        eth_sentiment = "NEUTRAL"
+        alt_flow = "NEUTRAL"
+
+        if df_eth is not None and len(df_eth) >= 50:
+            eth_candle = df_eth.iloc[-1]
+            eth_close = eth_candle['close']
+            eth_ema21 = eth_candle['ema21']
+            eth_ema50 = eth_candle['ema50']
+            eth_ema89 = eth_candle['ema89']
+
+            if eth_close > eth_ema50 and eth_ema21 > eth_ema50:
+                eth_sentiment = "BULLISH 🟢"
+            elif eth_close < eth_ema89 or eth_ema21 < eth_ema89:
+                eth_sentiment = "BEARISH 🔴"
+            else:
+                eth_sentiment = "NEUTRAL 🟡"
+
+            # Wskaźnik siły relatywnej ETH/BTC
+            min_len = min(len(df_btc), len(df_eth))
+            btc_series = df_btc['close'].iloc[-min_len:].reset_index(drop=True)
+            eth_series = df_eth['close'].iloc[-min_len:].reset_index(drop=True)
+            eth_btc_ratio = eth_series / btc_series
+            ratio_ema21 = eth_btc_ratio.ewm(span=21, adjust=False).mean()
+
+            if eth_btc_ratio.iloc[-1] > ratio_ema21.iloc[-1]:
+                alt_flow = "ALT_FLOW 🟢 (Kapitał w altach)"
+            else:
+                alt_flow = "ALT_PRESSURE 🔴 (Dominacja Bitcoina)"
+
+        ETH_SENTIMENT_STATE = eth_sentiment
+        ALTCOIN_FLOW_STATE = alt_flow
+
+        # 4. SYNTEZA MAKRO-SENTYMENTU I DYNAMICZNE SLOCKI POZYCJI
+        if btc_sentiment == "BULLISH":
             SENTIMENT_STATE = "BULLISH"
             MAX_TOTAL_POSITIONS = 10
             MAX_EMA_CROSS_POSITIONS = 5
             SAFE_RISK_PCT = 0.20
             MODERATE_RISK_PCT = 0.15
             HIGH_RISK_PCT = 0.10
-        elif c_close < ema89 or ema21 < ema89:
+            sentiment_label = "BULLISH 🟢 (Pełna Hossa)"
+
+        elif btc_sentiment == "BEARISH":
             SENTIMENT_STATE = "BEARISH"
             
             # WERYFIKACJA LOKALNEGO ODBICIA BITCOINA (INTERWAŁ 1H)
@@ -659,36 +710,37 @@ def update_market_sentiment():
                     ema21_1h = df_btc_1h.iloc[-1]['ema21']
                     growth_2h = (c_now - open_2h) / open_2h
                     
-                    # Warunek: cena 1H powyżej EMA21 i wzrost w 2h powyżej 0.3%
                     if c_now > ema21_1h and growth_2h >= 0.003:
                         btc_is_rebounding = True
             except Exception:
                 pass
 
             if btc_is_rebounding:
-                sentiment = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
-                MAX_TOTAL_POSITIONS = 5  # Rozszerzenie do 5 pozycji podczas odbicia BTC
+                sentiment_label = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
+                MAX_TOTAL_POSITIONS = 5  # Rozszerzenie slotów do 5 przy wzroście BTC
             else:
-                sentiment = "BEARISH 🔴 (Ścisła Defensywa)"
-                MAX_TOTAL_POSITIONS = 3  # Standardowy limit 3 pozycji
+                sentiment_label = "BEARISH 🔴 (Ścisła Defensywa)"
+                MAX_TOTAL_POSITIONS = 3  # Ścisły limit 3 pozycji
 
             MAX_EMA_CROSS_POSITIONS = 0
             SAFE_RISK_PCT = 0.15      
             MODERATE_RISK_PCT = 0.0   
             HIGH_RISK_PCT = 0.0       
+
         else:
-            sentiment = "NEUTRAL 🟡"
             SENTIMENT_STATE = "NEUTRAL"
+            sentiment_label = "NEUTRAL 🟡 (Rynek Boczny)"
             MAX_TOTAL_POSITIONS = 8
             MAX_EMA_CROSS_POSITIONS = 3
             SAFE_RISK_PCT = 0.18
             MODERATE_RISK_PCT = 0.12
             HIGH_RISK_PCT = 0.0       
         
-        logging.info(f"📊 [MAKRO SENTYMENT BTC 4H] {sentiment} | Max Pozycji: {MAX_TOTAL_POSITIONS} | Alokacje: Safe {SAFE_RISK_PCT*100:.0f}% / Mod {MODERATE_RISK_PCT*100:.0f}% / High {HIGH_RISK_PCT*100:.0f}%")
-        return sentiment
+        logging.info(f"📊 [MAKRO BTC+ETH] BTC 4H: {sentiment_label} | ETH 4H: {eth_sentiment} | Rotacja: {alt_flow} | Max Pozycji: {MAX_TOTAL_POSITIONS}")
+        return sentiment_label
+
     except Exception as e:
-        logging.error(f"Błąd aktualizacji sentymentu: {e}")
+        logging.error(f"Błąd aktualizacji sentymentu makro BTC+ETH: {e}")
         SENTIMENT_STATE = "NEUTRAL"
         return "UNKNOWN"
 
@@ -1623,7 +1675,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7!")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (BTC+ETH Macro Engine Active)!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
