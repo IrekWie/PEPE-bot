@@ -39,15 +39,21 @@ TOP_DIPS_COUNT = 6
 TOP_GAINERS_COUNT = 4
 MAX_PUMP_POSITIONS = 4
 
+# --- CZARNA LISTA PAR STABLECOIN-TO-STABLECOIN (ZAKAZ HANDLU) ---
+STABLE_PAIRS_BLACKLIST = [
+    "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
+    "USDEUSDC", "DAIUSDC", "FDUSDUSDC", "TUSDUSDC"
+]
+
 # --- LIMITY FINANSOWE ---
 STANDARD_MIN_ORDER_VALUE = 100.0  
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
 
-# --- TWARDE BEZPIECZNIKI PORTFELA (TRAILING DRAWDOWN W B戸SSIE) ---
-MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od MAKSYMALNEGO salda dnia = STOP zakupów
-MAX_CONSECUTIVE_LOSSES = 3           # 3 błędne decyzje pod rząd w bessie = STOP zakupów
-LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach w bessie (w godzinach)
+# --- BEZWZGLĘDNE BEZPIECZNIKI PORTFELA (GLOBALNY TRAILING DRAWDOWN) ---
+MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od MAKSYMALNEGO salda dnia = BEZWZGLĘDNY STOP ZAKUPÓW
+MAX_CONSECUTIVE_LOSSES = 3           # 3 błędne decyzje pod rząd = STOP ZAKUPÓW
+LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach (w godzinach)
 BTC_SURGE_UNLOCK_PCT = 0.015         # +1.5% wzrostu BTC w 2h zwalnia blokadę zakupów
 
 # --- MIKROSTRUKTURA I PŁYNNOŚĆ USDC ---
@@ -323,8 +329,11 @@ def check_btc_significant_surge():
         pass
     return False, 0.0
 
+# ==============================================================================
+# GLOBALNY TWARDY BEZPIECZNIK KAPITAŁU (TRAILING DRAWDOWN W KAŻDYM REŻIMIE)
+# ==============================================================================
 def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
-    """Weryfikuje kroczący spadek salda, limit 3 strat oraz zwalnia blokadę przy wzroście BTC."""
+    """Weryfikuje kroczący spadek salda i limit 3 strat GLOBALNIE (w KAŻDYM trybie rynku)."""
     global trade_history
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now_ts = time.time()
@@ -334,6 +343,7 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
 
     baseline = trade_history["equity_baseline"]
 
+    # Reset o północy UTC
     if baseline.get("date") != today_str:
         baseline["date"] = today_str
         baseline["starting_equity"] = current_total_equity
@@ -352,38 +362,92 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
 
     drop_from_peak = peak_equity - current_total_equity
 
-    if "BEARISH" not in current_sentiment:
-        return True, drop_from_peak, peak_equity
-
     cooldown_until = safe_float(trade_history.get("cooldown_until", 0))
     consecutive_losses = trade_history.get("consecutive_losses", 0)
 
     is_blocked_by_drop = drop_from_peak >= MAX_TRAILING_EQUITY_DROP_USD
     is_blocked_by_losses = (consecutive_losses >= MAX_CONSECUTIVE_LOSSES) or (now_ts < cooldown_until)
 
+    # MECHANIZM AWARYJNEGO ZWOLNIENIA PRZY POTĘŻNYM IMPULSIE BTC (+1.5% W 2H)
     if is_blocked_by_drop or is_blocked_by_losses:
         btc_surging, btc_gain = check_btc_significant_surge()
         if btc_surging:
-            logging.info(f"🚀⚡ [BTC SURGE UNLOCK] Bitcoin dynamicznie rośnie (+{btc_gain*100:.2f}% w 2h)! Znoszę blokadę zakupów i odblokowuję bota.")
+            logging.info(f"🚀⚡ [BTC SURGE UNLOCK] Bitcoin dynamicznie rośnie (+{btc_gain*100:.2f}% w 2h)! Znoszę blokadę zakupów i resetuję poziom szczytu.")
             trade_history["cooldown_until"] = 0
             trade_history["consecutive_losses"] = 0
             baseline["peak_equity"] = current_total_equity
             save_trade_history(trade_history)
             return True, 0.0, current_total_equity
 
+    # TWARDY WYŁĄCZNIK: Kroczący spadek o 15 USDC od szczytu dnia (GLOBALNY - CHRONI PORTFEL W KAŻDYM TRYBIE)
     if is_blocked_by_drop:
-        logging.warning(f"🛑 [TRAILING CIRCUIT BREAKER] Kapitał spadł o {drop_from_peak:.2f} USD od dzisiejszego szczytu ({peak_equity:.2f} USD)! Limit: {MAX_TRAILING_EQUITY_DROP_USD:.2f} USD. Zakupy zablokowane w trybie BEARISH do 00:00 UTC (Chyba że BTC mocno odbije).")
+        logging.warning(f"🛑 [TRAILING CIRCUIT BREAKER] Kapitał spadł o {drop_from_peak:.2f} USD od dzisiejszego szczytu ({peak_equity:.2f} USD)! Przekroczono limit: {MAX_TRAILING_EQUITY_DROP_USD:.2f} USD. Zakupy BEZWZGLĘDNIE ZABLOKOWANE do 00:00 UTC!")
         return False, drop_from_peak, peak_equity
 
+    # TWARDY BEZPIECZNIK: 3 straty z rzędu
     if is_blocked_by_losses:
         if now_ts < cooldown_until:
             rem_minutes = int((cooldown_until - now_ts) / 60)
-            logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Wstrzymuję zakupy w trybie BEARISH po serii porażek. Pozostało: {rem_minutes} min.")
+            logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Wstrzymuję zakupy po serii porażek ({consecutive_losses}/3). Pozostało: {rem_minutes} min.")
         else:
-            logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Zanotowano {consecutive_losses} porażek w trybie BEARISH. Zakupy zablokowane.")
+            logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Zanotowano {consecutive_losses} porażek z rzędu. Zakupy zablokowane na {LOSS_COOLDOWN_HOURS}h.")
         return False, drop_from_peak, peak_equity
 
     return True, drop_from_peak, peak_equity
+
+# ==============================================================================
+# AUTOMATYCZNA LIKWIDACJA STABLECOINÓW I ZAKUP BITCOINA (SPOT MARKET)
+# ==============================================================================
+def auto_liquidate_stables_to_btc():
+    """Wykrywa pozycje/salda USDT i EURC, sprzedaje je na Spot Market i kupuje BTC."""
+    global active_positions
+    stables_to_clean = [("USDT", "USDTUSDC"), ("EURC", "EURCUSDC")]
+
+    for coin, symbol in stables_to_clean:
+        try:
+            bal = get_coin_available_balance(coin)
+            if (bal * 1.0 >= MIN_EXCHANGE_NOTIONAL) or (symbol in active_positions):
+                logging.info(f"🧹 [AUTO-WYMIANA STABLECOINA] Wykryto pozycję {symbol} (Saldo: {bal} {coin}). Sprzedaję na Spot Market bez prowizji Convert...")
+                qty_step, min_qty = get_symbol_lot_filter(symbol)
+                qty_str = format_qty_with_step(bal, qty_step, min_qty)
+
+                sold_ok = False
+                if qty_str and safe_float(qty_str) > 0:
+                    res_sell = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qty_str)
+                    if res_sell.get("retCode") == 0:
+                        sold_ok = True
+                        logging.info(f"✅ [SPRZEDANO] {qty_str} {coin} na parze {symbol}. Uwalniam kapitał...")
+                else:
+                    sold_ok = True
+
+                if sold_ok:
+                    if symbol in active_positions:
+                        del active_positions[symbol]
+                        save_positions(active_positions)
+
+                    time.sleep(1.0)
+                    _, free_usdc = get_balances()
+
+                    if free_usdc >= MIN_EXCHANGE_NOTIONAL:
+                        btc_spend = round(free_usdc * 0.99, 2)
+                        res_btc = session.place_order(category=CATEGORY, symbol="BTCUSDC", side="Buy", orderType="Market", qty=f"{btc_spend:.2f}")
+                        if res_btc.get("retCode") == 0:
+                            df_btc = get_market_data("BTCUSDC", interval="15", limit=5)
+                            curr_p = df_btc.iloc[-1]['close'] if df_btc is not None else 65000.0
+                            b_step, b_min = get_symbol_lot_filter("BTCUSDC")
+                            b_qty = format_qty_with_step(btc_spend / curr_p, b_step, b_min)
+                            
+                            active_positions["BTCUSDC"] = {
+                                "strategy": "AUTO_STABLE_REINVEST",
+                                "buy_price": curr_p,
+                                "peak_price": curr_p,
+                                "qty": b_qty or "0.001",
+                                "sold_half": False
+                            }
+                            save_positions(active_positions)
+                            logging.info(f"💎🚀 [REINWESTYCJA W BTC SUKCES] Za {btc_spend:.2f} USDC zakupiono Bitcoina (BTCUSDC) po kursie ~{curr_p:.2f} USD!")
+        except Exception as e:
+            logging.error(f"Błąd auto-wymiany {symbol} na BTC: {e}")
 
 # ==============================================================================
 # ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU
@@ -589,7 +653,7 @@ def get_coin_available_balance(coin_name):
 def get_all_spot_trading_symbols():
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        return [t["symbol"] for t in tickers if "symbol" in t]
+        return [t["symbol"] for t in tickers if "symbol" in t and t["symbol"] not in STABLE_PAIRS_BLACKLIST]
     except Exception:
         pass
     return []
@@ -598,7 +662,7 @@ def get_all_spot_usdc_symbols():
     symbols = []
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in ["USDTUSDC", "USDCUSDT"]]
+        symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in STABLE_PAIRS_BLACKLIST]
     except Exception:
         pass
     if not symbols:
@@ -621,7 +685,7 @@ def sync_positions_from_bybit():
         for coin_info in account_list[0].get("coin", []):
             try:
                 coin = coin_info.get("coin")
-                if coin in ["USDC", "USDT", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
+                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
                     continue
 
                 wb = safe_float(coin_info.get("walletBalance"))
@@ -636,7 +700,7 @@ def sync_positions_from_bybit():
                 elif f"{coin}USDT" in all_trading_symbols:
                     matched_symbol = f"{coin}USDT"
 
-                if not matched_symbol:
+                if not matched_symbol or matched_symbol in STABLE_PAIRS_BLACKLIST:
                     continue
 
                 if matched_symbol not in active_positions:
@@ -830,7 +894,11 @@ def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
+        usdc_tickers = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+        ]
         if usdc_tickers:
             sorted_tickers = sorted(usdc_tickers, key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
             res_symbols = [t["symbol"] for t in sorted_tickers[:limit_count]]
@@ -838,12 +906,16 @@ def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
             return res_symbols
     except Exception:
         pass
-    return get_all_spot_usdc_symbols()[:limit_count]
+    return [s for s in get_all_spot_usdc_symbols() if s not in STABLE_PAIRS_BLACKLIST][:limit_count]
 
 def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN)]
+        usdc_tickers = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+        ]
         if usdc_tickers:
             valid_losers = [t for t in usdc_tickers if safe_float(t.get("price24hPcnt")) <= -0.03]
             sorted_tickers = sorted(valid_losers, key=lambda x: safe_float(x.get("price24hPcnt")))
@@ -855,7 +927,11 @@ def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
 def get_top_gainers_symbols(limit_count=TOP_GAINERS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        usdc_tickers = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in ["USDTUSDC", "USDCUSDT"]]
+        usdc_tickers = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+        ]
         if usdc_tickers:
             valid_gainers = [t for t in usdc_tickers if safe_float(t.get("price24hPcnt")) >= 0.02]
             sorted_tickers = sorted(valid_gainers, key=lambda x: safe_float(x.get("price24hPcnt")), reverse=True)
@@ -913,7 +989,7 @@ def get_market_data(symbol, interval="15", limit=250):
         return None
 
 # ==============================================================================
-# STRATEGIE HANDLOWE (Z POPRAWNĄ INDENTACJĄ TRY/EXCEPT)
+# STRATEGIE HANDLOWE
 # ==============================================================================
 def run_support_bounce_strategy():
     global active_positions
@@ -928,7 +1004,7 @@ def run_support_bounce_strategy():
     if order_val <= 0: return
 
     for symbol in top_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -998,7 +1074,7 @@ def run_mtf_alignment_strategy():
     if order_val <= 0: return
 
     for symbol in top_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1048,7 +1124,7 @@ def scan_top150_for_ema_signals():
     if order_val <= 0: return
 
     for symbol in top_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1099,7 +1175,7 @@ def run_top_gainers_strategy():
     if not top_gainers or order_val <= 0: return
 
     for symbol in top_gainers:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1158,7 +1234,7 @@ def run_relative_strength_strategy():
 
         top_symbols = get_top_volume_symbols(TOP_MARKETS_COUNT)
         for symbol in top_symbols:
-            if symbol in active_positions or symbol == "BTCUSDC": continue
+            if symbol in active_positions or symbol == "BTCUSDC" or symbol in STABLE_PAIRS_BLACKLIST: continue
             if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
             try:
@@ -1209,7 +1285,7 @@ def run_bb_squeeze_strategy():
     if order_val <= 0: return
 
     for symbol in top_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1263,7 +1339,7 @@ def run_ema21_89_pure_crossover_strategy():
     if order_val <= 0: return
 
     for symbol in all_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if current_cross_positions >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1315,7 +1391,7 @@ def run_dip_hunter_strategy():
     if not top_losers or order_val <= 0: return
 
     for symbol in top_losers:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1366,7 +1442,7 @@ def scan_for_pumps():
     if order_val <= 0: return
 
     for symbol in all_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if pump_positions_count >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: break
 
         try:
@@ -1635,6 +1711,7 @@ def monitor_and_close_positions():
 def bot_loop():
     global last_hourly_cost_report
     sync_positions_from_bybit()
+    auto_liquidate_stables_to_btc()  # Natychmiastowa likwidacja USDT/EURC na rzecz Bitcoina
     last_hourly_cost_report = time.time()
 
     while True:
@@ -1656,10 +1733,10 @@ def bot_loop():
 
             consec_losses = trade_history.get("consecutive_losses", 0)
 
-            # WERYFIKACJA TRAILING DRAWDOWN, 3 STRAT & SURGE UNLOCK
+            # GLOBALNA WERYFIKACJA TRAILING DRAWDOWN & CIRCUIT BREAKERA (CHRONI PORTFEL W KAŻDYM TRYBIE)
             can_buy, drop_from_peak, peak_eq = check_and_update_circuit_breakers(total_equity, current_sentiment)
 
-            # WERYFIKACJA PŁYNNOŚCI I SPREADU RYNKU USDC (BEZ BŁĘDU 10001)
+            # WERYFIKACJA PŁYNNOŚCI I SPREADU RYNKU USDC
             usdc_ok, usdc_status = check_usdc_market_dependencies()
 
             start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
@@ -1675,6 +1752,7 @@ def bot_loop():
                 report_hourly_costs(total_equity)
 
             sync_positions_from_bybit()
+            auto_liquidate_stables_to_btc()  # Ciągła ochrona przed pojawieniem się USDT/EURC
 
             if can_buy and is_btc_market_healthy() and usdc_ok:
                 run_support_bounce_strategy()          # Poziom 0 (Dno sinusoidy + potwierdzenie)
@@ -1697,7 +1775,7 @@ def bot_loop():
                     logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam pompy i memecoiny.")
             else:
                 if not can_buy:
-                    logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna w trybie BEARISH: przekroczono trailing limit 15 USD od szczytu lub odnotowano 3 straty z rzędu. Czekam na odbicie BTC lub nowy dzień.")
+                    logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna: przekroczono globalny trailing limit 15 USD od szczytu lub odnotowano serię porażek. Wstrzymuję zakupy do 00:00 UTC lub silnego rajdu BTC.")
                 elif not usdc_ok:
                     logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Filtr płynności USDC aktywny ({usdc_status}). Ochrona przed poślizgiem lub zrzutem.")
                 else:
