@@ -44,10 +44,10 @@ STANDARD_MIN_ORDER_VALUE = 100.0
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
 
-# --- TWARDE BEZPIECZNIKI PORTFELA (TYLKO DLA RYNKU BEARISH) ---
-MAX_DAILY_EQUITY_DROP_USD = 15.0  # Bezwzględny limit w bessie: spadek salda konta o 15 USD = STOP
-MAX_CONSECUTIVE_LOSSES = 3        # 3 błędne decyzje pod rząd w bessie = STOP
-LOSS_COOLDOWN_HOURS = 12          # Czas blokady zakupów po 3 stratach w bessie (w godzinach)
+# --- TWARDE BEZPIECZNIKI PORTFELA (TRAILING DRAWDOWN W B戸SSIE) ---
+MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od MAKSYMALNEGO salda dnia = STOP zakupów
+MAX_CONSECUTIVE_LOSSES = 3           # 3 błędne decyzje pod rząd w bessie = STOP zakupów
+LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach w bessie (w godzinach)
 
 # ==============================================================================
 # ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA
@@ -180,7 +180,7 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     logging.info(f"📊 [BILANS ZAPISANY (NETTO)] {symbol} | Wynik po fee: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Ilość: {qty} | Powód: {reason}")
 
 def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
-    """Weryfikuje realny spadek salda oraz limit 3 strat z rzędu TYLKO w trybie BEARISH."""
+    """Weryfikuje kroczący spadek salda (Trailing Drawdown) oraz limit 3 strat w trybie BEARISH."""
     global trade_history
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now_ts = time.time()
@@ -188,27 +188,38 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
     if "equity_baseline" not in trade_history:
         trade_history["equity_baseline"] = {}
 
-    if trade_history["equity_baseline"].get("date") != today_str:
-        trade_history["equity_baseline"] = {
-            "date": today_str,
-            "starting_equity": current_total_equity
-        }
-        save_trade_history(trade_history)
-        logging.info(f"🌅 [NOWY DZIEŃ UTC] Ustalono kapitał bazowy dla dnia {today_str}: {current_total_equity:.2f} USD")
+    baseline = trade_history["equity_baseline"]
 
-    starting_equity = safe_float(trade_history["equity_baseline"].get("starting_equity"), current_total_equity)
-    real_equity_drop = starting_equity - current_total_equity
+    # Reset parametrów o północy UTC
+    if baseline.get("date") != today_str:
+        baseline["date"] = today_str
+        baseline["starting_equity"] = current_total_equity
+        baseline["peak_equity"] = current_total_equity
+        save_trade_history(trade_history)
+        logging.info(f"🌅 [NOWY DZIEŃ UTC] Ustalono kapitał bazowy i szczytowy dla dnia {today_str}: {current_total_equity:.2f} USD")
+
+    # Aktualizacja szczytu dnia (Trailing Up)
+    starting_equity = safe_float(baseline.get("starting_equity"), current_total_equity)
+    prev_peak = safe_float(baseline.get("peak_equity"), starting_equity)
+    peak_equity = max(prev_peak, current_total_equity)
+
+    if peak_equity > prev_peak:
+        baseline["peak_equity"] = peak_equity
+        save_trade_history(trade_history)
+        logging.info(f"🚀 [NOWY SZCZYT DNIA] Szczyt kapitału przesunięty w górę: {peak_equity:.2f} USD (Trailing Lock: {(peak_equity - MAX_TRAILING_EQUITY_DROP_USD):.2f} USD)")
+
+    drop_from_peak = peak_equity - current_total_equity
 
     # Bezpieczniki działają wyłącznie w trybie bessy
     if "BEARISH" not in current_sentiment:
-        return True
+        return True, drop_from_peak, peak_equity
 
-    # 1. Twardy wyłącznik salda konta Bybit o 15 USDC
-    if real_equity_drop >= MAX_DAILY_EQUITY_DROP_USD:
-        logging.warning(f"🛑 [TWARDY WYŁĄCZNIK SALDA] Kapitał spadł o {real_equity_drop:.2f} USD od początku dnia. Rynek BEARISH! Zakupy zablokowane do 00:00 UTC.")
-        return False
+    # 1. TWARDY WYŁĄCZNIK: Kroczący spadek o 15 USDC od szczytu dnia
+    if drop_from_peak >= MAX_TRAILING_EQUITY_DROP_USD:
+        logging.warning(f"🛑 [TRAILING CIRCUIT BREAKER] Kapitał spadł o {drop_from_peak:.2f} USD od dzisiejszego szczytu ({peak_equity:.2f} USD)! Limit: {MAX_TRAILING_EQUITY_DROP_USD:.2f} USD. Zakupy zablokowane w trybie BEARISH do 00:00 UTC.")
+        return False, drop_from_peak, peak_equity
 
-    # 2. Bezpiecznik 3 strat z rzędu
+    # 2. BEZPIECZNIK: 3 straty z rzędu
     cooldown_until = safe_float(trade_history.get("cooldown_until", 0))
     consecutive_losses = trade_history.get("consecutive_losses", 0)
 
@@ -218,9 +229,9 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
             logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Wstrzymuję zakupy w trybie BEARISH po serii porażek. Pozostało: {rem_minutes} min.")
         else:
             logging.warning(f"⏳ [BLOKADA: 3 STRATY Z RZĘDU] Zanotowano {consecutive_losses} porażek w trybie BEARISH. Zakupy zablokowane.")
-        return False
+        return False, drop_from_peak, peak_equity
 
-    return True
+    return True, drop_from_peak, peak_equity
 
 # ==============================================================================
 # ELASTYCZNE ZARZĄDZANIE BUDŻETEM ZAKUPU
@@ -587,12 +598,13 @@ def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
         
     try:
         df_btc = get_market_data("BTCUSDC", interval="15", limit=3)
-        if df_btc is not None and len(df_btc) > 1:
-            c15 = df_btc.iloc[-1]
-            change_15m = (c15['close'] - c15['open']) / c15['open']
-            if change_15m <= -0.002:
-                logging.warning(f"⚠️ [BTC 15M GUARD] Spadek BTC 15M ({change_15m*100:.2f}%). Zakaz zakupów!")
-                return False
+        if df_btc is None or len(df_btc) <= 1:
+            return True
+        c15 = df_btc.iloc[-1]
+        change_15m = (c15['close'] - c15['open']) / c15['open']
+        if change_15m <= -0.002:
+            logging.warning(f"⚠️ [BTC 15M GUARD] Spadek BTC 15M ({change_15m*100:.2f}%). Zakaz zakupów!")
+            return False
     except Exception:
         pass
 
@@ -1424,16 +1436,19 @@ def bot_loop():
             total_sign = "+" if total_realized >= 0 else ""
 
             consec_losses = trade_history.get("consecutive_losses", 0)
+
+            # WERYFIKACJA TRAILING DRAWDOWN & CIRCUIT BREAKERA
+            can_buy, drop_from_peak, peak_eq = check_and_update_circuit_breakers(total_equity, current_sentiment)
+
             start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
             real_day_diff = total_equity - start_eq
             diff_sign = "+" if real_day_diff >= 0 else ""
 
             logging.info(f"📈 [BILANS HANDLOWY] Dziś (Netto): {today_sign}{today_stats['pnl_usd']:.2f} USD ({today_stats['trades']} transakcji) | Zmiana Salda Bybit: {diff_sign}{real_day_diff:.2f} USD | Strat z rzędu: {consec_losses}/3")
+            logging.info(f"🛡️ [TRAILING DRAWDOWN] Szczyt dnia: {peak_eq:.2f} USD | Spadek od szczytu: -{drop_from_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f} USD | Poziom blokady: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f} USD")
             logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
 
             sync_positions_from_bybit()
-
-            can_buy = check_and_update_circuit_breakers(total_equity, current_sentiment)
 
             if can_buy and is_btc_market_healthy():
                 run_support_bounce_strategy()          # Poziom 0 (Dno sinusoidy + potwierdzenie)
@@ -1456,7 +1471,7 @@ def bot_loop():
                     logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam pompy i memecoiny.")
             else:
                 if not can_buy:
-                    logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna w trybie BEARISH: przekroczono limit dziennego spadku 15 USD lub odnotowano 3 straty z rzędu.")
+                    logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna w trybie BEARISH: przekroczono trailing limit 15 USD od szczytu lub odnotowano 3 straty z rzędu.")
                 else:
                     logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard. Czekam na uspokojenie rynków.")
 
