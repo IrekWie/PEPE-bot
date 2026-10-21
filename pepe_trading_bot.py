@@ -35,7 +35,7 @@ QUOTE_COIN = "USDC"
 
 # --- USTAWIENIA SKANOWANIA I PŁYNNOŚCI ---
 TOP_MARKETS_COUNT = 150
-MIN_24H_TURNOVER_USDC = 150000.0     # Odrzucamy wszystkie shitcoiny o obrocie < 150k USD dziennie
+MIN_24H_TURNOVER_USDC = 150000.0     # Odrzucanie niepłynnych monet (obrót < 150k USD dziennie)
 TOP_DIPS_COUNT = 6
 TOP_GAINERS_COUNT = 4
 MAX_PUMP_POSITIONS = 3
@@ -46,13 +46,13 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 # --- LIMITY FINANSOWE I REZERWY ---
-STANDARD_MIN_ORDER_VALUE = 65.0      # Obniżone ze 100 USD, by nie zablokować konta przy wielu pozycjach
+STANDARD_MIN_ORDER_VALUE = 65.0      # Zoptymalizowana wielkość pojedynczego wejścia
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.20          # 20% kapitału ZAWSZE musi leżeć w gotówce na sytuacje awaryjne
+MIN_CASH_RESERVE_PCT = 0.20          # 20% kapitału ZAWSZE leży w wolnym USDC
 
 # --- BEZWZGLĘDNE BEZPIECZNIKI PORTFELA (GLOBALNY TRAILING DRAWDOWN) ---
-MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od MAKSYMALNEGO salda dnia = BEZWZGLĘDNY STOP ZAKUPÓW
+MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od MAKSYMALNEGO salda dnia = STOP ZAKUPÓW
 MAX_CONSECUTIVE_LOSSES = 3           # 3 błędne decyzje pod rząd = STOP ZAKUPÓW
 LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach (w godzinach)
 BTC_SURGE_UNLOCK_PCT = 0.015         # +1.5% wzrostu BTC w 2h zwalnia blokadę zakupów
@@ -61,9 +61,9 @@ USDC_MAX_SPREAD_PCT = 0.0008         # Max spread na BTCUSDC: 0.080%
 USDC_1M_DUMP_THRESHOLD = -0.003      # Szybki zrzut BTCUSDC na 1M (-0.3%) blokuje zakupy
 
 # ==============================================================================
-# ZMIENNE GLOBALNE I CACHE
+# ZMIENNE GLOBALNE I DYNAMICZNE RYZYKO
 # ==============================================================================
-MAX_TOTAL_POSITIONS = 6              # Obniżone z 10, by zachować większą kontrolę i wolną gotówkę
+MAX_TOTAL_POSITIONS = 6              # Bezpieczny limit jednoczesnych pozycji
 MAX_EMA_CROSS_POSITIONS = 3
 SENTIMENT_STATE = "NEUTRAL"
 ETH_SENTIMENT_STATE = "NEUTRAL"
@@ -103,8 +103,9 @@ logging.basicConfig(
 
 _original_time = time.time
 
-# CACHE ŚWIEC (Czyszczony co cykl)
+# CACHE ŚWIEC 15M (Czyszczony na początku każdego cyklu skanowania)
 kline_cache_15m = {}
+kline_cache_lock = threading.Lock()
 
 def safe_float(val, default=0.0):
     try:
@@ -155,9 +156,8 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
     global trade_history
     with lock_history:
         raw_pnl_usd = (sell_price - buy_price) * qty
-        
         fee_buy = (buy_price * qty) * 0.001
-        fee_sell = (sell_price * qty) * (0.001 if not is_maker else 0.001)
+        fee_sell = (sell_price * qty) * (0.0006 if is_maker else 0.001)
         estimated_fee = fee_buy + fee_sell
         
         pnl_usd = round(raw_pnl_usd - estimated_fee, 2)
@@ -220,8 +220,56 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
 
         save_trade_history(trade_history)
         sign = "+" if pnl_usd >= 0 else ""
-        ord_type = "LIMIT (MAKER)" if is_maker else "MARKET (TAKER)"
+        ord_type = "LIMIT (POST-ONLY)" if is_maker else "MARKET"
         logging.info(f"📊 [BILANS ({ord_type})] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Fee: -{estimated_fee:.2f}$ | Powód: {reason}")
+
+# ==============================================================================
+# MODUŁ GODZINOWEJ ANALIZY KOSZTÓW I PROWIZJI
+# ==============================================================================
+last_hourly_cost_report = 0.0
+
+def report_hourly_costs(total_equity):
+    """Generuje co godzinę raport prowizji giełdowych, obrotu i kosztów handlu."""
+    global last_hourly_cost_report, trade_history
+    now_ts = time.time()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with lock_history:
+        trades_log = trade_history.get("trades_log", [])
+        one_hour_ago = now_ts - 3600
+
+        recent_trades = [t for t in trades_log if t.get("timestamp", 0) >= one_hour_ago]
+
+        h_trades_count = len(recent_trades)
+        h_turnover = sum(t.get("turnover", 0.0) for t in recent_trades)
+        h_fees = sum(t.get("fee", 0.0) for t in recent_trades)
+        h_gross = sum(t.get("gross_pnl", 0.0) for t in recent_trades)
+        h_net = sum(t.get("net_pnl", 0.0) for t in recent_trades)
+
+        today_stats = trade_history.get("daily", {}).get(today_str, {})
+        d_fees = today_stats.get("total_fees", 0.0)
+        d_turnover = today_stats.get("total_turnover", 0.0)
+        d_trades = today_stats.get("trades", 0)
+        avg_fee_per_trade = (d_fees / d_trades) if d_trades > 0 else 0.0
+        fee_drag_pct = ((d_fees / total_equity) * 100) if total_equity > 0 else 0.0
+
+    sign_gross = "+" if h_gross >= 0 else ""
+    sign_net = "+" if h_net >= 0 else ""
+
+    logging.info("================================================================================")
+    logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
+    logging.info("--------------------------------------------------------------------------------")
+    logging.info(f"⏱️ Ostatnie 60 minut:")
+    logging.info(f"   • Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f} USD")
+    logging.info(f"   • Prowizje Bybit: -{h_fees:.2f} USD")
+    logging.info(f"   • Wynik Brutto: {sign_gross}{h_gross:.2f} USD | Wynik Netto: {sign_net}{h_net:.2f} USD")
+    logging.info(f"📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
+    logging.info(f"   • Suma prowizji oddanych giełdzie: -{d_fees:.2f} USD ({fee_drag_pct:.2f}% wartości konta)")
+    logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
+    logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
+    logging.info("================================================================================")
+
+    last_hourly_cost_report = now_ts
 
 # ==============================================================================
 # MODUŁ ZALEŻNOŚCI I PŁYNNOŚCI RYNKU USDC
@@ -313,20 +361,23 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
         is_blocked_by_drop = drop_from_peak >= MAX_TRAILING_EQUITY_DROP_USD
         is_blocked_by_losses = (consecutive_losses >= MAX_CONSECUTIVE_LOSSES) or (now_ts < cooldown_until)
 
+        # Globalne odblokowanie przy potężnym wzroście Bitcoina
         if is_blocked_by_drop or is_blocked_by_losses:
             btc_surging, btc_gain = check_btc_significant_surge()
             if btc_surging:
-                logging.info(f"🚀⚡ [BTC SURGE UNLOCK] Bitcoin rośnie (+{btc_gain*100:.2f}% w 2h)! Znoszę blokadę zakupów i resetuję szczyt.")
+                logging.info(f"🚀⚡ [BTC SURGE UNLOCK] Bitcoin silnie rośnie (+{btc_gain*100:.2f}% w 2h)! Znoszę blokadę zakupów i resetuję szczyt.")
                 trade_history["cooldown_until"] = 0
                 trade_history["consecutive_losses"] = 0
                 baseline["peak_equity"] = current_total_equity
                 save_trade_history(trade_history)
                 return True, 0.0, current_total_equity
 
+        # TWARDY WYŁĄCZNIK: Spadek o 15 USD od szczytu (GLOBALNY - CHRONI W KAŻDYM REŻIMIE)
         if is_blocked_by_drop:
-            logging.warning(f"🛑 [TRAILING BREAKER] Kapitał spadł o {drop_from_peak:.2f}$ od szczytu {peak_equity:.2f}$. Zakupy ZABLOKOWANE.")
+            logging.warning(f"🛑 [TRAILING BREAKER] Kapitał spadł o {drop_from_peak:.2f}$ od szczytu ({peak_equity:.2f}$). Zakupy BEZWZGLĘDNIE ZABLOKOWANE.")
             return False, drop_from_peak, peak_equity
 
+        # TWARDY BEZPIECZNIK: 3 straty z rzędu (GLOBALNY)
         if is_blocked_by_losses:
             if now_ts < cooldown_until:
                 rem_minutes = int((cooldown_until - now_ts) / 60)
@@ -348,7 +399,7 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     if (free_usdc - effective_target) < reserve_required:
         available = math.floor((free_usdc - reserve_required) * 0.995 * 100) / 100.0
         if available >= MIN_EXCHANGE_NOTIONAL:
-            return available, f"Zredukowane ({available:.2f}$) by zachować rezerwę"
+            return available, f"Zredukowane ({available:.2f}$) by zachować 20% rezerwy"
         return 0.0, f"Brak gotówki (Chronię {MIN_CASH_RESERVE_PCT*100:.0f}% rezerwy)"
 
     if free_usdc >= effective_target:
@@ -358,7 +409,7 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     return 0.0, "Brak środków"
 
 # ==============================================================================
-# INICJALIZACJA PUNKTU KOŃCOWEGO
+# INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT
 # ==============================================================================
 endpoints_to_test = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
 session = None
@@ -468,7 +519,7 @@ def get_coin_available_balance(coin_name):
     return 0.0
 
 # ==============================================================================
-# NOWOŚĆ: FILTR PŁYNNOŚCI (TURNOVER24H) 
+# FILTRY PŁYNNOŚCI (TURNOVER 24H)
 # ==============================================================================
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
@@ -481,7 +532,9 @@ def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
         ]
         if valid:
             valid.sort(key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
-            return [t["symbol"] for t in valid[:limit_count]]
+            res = [t["symbol"] for t in valid[:limit_count]]
+            if "PEPEUSDC" not in res: res.append("PEPEUSDC")
+            return res
     except Exception:
         pass
     return []
@@ -601,24 +654,163 @@ def get_market_data_no_cache(symbol, interval="15", limit=250):
         return None
 
 def get_market_data(symbol, interval="15", limit=250):
-    """Zwraca dane z cache 15M dla danego cyklu, zapobiegając spamowaniu API."""
     global kline_cache_15m
-    if interval == "15" and symbol in kline_cache_15m:
-        return kline_cache_15m[symbol]
+    with kline_cache_lock:
+        if interval == "15" and symbol in kline_cache_15m:
+            return kline_cache_15m[symbol]
     
     df = get_market_data_no_cache(symbol, interval, limit)
     if interval == "15" and df is not None:
-        kline_cache_15m[symbol] = df
+        with kline_cache_lock:
+            kline_cache_15m[symbol] = df
     return df
 
 # ==============================================================================
-# STRATEGIE HANDLOWE
+# FILTRY MAKROEKONOMICZNE BTC + ETH + ROTACJA ETH/BTC
+# ==============================================================================
+def update_market_sentiment():
+    global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, SAFE_RISK_PCT, MODERATE_RISK_PCT, HIGH_RISK_PCT
+    global SENTIMENT_STATE, ETH_SENTIMENT_STATE, ALTCOIN_FLOW_STATE
+    try:
+        df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
+        df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
+
+        if df_btc is None or len(df_btc) < 50:
+            SENTIMENT_STATE = "NEUTRAL"
+            return "NEUTRAL (Brak danych BTC)"
+
+        btc_candle = df_btc.iloc[-1]
+        btc_close = btc_candle['close']
+        btc_ema21 = btc_candle['ema21']
+        btc_ema50 = btc_candle['ema50']
+        btc_ema89 = btc_candle['ema89']
+
+        if btc_close > btc_ema50 and btc_ema21 > btc_ema50:
+            btc_sentiment = "BULLISH"
+        elif btc_close < btc_ema89 or btc_ema21 < btc_ema89:
+            btc_sentiment = "BEARISH"
+        else:
+            btc_sentiment = "NEUTRAL"
+
+        eth_sentiment = "NEUTRAL"
+        alt_flow = "NEUTRAL"
+
+        if df_eth is not None and len(df_eth) >= 50:
+            eth_candle = df_eth.iloc[-1]
+            eth_close = eth_candle['close']
+            eth_ema21 = eth_candle['ema21']
+            eth_ema50 = eth_candle['ema50']
+            eth_ema89 = eth_candle['ema89']
+
+            if eth_close > eth_ema50 and eth_ema21 > eth_ema50:
+                eth_sentiment = "BULLISH 🟢"
+            elif eth_close < eth_ema89 or eth_ema21 < eth_ema89:
+                eth_sentiment = "BEARISH 🔴"
+            else:
+                eth_sentiment = "NEUTRAL 🟡"
+
+            min_len = min(len(df_btc), len(df_eth))
+            btc_series = df_btc['close'].iloc[-min_len:].reset_index(drop=True)
+            eth_series = df_eth['close'].iloc[-min_len:].reset_index(drop=True)
+            eth_btc_ratio = eth_series / btc_series
+            ratio_ema21 = eth_btc_ratio.ewm(span=21, adjust=False).mean()
+
+            if eth_btc_ratio.iloc[-1] > ratio_ema21.iloc[-1]:
+                alt_flow = "ALT_FLOW 🟢 (Kapitał w altach)"
+            else:
+                alt_flow = "ALT_PRESSURE 🔴 (Dominacja Bitcoina)"
+
+        ETH_SENTIMENT_STATE = eth_sentiment
+        ALTCOIN_FLOW_STATE = alt_flow
+
+        if btc_sentiment == "BULLISH":
+            SENTIMENT_STATE = "BULLISH"
+            MAX_TOTAL_POSITIONS = 6  # Zoptymalizowano do 6 pozycji
+            MAX_EMA_CROSS_POSITIONS = 3
+            SAFE_RISK_PCT = 0.15
+            MODERATE_RISK_PCT = 0.10
+            HIGH_RISK_PCT = 0.07
+            sentiment_label = "BULLISH 🟢 (Pełna Hossa)"
+
+        elif btc_sentiment == "BEARISH":
+            SENTIMENT_STATE = "BEARISH"
+            btc_is_rebounding = False
+            try:
+                df_btc_1h = get_market_data_no_cache("BTCUSDC", interval="60", limit=10)
+                if df_btc_1h is not None and len(df_btc_1h) >= 4:
+                    c_now = df_btc_1h.iloc[-1]['close']
+                    open_2h = df_btc_1h.iloc[-3]['open']
+                    ema21_1h = df_btc_1h.iloc[-1]['ema21']
+                    growth_2h = (c_now - open_2h) / open_2h
+                    if c_now > ema21_1h and growth_2h >= 0.003:
+                        btc_is_rebounding = True
+            except Exception: pass
+
+            if btc_is_rebounding:
+                sentiment_label = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
+                MAX_TOTAL_POSITIONS = 4
+            else:
+                sentiment_label = "BEARISH 🔴 (Ścisła Defensywa)"
+                MAX_TOTAL_POSITIONS = 3
+
+            MAX_EMA_CROSS_POSITIONS = 0
+            SAFE_RISK_PCT = 0.12      
+            MODERATE_RISK_PCT = 0.0   
+            HIGH_RISK_PCT = 0.0       
+
+        else:
+            SENTIMENT_STATE = "NEUTRAL"
+            sentiment_label = "NEUTRAL 🟡 (Rynek Boczny)"
+            MAX_TOTAL_POSITIONS = 5
+            MAX_EMA_CROSS_POSITIONS = 2
+            SAFE_RISK_PCT = 0.14
+            MODERATE_RISK_PCT = 0.08
+            HIGH_RISK_PCT = 0.0       
+        
+        logging.info(f"📊 [MAKRO BTC+ETH] BTC 4H: {sentiment_label} | ETH 4H: {eth_sentiment} | Rotacja: {alt_flow} | Max Pozycji: {MAX_TOTAL_POSITIONS}")
+        return sentiment_label
+
+    except Exception as e:
+        logging.error(f"Błąd sentymentu: {e}")
+        SENTIMENT_STATE = "NEUTRAL"
+        return "UNKNOWN"
+
+def get_btc_realtime_metrics():
+    try:
+        df_btc = get_market_data_no_cache("BTCUSDC", interval="5", limit=6)
+        if df_btc is None or len(df_btc) < 4: return 0.0, 0.0
+        c = df_btc.iloc[-1]
+        candle_change = (c['close'] - c['open']) / c['open']
+        recent_15m_high = df_btc['high'].iloc[-3:].max()
+        drop_from_recent_high = (c['close'] - recent_15m_high) / recent_15m_high
+        return candle_change, drop_from_recent_high
+    except Exception:
+        return 0.0, 0.0
+
+def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
+    candle_change, drop_from_high = get_btc_realtime_metrics()
+    if candle_change <= drop_threshold or drop_from_high <= drop_threshold:
+        logging.warning(f"⚠️ [BTC RAPID GUARD] Spadek BTC 5M: {candle_change*100:.2f}%. Wstrzymuję zakupy.")
+        return False
+    try:
+        df_btc = get_market_data_no_cache("BTCUSDC", interval="15", limit=3)
+        if df_btc is not None and len(df_btc) > 1:
+            c15 = df_btc.iloc[-1]
+            if (c15['close'] - c15['open']) / c15['open'] <= -0.002:
+                logging.warning(f"⚠️ [BTC 15M GUARD] Spadek BTC 15M. Zakaz zakupów!")
+                return False
+    except Exception: pass
+    return True
+
+# ==============================================================================
+# PEŁNA PALETA 10 STRATEGII HANDLOWYCH (POZIOMY 0 DO 9)
 # ==============================================================================
 def run_support_bounce_strategy(top_symbols):
     global active_positions
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 0: DNO SINUSOIDY] CONFIRMED BOLLINGER / SUPPORT BOUNCE (15M) ===")
     if order_val <= 0: return
 
     for symbol in top_symbols:
@@ -627,26 +819,29 @@ def run_support_bounce_strategy(top_symbols):
         try:
             df = get_market_data(symbol, interval="15", limit=120)
             if df is None or len(df) < 60: continue
-            
             c_prev = df.iloc[-2]
             c_curr = df.iloc[-1]
-            
+
             if (c_prev['low'] <= c_prev['bb_lower'] * 1.002 or c_prev['rsi'] <= 35.0):
                 body = abs(c_prev['close'] - c_prev['open'])
                 wick = min(c_prev['open'], c_prev['close']) - c_prev['low']
                 reversal = (c_prev['close'] > c_prev['open']) or (wick >= body * 1.5)
                 vol_ok = c_prev['volume'] >= (c_prev['vol_ma20'] * 0.85)
                 upside = (c_curr['close'] < c_prev['ema200']) or (c_curr['close'] < c_prev['bb_mid'])
-                
+
                 if reversal and vol_ok and upside and c_curr['close'] >= c_prev['low']:
                     res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
                     if res.get("retCode") == 0:
                         step, minq = get_symbol_lot_filter(symbol)
                         qty_str = format_qty_with_step(order_val / c_curr['close'], step, minq)
                         with lock_pos:
-                            active_positions[symbol] = {"strategy": "SUPPORT_BOUNCE", "buy_price": c_curr['close'], "peak_price": c_curr['close'], "qty": qty_str or "1", "sold_half": False, "structural_sl": round(c_prev['low'] * 0.996, 6)}
+                            active_positions[symbol] = {
+                                "strategy": "SUPPORT_BOUNCE", "buy_price": c_curr['close'], 
+                                "peak_price": c_curr['close'], "qty": qty_str or "1", 
+                                "sold_half": False, "structural_sl": round(c_prev['low'] * 0.996, 6)
+                            }
                             save_positions(active_positions)
-                        logging.info(f"🎯 [KUPNO] {symbol} (Dno Sinusoidy) | Z: {order_val}$")
+                        logging.info(f"🎯 [KUPNO] {symbol} (Dno Sinusoidy) | Kwota: {order_val:.2f}$ ({risk_label})")
                         break
         except Exception: pass
 
@@ -655,10 +850,11 @@ def run_mtf_alignment_strategy(top_symbols):
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 1: NAJBEZPIECZNIEJSZA] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
     if order_val <= 0: return
 
     for symbol in top_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
         try:
             df_4h = get_market_data_no_cache(symbol, interval="240", limit=60)
@@ -677,7 +873,7 @@ def run_mtf_alignment_strategy(top_symbols):
                     with lock_pos:
                         active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": qty_str or "1", "sold_half": False}
                         save_positions(active_positions)
-                    logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Z: {order_val}$")
+                    logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Kwota: {order_val:.2f}$ ({risk_label})")
                     break
         except Exception: pass
 
@@ -686,25 +882,26 @@ def scan_top150_for_ema_signals(top_symbols):
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 2: BARDZO BEZPIECZNA] EMA TREND SCANNER ===")
     if order_val <= 0: return
 
     for symbol in top_symbols:
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
         try:
             df = get_market_data(symbol, interval="15", limit=120)
             if df is None: continue
-            c_prev = df.iloc[-2]
-            if c_prev['ema21'] > c_prev['ema89'] and (c_prev['low'] <= max(c_prev['ema21'], c_prev['ema89'])) and (c_prev['low'] >= min(c_prev['ema21'], c_prev['ema89'])):
-                if c_prev['close'] > c_prev['open'] and 40 <= c_prev['rsi'] <= 65 and c_prev['volume'] >= c_prev['vol_ma20']:
+            c = df.iloc[-2]
+            if c['ema21'] > c['ema89'] and (c['low'] <= max(c['ema21'], c['ema89'])) and (c['low'] >= min(c['ema21'], c['ema89'])):
+                if c['close'] > c['open'] and 40 <= c['rsi'] <= 65 and c['volume'] >= c['vol_ma20']:
                     res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
                     if res.get("retCode") == 0:
                         step, minq = get_symbol_lot_filter(symbol)
-                        q_str = format_qty_with_step(order_val / c_prev['close'], step, minq)
+                        q_str = format_qty_with_step(order_val / c['close'], step, minq)
                         with lock_pos:
-                            active_positions[symbol] = {"strategy": "EMA_SCAN", "buy_price": c_prev['close'], "peak_price": c_prev['close'], "qty": q_str or "1", "sold_half": False}
+                            active_positions[symbol] = {"strategy": "EMA_SCAN", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
                             save_positions(active_positions)
-                        logging.info(f"🔥 [KUPNO] {symbol} (EMA Scan) | Z: {order_val}$")
+                        logging.info(f"🔥 [KUPNO] {symbol} (EMA Scan) | Kwota: {order_val:.2f}$ ({risk_label})")
                         break
         except Exception: pass
 
@@ -713,10 +910,11 @@ def run_top_gainers_strategy():
     if len(active_positions) >= MAX_TOTAL_POSITIONS: return
     total_equity, free_usdc = get_balances()
     order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
+    logging.info("=== [POZ 3: UMIARKOWANIE BEZPIECZNA] TOP GAINERS PULLBACK ===")
     if order_val <= 0: return
 
     for symbol in get_top_gainers_symbols():
-        if symbol in active_positions: continue
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         try:
             df = get_market_data(symbol, interval="15", limit=120)
             if df is None: continue
@@ -729,22 +927,200 @@ def run_top_gainers_strategy():
                     with lock_pos:
                         active_positions[symbol] = {"strategy": "TOP_GAINER", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
                         save_positions(active_positions)
-                    logging.info(f"🚀 [KUPNO] {symbol} (Gainer Pullback) | Z: {order_val}$")
+                    logging.info(f"🚀 [KUPNO] {symbol} (Gainer Pullback) | Kwota: {order_val:.2f}$ ({risk_label})")
                     break
         except Exception: pass
 
+def run_relative_strength_strategy(top_symbols):
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 4: BEZPIECZNA / OBRONNA] RELATIVE STRENGTH VS BTC ===")
+    if order_val <= 0: return
+
+    try:
+        df_btc = get_market_data("BTCUSDC", interval="15", limit=10)
+        if df_btc is None or len(df_btc) < 6: return
+        btc_change = (df_btc.iloc[-2]['close'] - df_btc.iloc[-5]['open']) / df_btc.iloc[-5]['open']
+        if not (-0.015 <= btc_change <= -0.003): return
+
+        for symbol in top_symbols:
+            if symbol in active_positions or symbol == "BTCUSDC" or symbol in STABLE_PAIRS_BLACKLIST: continue
+            if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+            try:
+                df_alt = get_market_data(symbol, interval="15", limit=60)
+                if df_alt is None or len(df_alt) < 40: continue
+                c_now = df_alt.iloc[-2]
+                alt_change = (c_now['close'] - df_alt.iloc[-5]['open']) / df_alt.iloc[-5]['open']
+                if alt_change >= 0.010 and c_now['close'] > c_now['ema21'] and c_now['volume'] >= (c_now['vol_ma20'] * 1.3):
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                    if res.get("retCode") == 0:
+                        step, minq = get_symbol_lot_filter(symbol)
+                        q_str = format_qty_with_step(order_val / c_now['close'], step, minq)
+                        with lock_pos:
+                            active_positions[symbol] = {"strategy": "RELATIVE_STRENGTH", "buy_price": c_now['close'], "peak_price": c_now['close'], "qty": q_str or "1", "sold_half": False}
+                            save_positions(active_positions)
+                        logging.info(f"🛡️ [KUPNO] {symbol} (RS vs BTC) | Kwota: {order_val:.2f}$ ({risk_label})")
+                        break
+            except Exception: pass
+    except Exception: pass
+
+def run_bb_squeeze_strategy(top_symbols):
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
+    logging.info("=== [POZ 5: ŚREDNIE RYZYKO] BOLLINGER BANDS SQUEEZE ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=60)
+            if df is None or len(df) < 40: continue
+            c = df.iloc[-2]
+            recent_widths = df['bb_width'].iloc[-20:-2]
+            avg_width = df['bb_width'].iloc[-40:-2].mean()
+            if recent_widths.min() <= (avg_width * 0.70) and c['close'] > c['bb_upper'] and c['close'] > c['open'] and c['volume'] >= (c['vol_ma20'] * 2.5):
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "BB_SQUEEZE", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"💥 [KUPNO] {symbol} (BB Squeeze) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
+def run_ema21_89_pure_crossover_strategy(top_symbols):
+    global active_positions
+    cross_cnt = sum(1 for p in active_positions.values() if p.get("strategy") == "EMA21_89_CROSS")
+    if cross_cnt >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
+    logging.info("=== [POZ 6: ŚREDNIO-WYŻSZE RYZYKO] CZYSTY CROSS EMA 21/89 ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=120)
+            if df is None or len(df) < 95: continue
+            c = df.iloc[-2]
+            p = df.iloc[-3]
+            if (p['ema21'] <= p['ema89']) and (c['ema21'] > c['ema89']) and ((c['ema21'] - c['ema89']) / c['ema89'] >= EMA_CROSS_MIN_SPREAD_PCT):
+                if c['close'] > c['ema21'] and c['close'] > c['open'] and c['volume'] >= (c['vol_ma20'] * EMA_CROSS_VOL_MULTIPLIER):
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                    if res.get("retCode") == 0:
+                        step, minq = get_symbol_lot_filter(symbol)
+                        q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                        with lock_pos:
+                            active_positions[symbol] = {"strategy": "EMA21_89_CROSS", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                            save_positions(active_positions)
+                        logging.info(f"⚡ [KUPNO] {symbol} (Złoty Krzyż EMA 21/89) | Kwota: {order_val:.2f}$ ({risk_label})")
+                        break
+        except Exception: pass
+
+def run_dip_hunter_strategy():
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
+    logging.info("=== [POZ 7: WYŻSZE RYZYKO] REAL-TIME DIP HUNTER (5M) ===")
+    if order_val <= 0: return
+
+    for symbol in get_top_losers_symbols(limit_count=6):
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        try:
+            df = get_market_data_no_cache(symbol, interval="5", limit=30)
+            if df is None or len(df) < 25: continue
+            c = df.iloc[-1]
+            body = abs(c['close'] - c['open'])
+            wick = min(c['open'], c['close']) - c['low']
+            if wick > (body * 2.0) and c['volume'] >= (c['vol_ma20'] * DIP_VOL_MULTIPLIER) and c['rsi'] <= DIP_RSI_5M_MAX:
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "DIP_HUNTER_5M", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"🔥 [KUPNO] {symbol} (Dip Hunter 5M) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
+def scan_for_pumps(top_symbols):
+    global active_positions
+    pumps_cnt = sum(1 for p in active_positions.values() if p.get("strategy") == "PUMP_HUNTER")
+    if pumps_cnt >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
+    logging.info("=== [POZ 8: WYSOKIE RYZYKO] MOMENTUM PUMP HUNTER ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=25)
+            if df is None: continue
+            c = df.iloc[-2]
+            if (c['close'] - c['open']) / c['open'] >= PUMP_PRICE_CHANGE_PCT and c['volume'] >= (c['vol_ma20'] * PUMP_VOL_MULTIPLIER) and 45 <= c['rsi'] <= 75:
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "PUMP_HUNTER", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"🚀 [KUPNO] {symbol} (Pump Hunter) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
+def scan_pepe_specialist():
+    global active_positions
+    sym = "PEPEUSDC"
+    if sym in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
+    logging.info("=== [POZ 9: NAJBARDZIEJ RYZYKOWNA / MEME] PEPE EMA SPECIALIST ===")
+    if order_val <= 0: return
+
+    try:
+        df = get_market_data(sym, interval="15", limit=250)
+        if df is None or len(df) < 200: return
+        c = df.iloc[-2]
+        macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
+        ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
+        if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
+            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            if res.get("retCode") == 0:
+                step, minq = get_symbol_lot_filter(sym)
+                q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                with lock_pos:
+                    active_positions[sym] = {"strategy": "PEPE_SPECIALIST", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                    save_positions(active_positions)
+                logging.info(f"🐸 [KUPNO] PEPEUSDC (Odbicie EMA 21) | Kwota: {order_val:.2f}$ ({risk_label})")
+    except Exception: pass
+
 # ==============================================================================
-# SZYBKI WĄTEK MONITOROWANIA OTWARTYCH POZYCJI (URUCHAMIANY CO 3 SEKUNDY)
+# SZYBKI ASYNCHRONICZNY WĄTEK MONITOROWANIA (ODŚWIEŻANIE CO 3 SEKUNDY)
 # ==============================================================================
 def monitoring_worker():
     global active_positions
     while True:
         try:
-            if not active_positions:
-                time.sleep(10)
+            with lock_pos:
+                items = list(active_positions.items())
+
+            if not items:
+                time.sleep(3)
                 continue
 
-            # Szybki odczyt kondycji BTC (bez pełnego DataFrame)
             btc_flash_crash = False
             try:
                 res = session.get_kline(category=CATEGORY, symbol="BTCUSDC", interval="1", limit=15)
@@ -757,41 +1133,44 @@ def monitoring_worker():
             except: pass
 
             symbols_to_del = []
-            
-            with lock_pos:
-                items = list(active_positions.items())
-                
+
             for symbol, pos in items:
                 try:
-                    # Pobieramy tylko ostatnie 2 świece na potrzeby szybkiego Trail / TP
-                    res = session.get_kline(category=CATEGORY, symbol=symbol, interval="15", limit=2)
+                    res = session.get_kline(category=CATEGORY, symbol=symbol, interval="15", limit=15)
                     c_list = res.get("result", {}).get("list", [])
                     if not c_list: continue
-                    
-                    c_curr = safe_float(c_list[0][4]) # zamkniecie (aktualna cena)
+
+                    c_curr = safe_float(c_list[0][4])
                     bp = pos["buy_price"]
                     peak = max(pos.get("peak_price", bp), c_curr)
-                    
+
                     with lock_pos:
                         if symbol in active_positions:
                             active_positions[symbol]["peak_price"] = peak
-                    
+
+                    tr_list = []
+                    for i in range(len(c_list)-1):
+                        h = safe_float(c_list[i][2])
+                        l = safe_float(c_list[i][3])
+                        pc = safe_float(c_list[i+1][4])
+                        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+                    atr_pct = ((sum(tr_list) / len(tr_list)) / c_curr) if tr_list and c_curr > 0 else 0.02
+
+                    dynamic_sl_pct = max(atr_pct * 1.8, 0.015)
+                    trailing_drop_pct = max(atr_pct * 1.5, 0.010)
+
                     total_pnl = (c_curr - bp) / bp
                     drop_from_peak = (peak - c_curr) / peak
-                    
+
                     strat = pos.get("strategy", "")
                     sold_half = pos.get("sold_half", False)
                     struc_sl = pos.get("structural_sl")
-
-                    # Hardcoded dynamika: ATR można aproksymować jako stały np. 1.5% - 2% dla oszczędności RAM
-                    dynamic_sl_pct = 0.02
-                    trailing_drop_pct = 0.012
 
                     if SENTIMENT_STATE == "BULLISH": tp_ratio = 0.25
                     elif SENTIMENT_STATE == "BEARISH": tp_ratio = 0.50
                     else: tp_ratio = 0.33
 
-                    # Częściowy TP realizujemy Limit Orderem (Post-Only)
+                    # 1. POST-ONLY LIMIT TAKE PROFIT (Oszczędność prowizji Maker vs Taker)
                     if not sold_half and total_pnl >= PARTIAL_TP_PCT:
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
                         if rb > 0:
@@ -801,14 +1180,13 @@ def monitoring_worker():
                                 ticker = session.get_tickers(category=CATEGORY, symbol=symbol)
                                 ask_p = safe_float(ticker.get("result", {}).get("list", [{}])[0].get("ask1Price", c_curr))
                                 session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Limit", qty=qs, price=str(ask_p), timeInForce="PostOnly")
-                                
                                 with lock_pos:
                                     if symbol in active_positions:
                                         active_positions[symbol]["sold_half"] = True
                                         save_positions(active_positions)
-                                logging.info(f"💸 [PARTIAL TP] {symbol} LIMIT ORDER po {ask_p}. PnL: +{total_pnl*100:.2f}%")
+                                logging.info(f"💸 [PARTIAL TP] {symbol} LIMIT ORDER (Post-Only) po {ask_p:.4f} USD. Wynik: +{total_pnl*100:.2f}%")
 
-                    # Wyjścia Awaryjne Marketem
+                    # 2. BEZWZGLĘDNE ZLECENIA WYJŚCIA (SL / TRAILING STOP / CRASH)
                     sl_hit = struc_sl and c_curr <= struc_sl
                     be_hit = (sold_half or (peak - bp)/bp >= BREAKEVEN_TRIGGER_PCT) and c_curr <= bp * (1.0 + BREAKEVEN_SL_PCT)
                     dyn_hit = total_pnl <= -dynamic_sl_pct
@@ -828,7 +1206,7 @@ def monitoring_worker():
                                     symbols_to_del.append(symbol)
                         else:
                             symbols_to_del.append(symbol)
-                except Exception as e:
+                except Exception:
                     pass
 
             if symbols_to_del:
@@ -839,19 +1217,18 @@ def monitoring_worker():
 
         except Exception:
             pass
-        time.sleep(3) # Szybka pętla asynchroniczna
+        time.sleep(3)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA (WOLNA)
+# AUTOMATYCZNA LIKWIDACJA STABLECOINÓW I REINWESTYCJA W BTC
 # ==============================================================================
 def auto_liquidate_stables_to_btc():
-    """Wykrywa pozycje/salda USDT i EURC, sprzedaje na Spot i kupuje BTC."""
     global active_positions
     for coin, sym in [("USDT", "USDTUSDC"), ("EURC", "EURCUSDC")]:
         try:
             bal = get_coin_available_balance(coin)
             if (bal * 1.0 >= MIN_EXCHANGE_NOTIONAL) or (sym in active_positions):
-                logging.info(f"🧹 [CLEANUP] Zamieniam {bal} {coin} na BTCUSDC...")
+                logging.info(f"🧹 [AUTO-WYMIANA] Wykryto {bal} {coin}. Sprzedaję na Spot Market i kupuję BTC...")
                 step, mq = get_symbol_lot_filter(sym)
                 qs = format_qty_with_step(bal, step, mq)
                 sold_ok = True
@@ -870,45 +1247,52 @@ def auto_liquidate_stables_to_btc():
                         btc_val = round(fu * 0.99, 2)
                         r2 = session.place_order(category=CATEGORY, symbol="BTCUSDC", side="Buy", orderType="Market", qty=f"{btc_val:.2f}")
                         if r2.get("retCode") == 0:
-                            logging.info(f"✅ Kupiono BTC za {btc_val} USDC z odzysku stablecoinów.")
-        except: pass
+                            logging.info(f"💎🚀 [REINWESTYCJA] Za {btc_val} USDC zakupiono Bitcoina (BTCUSDC)!")
+        except Exception:
+            pass
 
+# ==============================================================================
+# PĘTLA GŁÓWNA SKANERA RYNKU (CO 60 SEKUND)
+# ==============================================================================
 def bot_loop():
     global last_hourly_cost_report, kline_cache_15m
     sync_positions_from_bybit()
     auto_liquidate_stables_to_btc()
     last_hourly_cost_report = time.time()
 
-    # Odpal wątek monitorujący w tle
+    # Uruchomienie błyskawicznego wątku monitorowania pozycji (3 sekundy)
     t_mon = threading.Thread(target=monitoring_worker, daemon=True)
     t_mon.start()
 
     while True:
         try:
-            kline_cache_15m.clear() # Czyszczenie pamięci przed nowym cyklem skanowania
+            with kline_cache_lock:
+                kline_cache_15m.clear()
 
             logging.info("--------------------------------------------------------------------------------")
-            logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU (Skaner w tle, Monitor aktywny 24/7)...")
+            logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU (Skaner 60s, Monitor pozycji 3s)...")
 
             current_sentiment = update_market_sentiment()
             total_equity, free_usdc = get_balances()
 
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            t_stats = trade_history.get("daily", {}).get(today_str, {"pnl_usd": 0.0, "trades": 0})
-            
+            with lock_history:
+                t_stats = trade_history.get("daily", {}).get(today_str, {"pnl_usd": 0.0, "trades": 0})
+                consec_losses = trade_history.get("consecutive_losses", 0)
+
             can_buy, drop_peak, peak_eq = check_and_update_circuit_breakers(total_equity, current_sentiment)
             usdc_ok, usdc_stat = check_usdc_market_dependencies()
 
             start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
             diff = total_equity - start_eq
 
-            logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Portfel: {diff:+.2f}$")
-            logging.info(f"🛡️ [DRAWDOWN] Szczyt: {peak_eq:.2f}$ | Spadek: -{drop_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD}$")
+            logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Zmiana Bybit: {diff:+.2f}$ | Porażki: {consec_losses}/3")
+            logging.info(f"🛡️ [DRAWDOWN] Szczyt dnia: {peak_eq:.2f}$ | Spadek: -{drop_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f}$ | Blokada przy: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f}$")
             
             with lock_pos:
                 act_cnt = len(active_positions)
                 
-            logging.info(f"💰 [PORTFEL] Wartość: {total_equity:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {act_cnt}/{MAX_TOTAL_POSITIONS}")
+            logging.info(f"💰 [PORTFEL] Wartość: {total_equity:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {act_cnt}/{MAX_TOTAL_POSITIONS} | Płynność USDC: {usdc_stat}")
 
             if time.time() - last_hourly_cost_report >= 3600:
                 report_hourly_costs(total_equity)
@@ -917,19 +1301,33 @@ def bot_loop():
             auto_liquidate_stables_to_btc()
 
             if can_buy and is_btc_market_healthy() and usdc_ok:
-                top_vols = get_top_volume_symbols()
+                top_vols = get_top_volume_symbols(TOP_MARKETS_COUNT)
                 if top_vols:
-                    run_support_bounce_strategy(top_vols)
-                    run_mtf_alignment_strategy(top_vols)
-                    scan_top150_for_ema_signals(top_vols)
-                
-                run_top_gainers_strategy()
-                # Pomijam dla czytelności mniejsze moduły (Pumps, Dips, PEPE)
-            else:
-                if not can_buy: logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału/Drawdown aktywna.")
-                elif not usdc_ok: logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Problem USDC: {usdc_stat}")
+                    run_support_bounce_strategy(top_vols)          # Poziom 0
+                    run_relative_strength_strategy(top_vols)       # Poziom 4
 
-            logging.info("💤 SKAN ZAKOŃCZONY. Monitor działa w tle. Następny skan za 60 sek...")
+                    if "BEARISH" not in current_sentiment:
+                        run_mtf_alignment_strategy(top_vols)           # Poziom 1
+                        scan_top150_for_ema_signals(top_vols)          # Poziom 2
+                        run_top_gainers_strategy()                     # Poziom 3
+                        run_bb_squeeze_strategy(top_vols)              # Poziom 5
+                        run_ema21_89_pure_crossover_strategy(top_vols) # Poziom 6
+                        run_dip_hunter_strategy()                      # Poziom 7
+                    else:
+                        logging.info("🛡️ [TRYB BEARISH] Poluję wyłącznie na potwierdzone dołki (Support Bounce) i Relative Strength!")
+
+                    if "BULLISH" in current_sentiment:
+                        scan_for_pumps(top_vols)                       # Poziom 8
+                        scan_pepe_specialist()                         # Poziom 9
+                    elif "BEARISH" not in current_sentiment:
+                        logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam pompy i PEPE.")
+            else:
+                if not can_buy: logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna (Limit -15$ lub seria porażek).")
+                elif not usdc_ok: logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Ochrona płynności USDC: {usdc_stat}")
+                else: logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard.")
+
+            logging.info("💤 SKAN ZAKOŃCZONY. Monitor asynchroniczny czuwa w tle. Następny skan za 60 sek...")
+            logging.info("--------------------------------------------------------------------------------")
         except Exception as e:
             logging.error(f"Błąd głównej pętli: {e}")
             
@@ -940,26 +1338,29 @@ def self_ping_loop():
         time.sleep(300)
         try:
             requests.get(APP_URL, timeout=10)
+            logging.info("PING: Serwer aktywny (Render Keep-Alive OK)")
         except Exception:
             pass
 
-class HealthHandler(BaseHTTPRequestHandler):
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V8: Async Monitor & Flow Engine)!")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V8: Full Engine + Async Monitor)!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    httpd = HTTPServer(('', port), HealthHandler)
+    httpd = HTTPServer(('', port), SimpleHTTPRequestHandler)
     httpd.serve_forever()
 
 if __name__ == "__main__":
     t_bot = threading.Thread(target=bot_loop, daemon=True)
     t_bot.start()
+
     t_ping = threading.Thread(target=self_ping_loop, daemon=True)
     t_ping.start()
+
     run_health_server()
