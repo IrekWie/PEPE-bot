@@ -35,7 +35,7 @@ QUOTE_COIN = "USDC"
 
 # --- USTAWIENIA SKANOWANIA I PŁYNNOŚCI ---
 TOP_MARKETS_COUNT = 150
-MIN_24H_TURNOVER_USDC = 150000.0     # Odrzucanie niepłynnych monet (obrót < 150k USD dziennie)
+MIN_24H_TURNOVER_USDC = 100000.0     # Filtr minimalnego obrotu dla NOWYCH pozycji
 TOP_DIPS_COUNT = 6
 TOP_GAINERS_COUNT = 4
 MAX_PUMP_POSITIONS = 3
@@ -46,10 +46,10 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 # --- LIMITY FINANSOWE I REZERWY ---
-STANDARD_MIN_ORDER_VALUE = 65.0      # Zoptymalizowana wielkość pojedynczego wejścia
+STANDARD_MIN_ORDER_VALUE = 65.0      # Wielkość nowego wejścia
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.20          # 20% kapitału ZAWSZE leży w wolnym USDC
+MIN_CASH_RESERVE_PCT = 0.15          # 15% kapitału leży w rezerwie gotówkowej
 
 # --- BEZWZGLĘDNE BEZPIECZNIKI PORTFELA (GLOBALNY TRAILING DRAWDOWN) ---
 MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od MAKSYMALNEGO salda dnia = STOP ZAKUPÓW
@@ -63,7 +63,7 @@ USDC_1M_DUMP_THRESHOLD = -0.003      # Szybki zrzut BTCUSDC na 1M (-0.3%) blokuj
 # ==============================================================================
 # ZMIENNE GLOBALNE I DYNAMICZNE RYZYKO
 # ==============================================================================
-MAX_TOTAL_POSITIONS = 6              # Bezpieczny limit jednoczesnych pozycji
+MAX_TOTAL_POSITIONS = 8              # Dostosowane pod Twój portfel (masz 6 pozycji)
 MAX_EMA_CROSS_POSITIONS = 3
 SENTIMENT_STATE = "NEUTRAL"
 ETH_SENTIMENT_STATE = "NEUTRAL"
@@ -103,7 +103,6 @@ logging.basicConfig(
 
 _original_time = time.time
 
-# CACHE ŚWIEC 15M (Czyszczony na początku każdego cyklu skanowania)
 kline_cache_15m = {}
 kline_cache_lock = threading.Lock()
 
@@ -372,7 +371,7 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
                 save_trade_history(trade_history)
                 return True, 0.0, current_total_equity
 
-        # TWARDY WYŁĄCZNIK: Spadek o 15 USD od szczytu (GLOBALNY - CHRONI W KAŻDYM REŻIMIE)
+        # TWARDY WYŁĄCZNIK: Spadek o 15 USD od szczytu (GLOBALNY)
         if is_blocked_by_drop:
             logging.warning(f"🛑 [TRAILING BREAKER] Kapitał spadł o {drop_from_peak:.2f}$ od szczytu ({peak_equity:.2f}$). Zakupy BEZWZGLĘDNIE ZABLOKOWANE.")
             return False, drop_from_peak, peak_equity
@@ -399,7 +398,7 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     if (free_usdc - effective_target) < reserve_required:
         available = math.floor((free_usdc - reserve_required) * 0.995 * 100) / 100.0
         if available >= MIN_EXCHANGE_NOTIONAL:
-            return available, f"Zredukowane ({available:.2f}$) by zachować 20% rezerwy"
+            return available, f"Zredukowane ({available:.2f}$) by zachować 15% rezerwy"
         return 0.0, f"Brak gotówki (Chronię {MIN_CASH_RESERVE_PCT*100:.0f}% rezerwy)"
 
     if free_usdc >= effective_target:
@@ -519,7 +518,7 @@ def get_coin_available_balance(coin_name):
     return 0.0
 
 # ==============================================================================
-# FILTRY PŁYNNOŚCI (TURNOVER 24H)
+# FILTRY PŁYNNOŚCI (DLA NOWYCH WEJŚĆ)
 # ==============================================================================
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
@@ -573,6 +572,9 @@ def get_top_gainers_symbols(limit_count=TOP_GAINERS_COUNT):
         pass
     return []
 
+# ==============================================================================
+# PEŁNA SYNCHRONIZACJA Z BYBIT (WSZYSTKIE 6 TWOICH MONET)
+# ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
     if not session: return
@@ -583,6 +585,7 @@ def sync_positions_from_bybit():
             
             for coin_info in res["result"]["list"][0].get("coin", []):
                 coin = coin_info.get("coin")
+                # Ignorujemy tylko waluty rozliczeniowe/fiat
                 if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
                     continue
 
@@ -596,7 +599,8 @@ def sync_positions_from_bybit():
                     df = get_market_data_no_cache(sym, interval="15", limit=5)
                     if df is not None and len(df) > 0:
                         cp = df.iloc[-1]['close']
-                        if bal * cp >= MIN_SYNC_POSITION_VALUE:
+                        val_usd = bal * cp
+                        if val_usd >= MIN_SYNC_POSITION_VALUE:
                             buy_p = cp
                             try:
                                 ex = session.get_executions(category=CATEGORY, symbol=sym, limit=10)
@@ -608,8 +612,14 @@ def sync_positions_from_bybit():
                             step, minq = get_symbol_lot_filter(sym)
                             q_str = format_qty_with_step(bal, step, minq)
                             if q_str:
-                                active_positions[sym] = {"strategy": "AUTO", "buy_price": buy_p, "peak_price": cp, "qty": q_str, "sold_half": False}
-                                logging.info(f"🔄 [SYNC] Przywrócono {sym}: {q_str} szt.")
+                                active_positions[sym] = {
+                                    "strategy": "AUTO_RESTORED", 
+                                    "buy_price": buy_p, 
+                                    "peak_price": max(cp, buy_p), 
+                                    "qty": q_str, 
+                                    "sold_half": False
+                                }
+                                logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono {sym}: {q_str} monet | Wartość: ~{val_usd:.2f} USD")
             save_positions(active_positions)
     except Exception as e:
         logging.error(f"Błąd synchronizacji: {e}")
@@ -643,6 +653,7 @@ def get_market_data_no_cache(symbol, interval="15", limit=250):
         df['bb_std'] = df['close'].rolling(window=20).std()
         df['bb_upper'] = df['bb_mid'] + (2.0 * df['bb_std'])
         df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
         df['tr0'] = abs(df['high'] - df['low'])
         df['tr1'] = abs(df['high'] - df['close'].shift())
         df['tr2'] = abs(df['low'] - df['close'].shift())
@@ -725,8 +736,8 @@ def update_market_sentiment():
 
         if btc_sentiment == "BULLISH":
             SENTIMENT_STATE = "BULLISH"
-            MAX_TOTAL_POSITIONS = 6  # Zoptymalizowano do 6 pozycji
-            MAX_EMA_CROSS_POSITIONS = 3
+            MAX_TOTAL_POSITIONS = 8
+            MAX_EMA_CROSS_POSITIONS = 4
             SAFE_RISK_PCT = 0.15
             MODERATE_RISK_PCT = 0.10
             HIGH_RISK_PCT = 0.07
@@ -748,10 +759,10 @@ def update_market_sentiment():
 
             if btc_is_rebounding:
                 sentiment_label = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
-                MAX_TOTAL_POSITIONS = 4
+                MAX_TOTAL_POSITIONS = 8
             else:
                 sentiment_label = "BEARISH 🔴 (Ścisła Defensywa)"
-                MAX_TOTAL_POSITIONS = 3
+                MAX_TOTAL_POSITIONS = 8
 
             MAX_EMA_CROSS_POSITIONS = 0
             SAFE_RISK_PCT = 0.12      
@@ -761,8 +772,8 @@ def update_market_sentiment():
         else:
             SENTIMENT_STATE = "NEUTRAL"
             sentiment_label = "NEUTRAL 🟡 (Rynek Boczny)"
-            MAX_TOTAL_POSITIONS = 5
-            MAX_EMA_CROSS_POSITIONS = 2
+            MAX_TOTAL_POSITIONS = 8
+            MAX_EMA_CROSS_POSITIONS = 3
             SAFE_RISK_PCT = 0.14
             MODERATE_RISK_PCT = 0.08
             HIGH_RISK_PCT = 0.0       
@@ -1108,7 +1119,7 @@ def scan_pepe_specialist():
     except Exception: pass
 
 # ==============================================================================
-# SZYBKI ASYNCHRONICZNY WĄTEK MONITOROWANIA (ODŚWIEŻANIE CO 3 SEKUNDY)
+# SZYBKI WĄTEK MONITOROWANIA (ODŚWIEŻANIE CO 3 SEKUNDY)
 # ==============================================================================
 def monitoring_worker():
     global active_positions
@@ -1170,7 +1181,7 @@ def monitoring_worker():
                     elif SENTIMENT_STATE == "BEARISH": tp_ratio = 0.50
                     else: tp_ratio = 0.33
 
-                    # 1. POST-ONLY LIMIT TAKE PROFIT (Oszczędność prowizji Maker vs Taker)
+                    # 1. POST-ONLY LIMIT TAKE PROFIT
                     if not sold_half and total_pnl >= PARTIAL_TP_PCT:
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
                         if rb > 0:
@@ -1186,7 +1197,7 @@ def monitoring_worker():
                                         save_positions(active_positions)
                                 logging.info(f"💸 [PARTIAL TP] {symbol} LIMIT ORDER (Post-Only) po {ask_p:.4f} USD. Wynik: +{total_pnl*100:.2f}%")
 
-                    # 2. BEZWZGLĘDNE ZLECENIA WYJŚCIA (SL / TRAILING STOP / CRASH)
+                    # 2. BEZWZGLĘDNE ZLECENIA WYJŚCIA
                     sl_hit = struc_sl and c_curr <= struc_sl
                     be_hit = (sold_half or (peak - bp)/bp >= BREAKEVEN_TRIGGER_PCT) and c_curr <= bp * (1.0 + BREAKEVEN_SL_PCT)
                     dyn_hit = total_pnl <= -dynamic_sl_pct
@@ -1260,7 +1271,7 @@ def bot_loop():
     auto_liquidate_stables_to_btc()
     last_hourly_cost_report = time.time()
 
-    # Uruchomienie błyskawicznego wątku monitorowania pozycji (3 sekundy)
+    # Szybki asynchroniczny wątek sprawdzający Stop Loss / TP co 3 sekundy
     t_mon = threading.Thread(target=monitoring_worker, daemon=True)
     t_mon.start()
 
@@ -1270,7 +1281,7 @@ def bot_loop():
                 kline_cache_15m.clear()
 
             logging.info("--------------------------------------------------------------------------------")
-            logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU (Skaner 60s, Monitor pozycji 3s)...")
+            logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU...")
 
             current_sentiment = update_market_sentiment()
             total_equity, free_usdc = get_balances()
@@ -1288,18 +1299,31 @@ def bot_loop():
 
             logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Zmiana Bybit: {diff:+.2f}$ | Porażki: {consec_losses}/3")
             logging.info(f"🛡️ [DRAWDOWN] Szczyt dnia: {peak_eq:.2f}$ | Spadek: -{drop_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f}$ | Blokada przy: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f}$")
-            
+
+            # Pełna synchronizacja stanu Twojego portfela z giełdą
+            sync_positions_from_bybit()
+            auto_liquidate_stables_to_btc()
+
+            # RAPORTOWANIE WSZYSTKICH AKTYWNYCH POZYCJI W KONSOLI (JAK DAWNIEJ)
             with lock_pos:
-                act_cnt = len(active_positions)
-                
-            logging.info(f"💰 [PORTFEL] Wartość: {total_equity:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {act_cnt}/{MAX_TOTAL_POSITIONS} | Płynność USDC: {usdc_stat}")
+                current_items = list(active_positions.items())
+
+            logging.info(f"💰 [PORTFEL] Wartość: {total_equity:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS} | Płynność USDC: {usdc_stat}")
+            logging.info(f"=== [MONITOROWANIE POZYCJI: {len(current_items)} AKTYWNYCH] ===")
+            
+            for symbol, pos in current_items:
+                try:
+                    df = get_market_data(symbol, interval="15", limit=2)
+                    cp = df.iloc[-1]['close'] if df is not None else pos.get("peak_price", pos["buy_price"])
+                    pnl_pct = ((cp - pos["buy_price"]) / pos["buy_price"]) * 100
+                    logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Szczyt: {pos.get('peak_price', cp)}")
+                except Exception:
+                    pass
 
             if time.time() - last_hourly_cost_report >= 3600:
                 report_hourly_costs(total_equity)
 
-            sync_positions_from_bybit()
-            auto_liquidate_stables_to_btc()
-
+            # SKANOWANIE I ZAKUPY
             if can_buy and is_btc_market_healthy() and usdc_ok:
                 top_vols = get_top_volume_symbols(TOP_MARKETS_COUNT)
                 if top_vols:
@@ -1326,7 +1350,7 @@ def bot_loop():
                 elif not usdc_ok: logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Ochrona płynności USDC: {usdc_stat}")
                 else: logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard.")
 
-            logging.info("💤 SKAN ZAKOŃCZONY. Monitor asynchroniczny czuwa w tle. Następny skan za 60 sek...")
+            logging.info("💤 SKAN ZAKOŃCZONY. Następny cykl za 60 sek...")
             logging.info("--------------------------------------------------------------------------------")
         except Exception as e:
             logging.error(f"Błąd głównej pętli: {e}")
@@ -1346,7 +1370,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V8: Full Engine + Async Monitor)!")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (Full 10-Level Engine Active)!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
