@@ -50,6 +50,10 @@ MAX_CONSECUTIVE_LOSSES = 3           # 3 błędne decyzje pod rząd w bessie = S
 LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach w bessie (w godzinach)
 BTC_SURGE_UNLOCK_PCT = 0.015         # +1.5% wzrostu BTC w 2h zwalnia blokadę zakupów
 
+# --- MIKROSTRUKTURA I PŁYNNOŚĆ USDC/USDT ---
+USDC_PEG_MAX_DEVIATION = 0.002       # Max odchylenie kursu USDC/USDT: 0.2% (np. < 0.998 lub > 1.002)
+LEAD_LAG_DUMP_THRESHOLD = -0.003     # Szybki zrzut BTCUSDT na 1M (-0.3%) blokuje zakupy na *USDC
+
 # ==============================================================================
 # ZMIENNE GLOBALNE DYNAMICZNEGO RYZYKA I MAKRO-SENTYMENTU
 # ==============================================================================
@@ -245,17 +249,52 @@ def report_hourly_costs(total_equity):
     logging.info("================================================================================")
     logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
     logging.info("--------------------------------------------------------------------------------")
-    logging.info("⏱️ Ostatnie 60 minut:")
+    logging.info(f"⏱️ Ostatnie 60 minut:")
     logging.info(f"   • Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f} USD")
     logging.info(f"   • Prowizje Bybit (Taker 0.1%): -{h_fees:.2f} USD")
     logging.info(f"   • Wynik Brutto: {sign_gross}{h_gross:.2f} USD | Wynik Netto: {sign_net}{h_net:.2f} USD")
-    logging.info("📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
+    logging.info(f"📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
     logging.info(f"   • Suma prowizji oddanych giełdzie: -{d_fees:.2f} USD ({fee_drag_pct:.2f}% wartości konta)")
     logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
     logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
     logging.info("================================================================================")
 
     last_hourly_cost_report = now_ts
+
+# ==============================================================================
+# MODUŁ ZALEŻNOŚCI USDC / USDT (PEG GUARD ORAZ LEAD-LAG SENSOR)
+# ==============================================================================
+def check_usdc_market_dependencies():
+    """Weryfikuje parytet USDC/USDT oraz zjawisko Lead-Lag z dominującego rynku USDT."""
+    try:
+        # 1. PEG GUARD: WERYFIKACJA STABILNOŚCI WALUTY BAZOWEJ (USDCUSDT)
+        tickers = session.get_tickers(category=CATEGORY, symbol="USDCUSDT").get("result", {}).get("list", [])
+        if tickers:
+            usdc_price = safe_float(tickers[0].get("lastPrice"), 1.0)
+            peg_deviation = abs(usdc_price - 1.0)
+            if peg_deviation >= USDC_PEG_MAX_DEVIATION:
+                logging.warning(f"⚠️ [USDC PEG GUARD] Odchylenie kursu USDC/USDT: {usdc_price:.4f} (Błąd: {peg_deviation*100:.2f}% >= {USDC_PEG_MAX_DEVIATION*100:.1f}%). Rynek niestabilny — blokuję zakupy!")
+                return False, f"USDC_DEPEG_{usdc_price:.4f}"
+
+        # 2. LEAD-LAG SENSOR: CZY GŁĘBSZY RYNEK BTCUSDT NOTUJE GWAŁTOWNY ZRZUT?
+        df_usdt = get_market_data("BTCUSDT", interval="1", limit=3)
+        df_usdc = get_market_data("BTCUSDC", interval="1", limit=3)
+
+        if df_usdt is not None and df_usdc is not None and len(df_usdt) >= 2 and len(df_usdc) >= 2:
+            c_usdt = df_usdt.iloc[-1]
+            c_usdc = df_usdc.iloc[-1]
+            chg_usdt = (c_usdt['close'] - c_usdt['open']) / c_usdt['open']
+            chg_usdc = (c_usdc['close'] - c_usdc['open']) / c_usdc['open']
+
+            # Jeśli na rynku USDT leci szybki zrzut (-0.3%), a rynek USDC jeszcze nie zareagował
+            if chg_usdt <= LEAD_LAG_DUMP_THRESHOLD and chg_usdc > chg_usdt:
+                logging.warning(f"⚠️ [LEAD-LAG GUARD] Wyprzedzający zrzut na rynku BTCUSDT ({chg_usdt*100:.2f}% na 1M). Wstrzymuję zakupy przed wyrównaniem na USDC!")
+                return False, "USDT_DUMP_LEAD"
+
+        return True, "USDC_HEALTHY"
+    except Exception as e:
+        logging.warning(f"Błąd analizy zależności USDC/USDT: {e}")
+        return True, "BYPASS"
 
 def check_btc_significant_surge():
     """Weryfikuje, czy Bitcoin notuje wyraźny skok w górę (min. +1.5% w ciągu 2h)."""
@@ -632,7 +671,6 @@ def update_market_sentiment():
     global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, SAFE_RISK_PCT, MODERATE_RISK_PCT, HIGH_RISK_PCT
     global SENTIMENT_STATE, ETH_SENTIMENT_STATE, ALTCOIN_FLOW_STATE
     try:
-        # 1. POBRANIE DANYCH 4H DLA BITCOINA ORAZ ETHEREUM
         df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
         df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
 
@@ -640,7 +678,6 @@ def update_market_sentiment():
             SENTIMENT_STATE = "NEUTRAL"
             return "NEUTRAL (Brak danych BTC)"
 
-        # 2. ANALIZA KONDYCJI BITCOINA (FILAR GŁÓWNY)
         btc_candle = df_btc.iloc[-1]
         btc_close = btc_candle['close']
         btc_ema21 = btc_candle['ema21']
@@ -654,7 +691,6 @@ def update_market_sentiment():
         else:
             btc_sentiment = "NEUTRAL"
 
-        # 3. ANALIZA KONDYCJI ETHEREUM ORAZ WSKAŹNIKA ROTACJI ETH/BTC
         eth_sentiment = "NEUTRAL"
         alt_flow = "NEUTRAL"
 
@@ -672,7 +708,6 @@ def update_market_sentiment():
             else:
                 eth_sentiment = "NEUTRAL 🟡"
 
-            # Wskaźnik siły relatywnej ETH/BTC
             min_len = min(len(df_btc), len(df_eth))
             btc_series = df_btc['close'].iloc[-min_len:].reset_index(drop=True)
             eth_series = df_eth['close'].iloc[-min_len:].reset_index(drop=True)
@@ -687,7 +722,6 @@ def update_market_sentiment():
         ETH_SENTIMENT_STATE = eth_sentiment
         ALTCOIN_FLOW_STATE = alt_flow
 
-        # 4. SYNTEZA MAKRO-SENTYMENTU I DYNAMICZNE SLOCKI POZYCJI
         if btc_sentiment == "BULLISH":
             SENTIMENT_STATE = "BULLISH"
             MAX_TOTAL_POSITIONS = 10
@@ -699,8 +733,6 @@ def update_market_sentiment():
 
         elif btc_sentiment == "BEARISH":
             SENTIMENT_STATE = "BEARISH"
-            
-            # WERYFIKACJA LOKALNEGO ODBICIA BITCOINA (INTERWAŁ 1H)
             btc_is_rebounding = False
             try:
                 df_btc_1h = get_market_data("BTCUSDC", interval="60", limit=10)
@@ -717,10 +749,10 @@ def update_market_sentiment():
 
             if btc_is_rebounding:
                 sentiment_label = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
-                MAX_TOTAL_POSITIONS = 5  # Rozszerzenie slotów do 5 przy wzroście BTC
+                MAX_TOTAL_POSITIONS = 5
             else:
                 sentiment_label = "BEARISH 🔴 (Ścisła Defensywa)"
-                MAX_TOTAL_POSITIONS = 3  # Ścisły limit 3 pozycji
+                MAX_TOTAL_POSITIONS = 3
 
             MAX_EMA_CROSS_POSITIONS = 0
             SAFE_RISK_PCT = 0.15      
@@ -1615,13 +1647,16 @@ def bot_loop():
             # WERYFIKACJA TRAILING DRAWDOWN, 3 STRAT & SURGE UNLOCK
             can_buy, drop_from_peak, peak_eq = check_and_update_circuit_breakers(total_equity, current_sentiment)
 
+            # WERYFIKACJA PŁYNNOŚCI I PARYTETU USDC/USDT ORAZ LEAD-LAG
+            usdc_ok, usdc_status = check_usdc_market_dependencies()
+
             start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
             real_day_diff = total_equity - start_eq
             diff_sign = "+" if real_day_diff >= 0 else ""
 
             logging.info(f"📈 [BILANS HANDLOWY] Dziś (Netto): {today_sign}{today_stats['pnl_usd']:.2f} USD ({today_stats['trades']} transakcji) | Zmiana Salda Bybit: {diff_sign}{real_day_diff:.2f} USD | Strat z rzędu: {consec_losses}/3")
             logging.info(f"🛡️ [TRAILING DRAWDOWN] Szczyt dnia: {peak_eq:.2f} USD | Spadek od szczytu: -{drop_from_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f} USD | Poziom blokady: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f} USD")
-            logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
+            logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC | Płynność USDC: {usdc_status}")
 
             # GODZINNY RAPORT KOSZTÓW I PROWIZJI
             if time.time() - last_hourly_cost_report >= 3600:
@@ -1629,7 +1664,7 @@ def bot_loop():
 
             sync_positions_from_bybit()
 
-            if can_buy and is_btc_market_healthy():
+            if can_buy and is_btc_market_healthy() and usdc_ok:
                 run_support_bounce_strategy()          # Poziom 0 (Dno sinusoidy + potwierdzenie)
                 run_relative_strength_strategy()       # Poziom 4 (Odporność na spadki BTC)
 
@@ -1651,6 +1686,8 @@ def bot_loop():
             else:
                 if not can_buy:
                     logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna w trybie BEARISH: przekroczono trailing limit 15 USD od szczytu lub odnotowano 3 straty z rzędu. Czekam na odbicie BTC lub nowy dzień.")
+                elif not usdc_ok:
+                    logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Filtr płynności USDC aktywny ({usdc_status}). Ochrona przed poślizgiem lub zrzutem z USDT.")
                 else:
                     logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard. Czekam na uspokojenie rynków.")
 
@@ -1675,7 +1712,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (BTC+ETH Macro Engine Active)!")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (BTC+ETH+USDC Engine Active)!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
