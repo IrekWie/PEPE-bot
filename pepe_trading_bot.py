@@ -155,7 +155,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
     trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
 
-    # Zapis do szczegółowej listy operacji
     if "trades_log" not in trade_history:
         trade_history["trades_log"] = []
 
@@ -168,7 +167,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
         "net_pnl": pnl_usd
     })
 
-    # Ograniczenie rozmiaru historii do ostatnich 200 transakcji
     if len(trade_history["trades_log"]) > 200:
         trade_history["trades_log"] = trade_history["trades_log"][-200:]
 
@@ -649,9 +647,31 @@ def update_market_sentiment():
             MODERATE_RISK_PCT = 0.15
             HIGH_RISK_PCT = 0.10
         elif c_close < ema89 or ema21 < ema89:
-            sentiment = "BEARISH 🔴 (Defensywa)"
             SENTIMENT_STATE = "BEARISH"
-            MAX_TOTAL_POSITIONS = 3
+            
+            # WERYFIKACJA LOKALNEGO ODBICIA BITCOINA (INTERWAŁ 1H)
+            btc_is_rebounding = False
+            try:
+                df_btc_1h = get_market_data("BTCUSDC", interval="60", limit=10)
+                if df_btc_1h is not None and len(df_btc_1h) >= 4:
+                    c_now = df_btc_1h.iloc[-1]['close']
+                    open_2h = df_btc_1h.iloc[-3]['open']
+                    ema21_1h = df_btc_1h.iloc[-1]['ema21']
+                    growth_2h = (c_now - open_2h) / open_2h
+                    
+                    # Warunek: cena 1H powyżej EMA21 i wzrost w 2h powyżej 0.3%
+                    if c_now > ema21_1h and growth_2h >= 0.003:
+                        btc_is_rebounding = True
+            except Exception:
+                pass
+
+            if btc_is_rebounding:
+                sentiment = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
+                MAX_TOTAL_POSITIONS = 5  # Rozszerzenie do 5 pozycji podczas odbicia BTC
+            else:
+                sentiment = "BEARISH 🔴 (Ścisła Defensywa)"
+                MAX_TOTAL_POSITIONS = 3  # Standardowy limit 3 pozycji
+
             MAX_EMA_CROSS_POSITIONS = 0
             SAFE_RISK_PCT = 0.15      
             MODERATE_RISK_PCT = 0.0   
@@ -1519,7 +1539,7 @@ def monitor_and_close_positions():
 def bot_loop():
     global last_hourly_cost_report
     sync_positions_from_bybit()
-    last_hourly_cost_report = time.time()  # Start timera raportu godzinowego
+    last_hourly_cost_report = time.time()
 
     while True:
         try:
@@ -1551,7 +1571,7 @@ def bot_loop():
             logging.info(f"🛡️ [TRAILING DRAWDOWN] Szczyt dnia: {peak_eq:.2f} USD | Spadek od szczytu: -{drop_from_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f} USD | Poziom blokady: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f} USD")
             logging.info(f"💰 [PORTFEL UTA] Całkowita wartość: {total_equity:.2f} USD | Wolne środki: {free_usdc:.2f} USDC")
 
-            # GODZINNY RAPORT KOSZTÓW I PROWIZJI (Co 3600 sekund)
+            # GODZINNY RAPORT KOSZTÓW I PROWIZJI
             if time.time() - last_hourly_cost_report >= 3600:
                 report_hourly_costs(total_equity)
 
