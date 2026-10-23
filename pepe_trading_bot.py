@@ -702,7 +702,8 @@ def run_ema29_89_swing_strategy():
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
 
             dec = 8 if c['ema29'] < 0.01 else 4
-            logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.{dec}f} | EMA89: {c['ema89']:.{dec}f} | Spread: {spread_pct*100:+.3f}% | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
+            spread_tag = f"🟢 +{spread_pct*100:.3f}%" if spread_pct >= 0 else f"🔴 {spread_pct*100:.3f}%"
+            logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.{dec}f} | EMA89: {c['ema89']:.{dec}f} | Spread: {spread_tag} | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
 
             if crossed_recently and is_bullish_trend and candle_ok:
                 if free_usdc < (target_allocation * 0.99):
