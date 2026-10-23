@@ -437,7 +437,6 @@ def get_market_data_no_cache(symbol, interval="15", limit=300):
         df = df.iloc[::-1].reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume"]: df[col] = df[col].astype(float)
         
-        # Wyliczanie EMA na 300 świecach daje 100% zgodności z Bybit i TradingView
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema29'] = df['close'].ewm(span=29, adjust=False).mean()
@@ -475,7 +474,78 @@ def get_market_data(symbol, interval="15", limit=300):
     return df
 
 # ==============================================================================
-# STRATEGIA GŁÓWNA: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU) - BEZ BLOKAD
+# FILTRY MAKROEKONOMICZNE BTC + ETH
+# ==============================================================================
+def update_market_sentiment():
+    global SENTIMENT_STATE, ETH_SENTIMENT_STATE, ALTCOIN_FLOW_STATE
+    try:
+        df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
+        df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
+
+        if df_btc is None or len(df_btc) < 50:
+            SENTIMENT_STATE = "NEUTRAL"
+            return "NEUTRAL (Brak danych BTC)"
+
+        btc_candle = df_btc.iloc[-1]
+        btc_close = btc_candle['close']
+        btc_ema21 = btc_candle['ema21']
+        btc_ema50 = btc_candle['ema50']
+        btc_ema89 = btc_candle['ema89']
+
+        if btc_close > btc_ema50 and btc_ema21 > btc_ema50: btc_sentiment = "BULLISH"
+        elif btc_close < btc_ema89 or btc_ema21 < btc_ema89: btc_sentiment = "BEARISH"
+        else: btc_sentiment = "NEUTRAL"
+
+        eth_sentiment = "NEUTRAL"
+        alt_flow = "NEUTRAL"
+
+        if df_eth is not None and len(df_eth) >= 50:
+            eth_candle = df_eth.iloc[-1]
+            if eth_candle['close'] > eth_candle['ema50'] and eth_candle['ema21'] > eth_candle['ema50']: eth_sentiment = "BULLISH 🟢"
+            elif eth_candle['close'] < eth_candle['ema89'] or eth_candle['ema21'] < eth_candle['ema89']: eth_sentiment = "BEARISH 🔴"
+            else: eth_sentiment = "NEUTRAL 🟡"
+
+            min_len = min(len(df_btc), len(df_eth))
+            ratio = df_eth['close'].iloc[-min_len:].reset_index(drop=True) / df_btc['close'].iloc[-min_len:].reset_index(drop=True)
+            ratio_ema = ratio.ewm(span=21, adjust=False).mean()
+            alt_flow = "ALT_FLOW 🟢" if ratio.iloc[-1] > ratio_ema.iloc[-1] else "ALT_PRESSURE 🔴"
+
+        SENTIMENT_STATE = btc_sentiment
+        ETH_SENTIMENT_STATE = eth_sentiment
+        ALTCOIN_FLOW_STATE = alt_flow
+        mode_str = "WSZYSTKIE STRATEGIE (10 POZIOMÓW)" if ENABLE_LEGACY_STRATEGIES else "TYLKO EMA 29/89 (5 MONET x 20%)"
+        logging.info(f"📊 [MAKRO BTC+ETH] BTC 4H: {btc_sentiment} | ETH 4H: {eth_sentiment} | Rotacja: {alt_flow} | Tryb: {mode_str}")
+        return btc_sentiment
+    except Exception as e:
+        logging.error(f"Błąd sentymentu: {e}")
+        SENTIMENT_STATE = "NEUTRAL"
+        return "UNKNOWN"
+
+def is_btc_market_healthy():
+    try:
+        df_btc = get_market_data_no_cache("BTCUSDC", interval="5", limit=6)
+        if df_btc is not None and len(df_btc) >= 4:
+            c = df_btc.iloc[-1]
+            candle_change = (c['close'] - c['open']) / c['open']
+            recent_high = df_btc['high'].iloc[-3:].max()
+            drop_from_high = (c['close'] - recent_high) / recent_high
+            if candle_change <= BTC_FAST_DROP_BUY_BLOCK_PCT or drop_from_high <= BTC_FAST_DROP_BUY_BLOCK_PCT:
+                logging.warning(f"⚠️ [BTC GUARD] Tąpnięcie 5M na BTC: {candle_change*100:.2f}%. Wstrzymuję zakupy.")
+                return False
+
+        df_btc_15 = get_market_data_no_cache("BTCUSDC", interval="15", limit=3)
+        if df_btc_15 is not None and len(df_btc_15) > 1:
+            c15 = df_btc_15.iloc[-1]
+            chg15 = (c15['close'] - c15['open']) / c15['open']
+            if chg15 <= -0.006:
+                logging.warning(f"⚠️ [BTC 15M GUARD] Silny spadek BTC 15M ({chg15*100:.2f}%). Zakaz zakupów!")
+                return False
+    except Exception:
+        pass
+    return True
+
+# ==============================================================================
+# STRATEGIA GŁÓWNA: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU)
 # ==============================================================================
 def run_ema29_89_swing_strategy():
     global active_positions
@@ -508,13 +578,12 @@ def run_ema29_89_swing_strategy():
             p2 = df.iloc[-4]  # 45 min temu
             p3 = df.iloc[-5]  # 60 min temu
 
-            # Wykrywanie przecięcia w oknie ostatnich 45-60 minut (ostatnie 4 świece)
             crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
                                (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or \
                                (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
             
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
-            is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005  # min. +0.05%
+            is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
 
             logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.4f} | EMA89: {c['ema89']:.4f} | Spread: {spread_pct*100:+.3f}% | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
