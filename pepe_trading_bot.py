@@ -69,7 +69,7 @@ QUOTE_COIN = "USDC"
 ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 5 monetach
                                      # True = Odblokowuje wszystkie stare strategie (Poziomy 0-9)
 
-# --- STRATEGIA GŁÓWNA: EMA 29/89 (ROZSZERZONY KOSZYK) ---
+# --- STRATEGIA GŁÓWNA: EMA 29/89 (ROZSZERZONY KOSZYK 12 MONET) ---
 EMA29_89_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
@@ -420,6 +420,9 @@ def get_coin_available_balance(coin_name):
     except Exception: pass
     return 0.0
 
+# ==============================================================================
+# SYNCHRONIZACJA Z BYBIT (Z PEŁNYM PRZEJĘCIEM POD EMA 29/89 SWING)
+# ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
     if not session: return
@@ -454,7 +457,6 @@ def sync_positions_from_bybit():
                             q_str = format_qty_with_step(bal, step, minq)
                             if q_str:
                                 if sym in EMA29_89_COINS:
-                                    # Monety z Twojej piątki przejmujemy pod dedykowany Trailing SL za dołkami 15M
                                     recent_low = df['low'].iloc[-4:-1].min() if len(df) >= 4 else buy_p * 0.98
                                     initial_sl = recent_low * 0.998
                                     active_positions[sym] = {
@@ -679,12 +681,10 @@ def run_ema29_89_swing_strategy():
         with lock_pos: is_active = (symbol in active_positions)
         if is_active: continue
 
-        if free_usdc < (target_allocation * 0.99):
-            continue
-
         try:
             df = get_market_data(symbol, interval="15", limit=300)
             if df is None or len(df) < 100:
+                logging.warning(f"⚠️ [{symbol}] Brak wystarczającej liczby świec 15M.")
                 continue
 
             c = df.iloc[-2]   # Świeca zamknięta (kwadrans temu)
@@ -701,7 +701,14 @@ def run_ema29_89_swing_strategy():
             is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005  # min. +0.05%
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
 
+            dec = 8 if c['ema29'] < 0.01 else 4
+            logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.{dec}f} | EMA89: {c['ema89']:.{dec}f} | Spread: {spread_pct*100:+.3f}% | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
+
             if crossed_recently and is_bullish_trend and candle_ok:
+                if free_usdc < (target_allocation * 0.99):
+                    logging.warning(f"⏳ [{symbol}] Sygnał zakupu, ale brak środków ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
+                    continue
+
                 recent_low = df['low'].iloc[-4:-1].min()
                 initial_sl = recent_low * 0.998
 
@@ -719,12 +726,14 @@ def run_ema29_89_swing_strategy():
                             "trailing_sl_low": initial_sl
                         }
                         save_positions(active_positions)
-                    logging.info(f"⚡🚀 [SUKCES - KUPNO 20%] {symbol} | Kwota: {target_allocation:.2f}$ | Cena: {curr_price:.4f} | Początkowy SL: {initial_sl:.4f}")
+                    p_fmt = f"{curr_price:.8f}" if curr_price < 0.01 else f"{curr_price:.4f}"
+                    sl_fmt = f"{initial_sl:.8f}" if initial_sl < 0.01 else f"{initial_sl:.4f}"
+                    logging.info(f"⚡🚀 [SUKCES - KUPNO 20%] {symbol} | Kwota: {target_allocation:.2f}$ | Cena: {p_fmt} | Początkowy SL: {sl_fmt}")
                     free_usdc -= target_allocation
                 else:
                     logging.error(f"❌ Błąd zlecenia {symbol}: {res}")
         except Exception as e:
-            pass
+            logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
 # PEŁNA PALETA 9 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
@@ -795,7 +804,7 @@ def run_mtf_alignment_strategy(top_symbols):
                     step, minq = get_symbol_lot_filter(symbol)
                     qty_str = format_qty_with_step(order_val / c15['close'], step, minq)
                     with lock_pos:
-                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": qty_str or "1", "sold_half": False}
+                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": q_str or "1", "sold_half": False}
                         save_positions(active_positions)
                     logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Kwota: {order_val:.2f}$ ({risk_label})")
                     break
@@ -1022,7 +1031,7 @@ def scan_pepe_specialist():
         macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
         ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
         if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
-            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
             if res.get("retCode") == 0:
                 step, minq = get_symbol_lot_filter(sym)
                 q_str = format_qty_with_step(order_val / c['close'], step, minq)
@@ -1255,7 +1264,7 @@ def bot_loop():
             # SKANOWANIE I ZAKUPY (BEZ BLOKAD PORTFELOWYCH)
             # ==================================================================
             if is_btc_market_healthy() and usdc_ok:
-                # 1. ZAWSZE AKTYWNA: STRATEGIA EMA 29/89 SWING (ROZSZERZONA O NOWE MONETY)
+                # 1. ZAWSZE AKTYWNA: STRATEGIA EMA 29/89 SWING (ROZSZERZONY KOSZYK 12 MONET)
                 run_ema29_89_swing_strategy()
                 
                 # 2. POZOSTAŁE STRATEGIE (KONTROLOWANE PRZEŁĄCZNIKIEM ENABLE_LEGACY_STRATEGIES)
