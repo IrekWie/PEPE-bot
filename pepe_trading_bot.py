@@ -40,13 +40,15 @@ ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89
 # --- STRATEGIA GŁÓWNA: 5 WYZNACZONYCH MONET x 20% KAPITAŁU (EMA 29/89) ---
 EMA29_89_COINS = ["SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC"]
 EMA29_89_CAPITAL_PCT = 0.20          # Dokładnie 20% kapitału na pozycję
+MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 pozycji (5 x 20% = 100%)
 
-# --- USTAWIENIA SKANOWANIA I PŁYNNOŚCI ---
+# --- USTAWIENIA SKANOWANIA I PŁYNNOŚCI (DLA STRATEGII POBOCZNYCH) ---
 TOP_MARKETS_COUNT = 150
 MIN_24H_TURNOVER_USDC = 150000.0     # Odrzucanie niepłynnych monet (obrót < 150k USD dziennie)
 TOP_DIPS_COUNT = 6
 TOP_GAINERS_COUNT = 4
 MAX_PUMP_POSITIONS = 3
+MAX_EMA_CROSS_POSITIONS = 5
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -57,22 +59,17 @@ STABLE_PAIRS_BLACKLIST = [
 STANDARD_MIN_ORDER_VALUE = 20.0      # Minimalna wartość wejścia
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe (pozwala na 5x 20% alokacji)
+MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe
 
-# --- BEZWZGLĘDNE BEZPIECZNIKI PORTFELA (GLOBALNY TRAILING DRAWDOWN) ---
-MAX_TRAILING_EQUITY_DROP_USD = 15.0  # Spadek o 15 USD od szczytu dnia = STOP ZAKUPÓW
-MAX_CONSECUTIVE_LOSSES = 3           # 3 błędne decyzje pod rząd = STOP ZAKUPÓW
-LOSS_COOLDOWN_HOURS = 12             # Czas blokady zakupów po 3 stratach (w godzinach)
-BTC_SURGE_UNLOCK_PCT = 0.015         # +1.5% wzrostu BTC w 2h zwalnia blokadę zakupów
-
-USDC_MAX_SPREAD_PCT = 0.0008         # Max spread na BTCUSDC: 0.080%
-USDC_1M_DUMP_THRESHOLD = -0.003      # Szybki zrzut BTCUSDC na 1M (-0.3%) blokuje zakupy
+# Bezpieczniki rynkowe (realistyczne progi)
+USDC_MAX_SPREAD_PCT = 0.0010         # Max spread na BTCUSDC: 0.100%
+USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC na 1M (-0.5%) blokuje zakupy
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015
 
 # ==============================================================================
-# ZMIENNE GLOBALNE I DYNAMICZNE RYZYKO
+# PARAMETRY DLA STRATEGII POBOCZNYCH (LEGACY)
 # ==============================================================================
-MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 pozycji (5 x 20% = 100%)
-MAX_EMA_CROSS_POSITIONS = 5          
 SENTIMENT_STATE = "NEUTRAL"
 ETH_SENTIMENT_STATE = "NEUTRAL"
 ALTCOIN_FLOW_STATE = "ALT_PRESSURE"
@@ -80,9 +77,6 @@ ALTCOIN_FLOW_STATE = "ALT_PRESSURE"
 SAFE_RISK_PCT = 0.15
 MODERATE_RISK_PCT = 0.10
 HIGH_RISK_PCT = 0.07
-
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.008
-BTC_FLASH_CRASH_EXIT_PCT    = -0.010
 
 EMA_CROSS_MIN_SPREAD_PCT = 0.0020  
 EMA_CROSS_VOL_MULTIPLIER = 1.10    
@@ -123,38 +117,25 @@ def safe_float(val, default=0.0):
         return default
 
 # ==============================================================================
-# MODUŁ KSIĘGOWANIA BILANSU I HISTORII TRANSAKCJI
+# MODUŁ HISTORII TRANSAKCJI
 # ==============================================================================
 def load_trade_history():
     if os.path.exists(TRADE_HISTORY_FILE):
         try:
             with open(TRADE_HISTORY_FILE, "r") as f:
                 data = json.load(f)
-                if "consecutive_losses" not in data: data["consecutive_losses"] = 0
-                if "cooldown_until" not in data: data["cooldown_until"] = 0
-                if "equity_baseline" not in data: data["equity_baseline"] = {}
                 if "trades_log" not in data: data["trades_log"] = []
                 return data
         except Exception:
             pass
-    return {
-        "total_realized_usd": 0.0,
-        "total_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "consecutive_losses": 0,
-        "cooldown_until": 0,
-        "equity_baseline": {},
-        "trades_log": [],
-        "daily": {}
-    }
+    return {"total_realized_usd": 0.0, "total_trades": 0, "wins": 0, "losses": 0, "trades_log": [], "daily": {}}
 
 def save_trade_history(history):
     try:
         with open(TRADE_HISTORY_FILE, "w") as f:
             json.dump(history, f, indent=4)
     except Exception as e:
-        logging.error(f"Błąd zapisu historii transakcji: {e}")
+        logging.error(f"Błąd zapisu historii: {e}")
 
 trade_history = load_trade_history()
 lock_history = threading.Lock()
@@ -169,50 +150,27 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
         
         pnl_usd = round(raw_pnl_usd - estimated_fee, 2)
         pnl_pct = (pnl_usd / (buy_price * qty)) if (buy_price * qty) > 0 else 0.0
-
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         now_ts = time.time()
 
         trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
         trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
 
-        if "trades_log" not in trade_history:
-            trade_history["trades_log"] = []
+        if pnl_usd >= 0: trade_history["wins"] = trade_history.get("wins", 0) + 1
+        else: trade_history["losses"] = trade_history.get("losses", 0) + 1
 
+        if "trades_log" not in trade_history: trade_history["trades_log"] = []
         trade_history["trades_log"].append({
-            "timestamp": now_ts,
-            "symbol": symbol,
-            "turnover": round((buy_price + sell_price) * qty, 2),
-            "fee": round(estimated_fee, 4),
-            "gross_pnl": round(raw_pnl_usd, 2),
-            "net_pnl": pnl_usd
+            "timestamp": now_ts, "symbol": symbol, "turnover": round((buy_price + sell_price) * qty, 2),
+            "fee": round(estimated_fee, 4), "gross_pnl": round(raw_pnl_usd, 2), "net_pnl": pnl_usd
         })
 
         if len(trade_history["trades_log"]) > 200:
             trade_history["trades_log"] = trade_history["trades_log"][-200:]
 
-        if pnl_usd >= 0:
-            trade_history["wins"] = trade_history.get("wins", 0) + 1
-            trade_history["consecutive_losses"] = 0
-        else:
-            trade_history["losses"] = trade_history.get("losses", 0) + 1
-            streak = trade_history.get("consecutive_losses", 0) + 1
-            trade_history["consecutive_losses"] = streak
-            
-            if streak >= MAX_CONSECUTIVE_LOSSES:
-                trade_history["cooldown_until"] = now_ts + (LOSS_COOLDOWN_HOURS * 3600)
-
-        if "daily" not in trade_history:
-            trade_history["daily"] = {}
+        if "daily" not in trade_history: trade_history["daily"] = {}
         if today_str not in trade_history["daily"]:
-            trade_history["daily"][today_str] = {
-                "pnl_usd": 0.0,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-                "total_fees": 0.0,
-                "total_turnover": 0.0
-            }
+            trade_history["daily"][today_str] = {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0, "total_fees": 0.0, "total_turnover": 0.0}
 
         d = trade_history["daily"][today_str]
         d["pnl_usd"] = round(d.get("pnl_usd", 0.0) + pnl_usd, 2)
@@ -220,15 +178,10 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
         d["total_fees"] = round(d.get("total_fees", 0.0) + estimated_fee, 4)
         d["total_turnover"] = round(d.get("total_turnover", 0.0) + ((buy_price + sell_price) * qty), 2)
 
-        if pnl_usd >= 0:
-            d["wins"] = d.get("wins", 0) + 1
-        else:
-            d["losses"] = d.get("losses", 0) + 1
-
         save_trade_history(trade_history)
         sign = "+" if pnl_usd >= 0 else ""
         ord_type = "LIMIT (POST-ONLY)" if is_maker else "MARKET"
-        logging.info(f"📊 [BILANS ({ord_type})] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Fee: -{estimated_fee:.2f}$ | Powód: {reason}")
+        logging.info(f"📊 [BILANS ZAMKNIĘCIA ({ord_type})] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Fee: -{estimated_fee:.2f}$ | Powód: {reason}")
 
 # ==============================================================================
 # MODUŁ GODZINOWEJ ANALIZY KOSZTÓW I PROWIZJI
@@ -242,9 +195,7 @@ def report_hourly_costs(total_equity):
 
     with lock_history:
         trades_log = trade_history.get("trades_log", [])
-        one_hour_ago = now_ts - 3600
-
-        recent_trades = [t for t in trades_log if t.get("timestamp", 0) >= one_hour_ago]
+        recent_trades = [t for t in trades_log if t.get("timestamp", 0) >= now_ts - 3600]
 
         h_trades_count = len(recent_trades)
         h_turnover = sum(t.get("turnover", 0.0) for t in recent_trades)
@@ -269,7 +220,7 @@ def report_hourly_costs(total_equity):
     logging.info(f"   • Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f} USD")
     logging.info(f"   • Prowizje Bybit: -{h_fees:.2f} USD")
     logging.info(f"   • Wynik Brutto: {sign_gross}{h_gross:.2f} USD | Wynik Netto: {sign_net}{h_net:.2f} USD")
-    logging.info(f"📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
+    logging.info("📅 Podsumowanie dzisiejsze (od 00:00 UTC):")
     logging.info(f"   • Suma prowizji oddanych giełdzie: -{d_fees:.2f} USD ({fee_drag_pct:.2f}% wartości konta)")
     logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
     logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
@@ -292,7 +243,7 @@ def check_usdc_market_dependencies():
                 if bid > 0 and ask > 0:
                     spread_pct = (ask - bid) / bid
                     if spread_pct > USDC_MAX_SPREAD_PCT:
-                        logging.warning(f"⚠️ [USDC SPREAD GUARD] Zbyt szeroki spread na BTCUSDC ({spread_pct*100:.3f}%). Ryzyko poślizgu cenowego!")
+                        logging.warning(f"⚠️ [USDC SPREAD GUARD] Zbyt szeroki spread na BTCUSDC ({spread_pct*100:.3f}%).")
                         return False, f"WIDE_SPREAD_{spread_pct*100:.2f}%"
 
         df_usdc_1m = get_market_data_no_cache("BTCUSDC", interval="1", limit=3)
@@ -300,7 +251,7 @@ def check_usdc_market_dependencies():
             c1m = df_usdc_1m.iloc[-1]
             chg_1m = (c1m['close'] - c1m['open']) / c1m['open']
             if chg_1m <= USDC_1M_DUMP_THRESHOLD:
-                logging.warning(f"⚠️ [USDC MICRO-DUMP GUARD] Nagły spadek BTCUSDC 1M ({chg_1m*100:.2f}%). Chwilowa pauza przed zakupem!")
+                logging.warning(f"⚠️ [USDC MICRO-DUMP GUARD] Nagły spadek BTCUSDC 1M ({chg_1m*100:.2f}%).")
                 return False, f"USDC_DUMP_{chg_1m*100:.2f}%"
 
         try:
@@ -311,7 +262,7 @@ def check_usdc_market_dependencies():
                 if t_list:
                     peg_price = safe_float(t_list[0].get("lastPrice"), 1.0)
                     if abs(peg_price - 1.0) >= 0.003:
-                        logging.warning(f"⚠️ [GLOBAL USDC PEG ALERT] Globalne odchylenie kursu USDC: {peg_price:.4f}! Rynek niestabilny.")
+                        logging.warning(f"⚠️ [GLOBAL USDC PEG ALERT] Odchylenie kursu USDC: {peg_price:.4f}!")
                         return False, f"GLOBAL_DEPEG_{peg_price:.4f}"
         except Exception:
             pass
@@ -320,76 +271,6 @@ def check_usdc_market_dependencies():
     except Exception as e:
         logging.warning(f"Błąd analizy zależności USDC: {e}")
         return True, "BYPASS"
-
-def check_btc_significant_surge():
-    try:
-        df = get_market_data_no_cache("BTCUSDC", interval="60", limit=5)
-        if df is not None and len(df) >= 3:
-            curr_p = df.iloc[-1]['close']
-            open_2h = df.iloc[-3]['open']
-            growth = (curr_p - open_2h) / open_2h
-            if growth >= BTC_SURGE_UNLOCK_PCT:
-                return True, growth
-    except Exception:
-        pass
-    return False, 0.0
-
-def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
-    global trade_history
-    with lock_history:
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        now_ts = time.time()
-
-        if "equity_baseline" not in trade_history:
-            trade_history["equity_baseline"] = {}
-        baseline = trade_history["equity_baseline"]
-
-        if baseline.get("date") != today_str:
-            baseline["date"] = today_str
-            baseline["starting_equity"] = current_total_equity
-            baseline["peak_equity"] = current_total_equity
-            save_trade_history(trade_history)
-            logging.info(f"🌅 [NOWY DZIEŃ UTC] Ustalono kapitał bazowy i szczytowy dla dnia {today_str}: {current_total_equity:.2f} USD")
-
-        starting_equity = safe_float(baseline.get("starting_equity"), current_total_equity)
-        prev_peak = safe_float(baseline.get("peak_equity"), starting_equity)
-        peak_equity = max(prev_peak, current_total_equity)
-
-        if peak_equity > prev_peak:
-            baseline["peak_equity"] = peak_equity
-            save_trade_history(trade_history)
-            logging.info(f"🚀 [NOWY SZCZYT DNIA] Szczyt kapitału przesunięty w górę: {peak_equity:.2f} USD")
-
-        drop_from_peak = peak_equity - current_total_equity
-        cooldown_until = safe_float(trade_history.get("cooldown_until", 0))
-        consecutive_losses = trade_history.get("consecutive_losses", 0)
-
-        is_blocked_by_drop = drop_from_peak >= MAX_TRAILING_EQUITY_DROP_USD
-        is_blocked_by_losses = (consecutive_losses >= MAX_CONSECUTIVE_LOSSES) or (now_ts < cooldown_until)
-
-        if is_blocked_by_drop or is_blocked_by_losses:
-            btc_surging, btc_gain = check_btc_significant_surge()
-            if btc_surging:
-                logging.info(f"🚀⚡ [BTC SURGE UNLOCK] Bitcoin silnie rośnie (+{btc_gain*100:.2f}% w 2h)! Znoszę blokadę zakupów i resetuję szczyt.")
-                trade_history["cooldown_until"] = 0
-                trade_history["consecutive_losses"] = 0
-                baseline["peak_equity"] = current_total_equity
-                save_trade_history(trade_history)
-                return True, 0.0, current_total_equity
-
-        if is_blocked_by_drop:
-            logging.warning(f"🛑 [TRAILING BREAKER] Kapitał spadł o {drop_from_peak:.2f}$ od szczytu ({peak_equity:.2f}$). Zakupy BEZWZGLĘDNIE ZABLOKOWANE.")
-            return False, drop_from_peak, peak_equity
-
-        if is_blocked_by_losses:
-            if now_ts < cooldown_until:
-                rem_minutes = int((cooldown_until - now_ts) / 60)
-                logging.warning(f"⏳ [BLOKADA: 3 STRATY] Zakupy wstrzymane na {rem_minutes} min.")
-            else:
-                logging.warning(f"⏳ [BLOKADA: 3 STRATY] Zakupy zablokowane na {LOSS_COOLDOWN_HOURS}h.")
-            return False, drop_from_peak, peak_equity
-
-        return True, drop_from_peak, peak_equity
 
 # ==============================================================================
 # ZARZĄDZANIE BUDŻETEM Z REZERWĄ GOTÓWKOWĄ
@@ -412,22 +293,21 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     return 0.0, "Brak środków"
 
 # ==============================================================================
-# INICJALIZACJA PUNKTU KOŃCOWEGO BYBIT
+# INICJALIZACJA SESJI BYBIT
 # ==============================================================================
-endpoints_to_test = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
+endpoints = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
 session = None
-for name, url in endpoints_to_test:
+for name, url in endpoints:
     try:
-        test_sess = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
-        test_sess.endpoint = url
-        res_bal = test_sess.get_wallet_balance(accountType="UNIFIED")
-        if res_bal.get("retCode") == 0:
-            session = test_sess
-            print(f"✅ POŁĄCZONO PRZEZ: {name}", flush=True)
-            res_time = test_sess.get_server_time()
+        s = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
+        s.endpoint = url
+        res = s.get_wallet_balance(accountType="UNIFIED")
+        if res.get("retCode") == 0:
+            session = s
+            print(f"✅ POŁĄCZONO: {name}", flush=True)
+            res_time = s.get_server_time()
             bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
-            local_ms = int(_original_time() * 1000)
-            time.time = lambda: _original_time() + (bybit_ms - local_ms) / 1000.0
+            time.time = lambda: _original_time() + (bybit_ms - int(_original_time() * 1000)) / 1000.0
             break
     except Exception:
         pass
@@ -443,10 +323,8 @@ def get_symbol_lot_filter(symbol):
         res = session.get_instruments_info(category=CATEGORY, symbol=symbol)
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             lot = res["result"]["list"][0].get("lotSizeFilter", {})
-            b_prec = lot.get("basePrecision")
-            step = lot.get("qtyStep")
-            eff = b_prec if b_prec and str(b_prec).strip() != "" else (step if step else "0.000001")
-            instrument_filters[symbol] = (eff, lot.get("minOrderQty", "0.000001"))
+            step = lot.get("basePrecision") or lot.get("qtyStep") or "0.000001"
+            instrument_filters[symbol] = (step, lot.get("minOrderQty", "0.000001"))
             return instrument_filters[symbol]
     except Exception:
         pass
@@ -459,7 +337,6 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         min_dec = Decimal(str(min_qty_str))
         floored = (qty_dec // step_dec) * step_dec if step_dec > 0 else qty_dec
         if floored < min_dec and floored <= 0: return None
-        if floored <= 0 and qty_dec > 0: floored = qty_dec
         norm = step_dec.normalize()
         exp = norm.as_tuple().exponent
         return f"{floored:.{abs(exp)}f}" if exp < 0 else f"{int(floored)}"
@@ -472,20 +349,14 @@ lock_pos = threading.Lock()
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
         try:
-            with open(POSITIONS_FILE, "r") as f:
-                pos = json.load(f)
-                for p in pos.values(): p.setdefault("sold_half", False)
-                return pos
-        except Exception:
-            return {}
+            with open(POSITIONS_FILE, "r") as f: return json.load(f)
+        except Exception: pass
     return {}
 
 def save_positions(positions):
     try:
-        with open(POSITIONS_FILE, "w") as f:
-            json.dump(positions, f, indent=4)
-    except Exception as e:
-        logging.error(f"Błąd zapisu pozycji: {e}")
+        with open(POSITIONS_FILE, "w") as f: json.dump(positions, f, indent=4)
+    except Exception as e: logging.error(f"Błąd zapisu pozycji: {e}")
 
 active_positions = load_positions()
 
@@ -499,8 +370,8 @@ def get_balances():
             fu = 0.0
             for c in ad.get("coin", []):
                 if c.get("coin") == QUOTE_COIN:
-                    a = c.get("availableToWithdraw")
-                    fu = safe_float(a) if a else safe_float(c.get("equity"))
+                    avail = c.get("availableToWithdraw")
+                    fu = safe_float(avail) if avail else safe_float(c.get("equity"))
                     break
             return te, fu
     except Exception:
@@ -514,11 +385,8 @@ def get_coin_available_balance(coin_name):
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             for c in res["result"]["list"][0].get("coin", []):
                 if c.get("coin") == coin_name:
-                    wb = safe_float(c.get("walletBalance"))
-                    avail = safe_float(c.get("availableToWithdraw"))
-                    return wb if wb > 0 else avail
-    except Exception:
-        pass
+                    return max(safe_float(c.get("walletBalance")), safe_float(c.get("availableToWithdraw")))
+    except Exception: pass
     return 0.0
 
 def sync_positions_from_bybit():
@@ -528,49 +396,31 @@ def sync_positions_from_bybit():
         with lock_pos:
             res = session.get_wallet_balance(accountType="UNIFIED")
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
-            
             for coin_info in res["result"]["list"][0].get("coin", []):
                 coin = coin_info.get("coin")
-                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
-                    continue
-
+                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN"]: continue
                 bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
                 if bal <= 0: continue
-
                 sym = f"{coin}USDC"
-                if sym in STABLE_PAIRS_BLACKLIST: continue
-
                 if sym not in active_positions:
                     df = get_market_data_no_cache(sym, interval="15", limit=5)
                     if df is not None and len(df) > 0:
                         cp = df.iloc[-1]['close']
-                        val_usd = bal * cp
-                        if val_usd >= MIN_SYNC_POSITION_VALUE:
-                            buy_p = cp
-                            try:
-                                ex = session.get_executions(category=CATEGORY, symbol=sym, limit=10)
-                                if ex.get("retCode") == 0:
-                                    buys = [e for e in ex.get("result", {}).get("list", []) if e.get("side") == "Buy"]
-                                    if buys: buy_p = safe_float(buys[0].get("execPrice"), cp)
-                            except Exception: pass
-                            
+                        if bal * cp >= MIN_SYNC_POSITION_VALUE:
                             step, minq = get_symbol_lot_filter(sym)
                             q_str = format_qty_with_step(bal, step, minq)
                             if q_str:
                                 active_positions[sym] = {
-                                    "strategy": "AUTO_RESTORED", 
-                                    "buy_price": buy_p, 
-                                    "peak_price": max(cp, buy_p), 
-                                    "qty": q_str, 
-                                    "sold_half": False
+                                    "strategy": "AUTO_RESTORED", "buy_price": cp, 
+                                    "peak_price": cp, "qty": q_str, "trailing_sl_low": cp * 0.98
                                 }
-                                logging.info(f"🔄 [AUTOREKUPERACJA] Przywrócono {sym}: {q_str} szt. | Wartość: ~{val_usd:.2f}$")
+                                logging.info(f"🔄 [SYNC] Przywrócono {sym}: {q_str} szt.")
             save_positions(active_positions)
     except Exception as e:
         logging.error(f"Błąd synchronizacji: {e}")
 
 # ==============================================================================
-# WYZNACZANIE WSKAŹNIKÓW I GLOBALNY CACHE ŚWIEC
+# POBIERANIE ŚWIEC I WSKAŹNIKÓW (LIMIT=300 DLA PEŁNEJ ZGODNOŚCI EMA 89)
 # ==============================================================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -578,7 +428,7 @@ def calculate_rsi(series, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     return 100 - (100 / (1 + (gain / loss)))
 
-def get_market_data_no_cache(symbol, interval="15", limit=250):
+def get_market_data_no_cache(symbol, interval="15", limit=300):
     try:
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
@@ -587,6 +437,7 @@ def get_market_data_no_cache(symbol, interval="15", limit=250):
         df = df.iloc[::-1].reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume"]: df[col] = df[col].astype(float)
         
+        # Wyliczanie EMA na 300 świecach daje 100% zgodności z Bybit i TradingView
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema29'] = df['close'].ewm(span=29, adjust=False).mean()
@@ -611,7 +462,7 @@ def get_market_data_no_cache(symbol, interval="15", limit=250):
     except Exception:
         return None
 
-def get_market_data(symbol, interval="15", limit=250):
+def get_market_data(symbol, interval="15", limit=300):
     global kline_cache_15m
     with kline_cache_lock:
         if interval == "15" and symbol in kline_cache_15m:
@@ -624,169 +475,74 @@ def get_market_data(symbol, interval="15", limit=250):
     return df
 
 # ==============================================================================
-# FILTRY MAKROEKONOMICZNE BTC + ETH + ROTACJA ETH/BTC
-# ==============================================================================
-def update_market_sentiment():
-    global SENTIMENT_STATE
-    try:
-        df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
-        df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
-
-        if df_btc is None or len(df_btc) < 50:
-            SENTIMENT_STATE = "NEUTRAL"
-            return "NEUTRAL (Brak danych BTC)"
-
-        btc_candle = df_btc.iloc[-1]
-        btc_close = btc_candle['close']
-        btc_ema21 = btc_candle['ema21']
-        btc_ema50 = btc_candle['ema50']
-        btc_ema89 = btc_candle['ema89']
-
-        if btc_close > btc_ema50 and btc_ema21 > btc_ema50:
-            btc_sentiment = "BULLISH"
-        elif btc_close < btc_ema89 or btc_ema21 < btc_ema89:
-            btc_sentiment = "BEARISH"
-        else:
-            btc_sentiment = "NEUTRAL"
-
-        eth_sentiment = "NEUTRAL"
-        alt_flow = "NEUTRAL"
-
-        if df_eth is not None and len(df_eth) >= 50:
-            eth_candle = df_eth.iloc[-1]
-            eth_close = eth_candle['close']
-            eth_ema21 = eth_candle['ema21']
-            eth_ema50 = eth_candle['ema50']
-            eth_ema89 = eth_candle['ema89']
-
-            if eth_close > eth_ema50 and eth_ema21 > eth_ema50:
-                eth_sentiment = "BULLISH 🟢"
-            elif eth_close < eth_ema89 or eth_ema21 < eth_ema89:
-                eth_sentiment = "BEARISH 🔴"
-            else:
-                eth_sentiment = "NEUTRAL 🟡"
-
-            min_len = min(len(df_btc), len(df_eth))
-            btc_series = df_btc['close'].iloc[-min_len:].reset_index(drop=True)
-            eth_series = df_eth['close'].iloc[-min_len:].reset_index(drop=True)
-            eth_btc_ratio = eth_series / btc_series
-            ratio_ema21 = eth_btc_ratio.ewm(span=21, adjust=False).mean()
-
-            if eth_btc_ratio.iloc[-1] > ratio_ema21.iloc[-1]:
-                alt_flow = "ALT_FLOW 🟢"
-            else:
-                alt_flow = "ALT_PRESSURE 🔴"
-
-        if btc_sentiment == "BULLISH":
-            SENTIMENT_STATE = "BULLISH"
-            sentiment_label = "BULLISH 🟢"
-        elif btc_sentiment == "BEARISH":
-            SENTIMENT_STATE = "BEARISH"
-            sentiment_label = "BEARISH 🔴"
-        else:
-            SENTIMENT_STATE = "NEUTRAL"
-            sentiment_label = "NEUTRAL 🟡"
-        
-        mode_str = "AKTYWNE WSZYSTKIE STRATEGIE (10 POZIOMÓW)" if ENABLE_LEGACY_STRATEGIES else "TYLKO EMA 29/89 (5 MONET x 20%)"
-        logging.info(f"📊 [MAKRO BTC+ETH] BTC 4H: {sentiment_label} | ETH 4H: {eth_sentiment} | Rotacja: {alt_flow} | Tryb: {mode_str}")
-        return sentiment_label
-
-    except Exception as e:
-        logging.error(f"Błąd sentymentu: {e}")
-        SENTIMENT_STATE = "NEUTRAL"
-        return "UNKNOWN"
-
-def get_btc_realtime_metrics():
-    try:
-        df_btc = get_market_data_no_cache("BTCUSDC", interval="5", limit=6)
-        if df_btc is None or len(df_btc) < 4: return 0.0, 0.0
-        c = df_btc.iloc[-1]
-        candle_change = (c['close'] - c['open']) / c['open']
-        recent_15m_high = df_btc['high'].iloc[-3:].max()
-        drop_from_recent_high = (c['close'] - recent_15m_high) / recent_15m_high
-        return candle_change, drop_from_recent_high
-    except Exception:
-        return 0.0, 0.0
-
-def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
-    candle_change, drop_from_high = get_btc_realtime_metrics()
-    if candle_change <= drop_threshold or drop_from_high <= drop_threshold:
-        logging.warning(f"⚠️ [BTC RAPID GUARD] Spadek BTC 5M: {candle_change*100:.2f}%. Wstrzymuję zakupy.")
-        return False
-    try:
-        df_btc = get_market_data_no_cache("BTCUSDC", interval="15", limit=3)
-        if df_btc is not None and len(df_btc) > 1:
-            c15 = df_btc.iloc[-1]
-            if (c15['close'] - c15['open']) / c15['open'] <= -0.002:
-                logging.warning(f"⚠️ [BTC 15M GUARD] Spadek BTC 15M. Zakaz zakupów!")
-                return False
-    except Exception: pass
-    return True
-
-# ==============================================================================
-# STRATEGIA GŁÓWNA: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU) - POPRAWIONA
+# STRATEGIA GŁÓWNA: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU) - BEZ BLOKAD
 # ==============================================================================
 def run_ema29_89_swing_strategy():
-    """Strategia EMA 29/89 dla 5 monet. Kupuje po potwierdzonym przecięciu w oknie 3 świec."""
     global active_positions
     total_equity, free_usdc = get_balances()
     target_allocation = total_equity * EMA29_89_CAPITAL_PCT
 
-    with lock_pos:
-        current_count = len(active_positions)
+    with lock_pos: current_count = len(active_positions)
     if current_count >= MAX_TOTAL_POSITIONS:
+        logging.info(f"ℹ️ [LIMIT POZYCJI] Osiągnięto limit {current_count}/{MAX_TOTAL_POSITIONS}. Czekam na zamknięcie.")
         return
 
-    # Usunięto blokadę 'BEARISH' - strategia skanuje 5 kluczowych monet w każdym reżimie rynku!
-    logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam 5 monet ({EMA29_89_COINS}) | Alokacja: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
+    logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam {EMA29_89_COINS} | Cel: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
     for symbol in EMA29_89_COINS:
-        with lock_pos:
-            is_active = (symbol in active_positions)
-        if is_active or symbol in STABLE_PAIRS_BLACKLIST:
-            continue
+        with lock_pos: is_active = (symbol in active_positions)
+        if is_active: continue
 
         if free_usdc < (target_allocation * 0.99):
+            logging.info(f"⏳ [{symbol}] Za mało wolnych środków ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
             continue
 
         try:
-            df = get_market_data(symbol, interval="15", limit=120)
-            if df is None or len(df) < 95: continue
+            df = get_market_data(symbol, interval="15", limit=300)
+            if df is None or len(df) < 100:
+                logging.warning(f"⚠️ [{symbol}] Brak wystarczającej liczby świec 15M.")
+                continue
 
-            c = df.iloc[-2]  # Ostatnia zamknięta świeca 15M
-            p = df.iloc[-3]  # Świeca wcześniejsza
-            p2 = df.iloc[-4] # 3 świece wstecz
+            c = df.iloc[-2]   # Świeca zamknięta (kwadrans temu)
+            p = df.iloc[-3]   # 30 min temu
+            p2 = df.iloc[-4]  # 45 min temu
+            p3 = df.iloc[-5]  # 60 min temu
 
-            # Przecięcie w oknie ostatnich 2-3 świec + utrzymanie EMA 29 nad EMA 89
+            # Wykrywanie przecięcia w oknie ostatnich 45-60 minut (ostatnie 4 świece)
             crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
-                               (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89'])
+                               (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or \
+                               (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
             
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
-            is_bullish_aligned = c['ema29'] > c['ema89'] and spread_pct >= 0.0008  # Realistyczny próg +0.08%
-            candle_confirmed = (c['close'] >= c['open']) or (c['close'] > c['ema29'])
+            is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005  # min. +0.05%
+            candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
 
-            if crossed_recently and is_bullish_aligned and candle_confirmed:
+            logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.4f} | EMA89: {c['ema89']:.4f} | Spread: {spread_pct*100:+.3f}% | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
+
+            if crossed_recently and is_bullish_trend and candle_ok:
                 recent_low = df['low'].iloc[-4:-1].min()
                 initial_sl = recent_low * 0.998
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
+                    curr_price = df.iloc[-1]['close']
                     step, minq = get_symbol_lot_filter(symbol)
-                    q_str = format_qty_with_step(target_allocation / df.iloc[-1]['close'], step, minq)
+                    q_str = format_qty_with_step(target_allocation / curr_price, step, minq)
                     with lock_pos:
                         active_positions[symbol] = {
                             "strategy": "EMA29_89_SWING", 
-                            "buy_price": df.iloc[-1]['close'], 
-                            "peak_price": df.iloc[-1]['close'], 
+                            "buy_price": curr_price, 
+                            "peak_price": curr_price, 
                             "qty": q_str or "1", 
-                            "sold_half": False,
                             "trailing_sl_low": initial_sl
                         }
                         save_positions(active_positions)
-                    logging.info(f"⚡🚀 [KUPNO 20%] {symbol} (Złoty Krzyż EMA 29/89) | Alokacja: {target_allocation:.2f}$ | SL: {initial_sl:.4f}")
+                    logging.info(f"⚡🚀 [SUKCES - KUPNO 20%] {symbol} | Kwota: {target_allocation:.2f}$ | Cena: {curr_price:.4f} | Początkowy SL: {initial_sl:.4f}")
                     free_usdc -= target_allocation
+                else:
+                    logging.error(f"❌ Błąd zlecenia {symbol}: {res}")
         except Exception as e:
-            logging.error(f"Błąd analizy {symbol} w strategii EMA 29/89: {e}")
+            logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
 # PEŁNA PALETA 9 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
@@ -1101,9 +857,7 @@ def monitoring_worker():
     global active_positions
     while True:
         try:
-            with lock_pos:
-                items = list(active_positions.items())
-
+            with lock_pos: items = list(active_positions.items())
             if not items:
                 time.sleep(3)
                 continue
@@ -1222,7 +976,6 @@ def monitoring_worker():
                     for s in symbols_to_del:
                         if s in active_positions: del active_positions[s]
                     save_positions(active_positions)
-
         except Exception:
             pass
         time.sleep(3)
@@ -1273,9 +1026,7 @@ def bot_loop():
 
     while True:
         try:
-            with kline_cache_lock:
-                kline_cache_15m.clear()
-
+            with kline_cache_lock: kline_cache_15m.clear()
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU...")
 
@@ -1285,23 +1036,18 @@ def bot_loop():
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             with lock_history:
                 t_stats = trade_history.get("daily", {}).get(today_str, {"pnl_usd": 0.0, "trades": 0})
-                consec_losses = trade_history.get("consecutive_losses", 0)
 
-            can_buy, drop_peak, peak_eq = check_and_update_circuit_breakers(total_equity, current_sentiment)
             usdc_ok, usdc_stat = check_usdc_market_dependencies()
 
             start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
             diff = total_equity - start_eq
 
-            logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Zmiana Bybit: {diff:+.2f}$ | Porażki: {consec_losses}/3")
-            logging.info(f"🛡️ [DRAWDOWN] Szczyt dnia: {peak_eq:.2f}$ | Spadek: -{drop_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f}$ | Blokada przy: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f}$")
+            logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Zmiana Bybit: {diff:+.2f}$")
 
             sync_positions_from_bybit()
             auto_liquidate_stables_to_btc()
 
-            with lock_pos:
-                current_items = list(active_positions.items())
-
+            with lock_pos: current_items = list(active_positions.items())
             logging.info(f"💰 [PORTFEL] Wartość: {total_equity:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS} | Płynność USDC: {usdc_stat}")
             logging.info(f"=== [MONITOROWANIE POZYCJI: {len(current_items)} AKTYWNYCH] ===")
             
@@ -1319,9 +1065,9 @@ def bot_loop():
                 report_hourly_costs(total_equity)
 
             # ==================================================================
-            # SKANOWANIE I ZAKUPY
+            # SKANOWANIE I ZAKUPY (BEZ BLOKAD PORTFELOWYCH)
             # ==================================================================
-            if can_buy and is_btc_market_healthy() and usdc_ok:
+            if is_btc_market_healthy() and usdc_ok:
                 # 1. ZAWSZE AKTYWNA: STRATEGIA EMA 29/89 SWING (5 MONET x 20%)
                 run_ema29_89_swing_strategy()
                 
@@ -1348,9 +1094,8 @@ def bot_loop():
                         elif "BEARISH" not in current_sentiment:
                             logging.info("⏸️ [TRYB NEUTRAL] Rynek niezdecydowany. Pomijam pompy i PEPE.")
             else:
-                if not can_buy: logging.info("⛔ [ZAKUPY ZABLOKOWANE] Ochrona kapitału aktywna (Limit -15$ lub seria porażek).")
-                elif not usdc_ok: logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Ochrona płynności USDC: {usdc_stat}")
-                else: logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard.")
+                if not usdc_ok: logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Ochrona płynności USDC: {usdc_stat}")
+                else: logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard (gwałtowny spadek).")
 
             logging.info("💤 SKAN ZAKOŃCZONY. Następny cykl za 60 sek...")
             logging.info("--------------------------------------------------------------------------------")
