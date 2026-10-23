@@ -69,8 +69,12 @@ QUOTE_COIN = "USDC"
 ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 5 monetach
                                      # True = Odblokowuje wszystkie stare strategie (Poziomy 0-9)
 
-# --- STRATEGIA GŁÓWNA: 5 WYZNACZONYCH MONET x 20% KAPITAŁU (EMA 29/89) ---
-EMA29_89_COINS = ["SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC"]
+# --- STRATEGIA GŁÓWNA: EMA 29/89 (ROZSZERZONY KOSZYK) ---
+EMA29_89_COINS = [
+    "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
+    "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
+    "RENDERUSDC", "LINKUSDC"
+]
 EMA29_89_CAPITAL_PCT = 0.20          # Dokładnie 20% kapitału na pozycję
 MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 pozycji (5 x 20% = 100%)
 
@@ -416,9 +420,6 @@ def get_coin_available_balance(coin_name):
     except Exception: pass
     return 0.0
 
-# ==============================================================================
-# SYNCHRONIZACJA Z BYBIT (Z PEŁNYM PRZEJĘCIEM POD EMA 29/89 SWING)
-# ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
     if not session: return
@@ -440,7 +441,7 @@ def sync_positions_from_bybit():
                         cp = df.iloc[-1]['close']
                         val_usd = bal * cp
                         if val_usd >= MIN_SYNC_POSITION_VALUE:
-                            # Pobieramy faktyczną cenę zakupu ze zleceń giełdowych jeśli jest dostępna
+                            # Pobieramy faktyczną cenę zakupu ze zleceń jeśli dostępna
                             buy_p = cp
                             try:
                                 ex = session.get_executions(category=CATEGORY, symbol=sym, limit=5)
@@ -628,7 +629,7 @@ def update_market_sentiment():
         SENTIMENT_STATE = btc_sentiment
         ETH_SENTIMENT_STATE = eth_sentiment
         ALTCOIN_FLOW_STATE = alt_flow
-        mode_str = "WSZYSTKIE STRATEGIE (10 POZIOMÓW)" if ENABLE_LEGACY_STRATEGIES else "TYLKO EMA 29/89 (5 MONET x 20%)"
+        mode_str = "WSZYSTKIE STRATEGIE (10 POZIOMÓW)" if ENABLE_LEGACY_STRATEGIES else "TYLKO EMA 29/89"
         logging.info(f"📊 [MAKRO BTC+ETH] BTC 4H: {btc_sentiment} | ETH 4H: {eth_sentiment} | Rotacja: {alt_flow} | Tryb: {mode_str}")
         return btc_sentiment
     except Exception as e:
@@ -660,7 +661,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# STRATEGIA GŁÓWNA: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU)
+# STRATEGIA GŁÓWNA: EMA 29/89 SWING (ROZSZERZONY KOSZYK 12 MONET x 20%)
 # ==============================================================================
 def run_ema29_89_swing_strategy():
     global active_positions
@@ -672,20 +673,18 @@ def run_ema29_89_swing_strategy():
         logging.info(f"ℹ️ [LIMIT POZYCJI] Osiągnięto limit {current_count}/{MAX_TOTAL_POSITIONS}. Czekam na zamknięcie.")
         return
 
-    logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam {EMA29_89_COINS} | Cel: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
+    logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam {len(EMA29_89_COINS)} wyselekcjonowanych monet | Cel: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
     for symbol in EMA29_89_COINS:
         with lock_pos: is_active = (symbol in active_positions)
         if is_active: continue
 
         if free_usdc < (target_allocation * 0.99):
-            logging.info(f"⏳ [{symbol}] Za mało wolnych środków ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
             continue
 
         try:
             df = get_market_data(symbol, interval="15", limit=300)
             if df is None or len(df) < 100:
-                logging.warning(f"⚠️ [{symbol}] Brak wystarczającej liczby świec 15M.")
                 continue
 
             c = df.iloc[-2]   # Świeca zamknięta (kwadrans temu)
@@ -701,8 +700,6 @@ def run_ema29_89_swing_strategy():
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
             is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005  # min. +0.05%
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
-
-            logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.4f} | EMA89: {c['ema89']:.4f} | Spread: {spread_pct*100:+.3f}% | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
 
             if crossed_recently and is_bullish_trend and candle_ok:
                 recent_low = df['low'].iloc[-4:-1].min()
@@ -727,7 +724,7 @@ def run_ema29_89_swing_strategy():
                 else:
                     logging.error(f"❌ Błąd zlecenia {symbol}: {res}")
         except Exception as e:
-            logging.error(f"Błąd analizy {symbol}: {e}")
+            pass
 
 # ==============================================================================
 # PEŁNA PALETA 9 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
@@ -798,7 +795,7 @@ def run_mtf_alignment_strategy(top_symbols):
                     step, minq = get_symbol_lot_filter(symbol)
                     qty_str = format_qty_with_step(order_val / c15['close'], step, minq)
                     with lock_pos:
-                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": q_str or "1", "sold_half": False}
+                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": qty_str or "1", "sold_half": False}
                         save_positions(active_positions)
                     logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Kwota: {order_val:.2f}$ ({risk_label})")
                     break
@@ -1083,7 +1080,7 @@ def monitoring_worker():
                     trail_hit = False
                     sl_type = ""
 
-                    # 1. DEDYKOWANE PROWADZENIE DLA NOWEJ STRATEGII EMA 29/89
+                    # 1. DEDYKOWANE PROWADZENIE DLA STRATEGII EMA 29/89 (Trailing za dołkami 15M)
                     if strat == "EMA29_89_SWING":
                         if len(c_list) >= 4:
                             recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
@@ -1101,7 +1098,7 @@ def monitoring_worker():
                                 sl_hit = True
                                 sl_type = f"Wyjście z trendu (Stop za dołkiem: {curr_sl:.4f})"
                     
-                    # 2. STANDARDOWA OBSŁUGA POZYCJI DLA STARYCH / PRZYWRÓCONYCH MONET
+                    # 2. STANDARDOWA OBSŁUGA POZYCJI DLA STARYCH STRATEGII (Z Profilem obronnym i TP 3%)
                     else:
                         sold_half = pos.get("sold_half", False)
                         struc_sl = pos.get("structural_sl")
@@ -1251,11 +1248,14 @@ def bot_loop():
                 except Exception:
                     pass
 
+            if time.time() - last_hourly_cost_report >= 3600:
+                report_hourly_costs(total_equity)
+
             # ==================================================================
             # SKANOWANIE I ZAKUPY (BEZ BLOKAD PORTFELOWYCH)
             # ==================================================================
             if is_btc_market_healthy() and usdc_ok:
-                # 1. ZAWSZE AKTYWNA: STRATEGIA EMA 29/89 SWING (5 MONET x 20%)
+                # 1. ZAWSZE AKTYWNA: STRATEGIA EMA 29/89 SWING (ROZSZERZONA O NOWE MONETY)
                 run_ema29_89_swing_strategy()
                 
                 # 2. POZOSTAŁE STRATEGIE (KONTROLOWANE PRZEŁĄCZNIKIEM ENABLE_LEGACY_STRATEGIES)
