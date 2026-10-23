@@ -54,7 +54,7 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 # --- LIMITY FINANSOWE I REZERWY ---
-STANDARD_MIN_ORDER_VALUE = 65.0      # Wielkość pojedynczego wejścia dla strategii pomocniczych
+STANDARD_MIN_ORDER_VALUE = 20.0      # Minimalna wartość wejścia
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
 MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe (pozwala na 5x 20% alokacji)
@@ -71,7 +71,7 @@ USDC_1M_DUMP_THRESHOLD = -0.003      # Szybki zrzut BTCUSDC na 1M (-0.3%) blokuj
 # ==============================================================================
 # ZMIENNE GLOBALNE I DYNAMICZNE RYZYKO
 # ==============================================================================
-MAX_TOTAL_POSITIONS = 8              # Maksymalna liczba pozycji na koncie
+MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 pozycji (5 x 20% = 100%)
 MAX_EMA_CROSS_POSITIONS = 5          
 SENTIMENT_STATE = "NEUTRAL"
 ETH_SENTIMENT_STATE = "NEUTRAL"
@@ -236,7 +236,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
 last_hourly_cost_report = 0.0
 
 def report_hourly_costs(total_equity):
-    """Generuje co godzinę raport prowizji giełdowych, obrotu i kosztów handlu."""
     global last_hourly_cost_report, trade_history
     now_ts = time.time()
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -368,7 +367,6 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
         is_blocked_by_drop = drop_from_peak >= MAX_TRAILING_EQUITY_DROP_USD
         is_blocked_by_losses = (consecutive_losses >= MAX_CONSECUTIVE_LOSSES) or (now_ts < cooldown_until)
 
-        # Globalne odblokowanie przy potężnym wzroście Bitcoina
         if is_blocked_by_drop or is_blocked_by_losses:
             btc_surging, btc_gain = check_btc_significant_surge()
             if btc_surging:
@@ -379,12 +377,10 @@ def check_and_update_circuit_breakers(current_total_equity, current_sentiment):
                 save_trade_history(trade_history)
                 return True, 0.0, current_total_equity
 
-        # TWARDY WYŁĄCZNIK: Spadek o 15 USD od szczytu (GLOBALNY)
         if is_blocked_by_drop:
             logging.warning(f"🛑 [TRAILING BREAKER] Kapitał spadł o {drop_from_peak:.2f}$ od szczytu ({peak_equity:.2f}$). Zakupy BEZWZGLĘDNIE ZABLOKOWANE.")
             return False, drop_from_peak, peak_equity
 
-        # TWARDY BEZPIECZNIK: 3 straty z rzędu (GLOBALNY)
         if is_blocked_by_losses:
             if now_ts < cooldown_until:
                 rem_minutes = int((cooldown_until - now_ts) / 60)
@@ -525,64 +521,6 @@ def get_coin_available_balance(coin_name):
         pass
     return 0.0
 
-# ==============================================================================
-# FILTRY PŁYNNOŚCI (DLA NOWYCH WEJŚĆ)
-# ==============================================================================
-def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
-    try:
-        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        valid = [
-            t for t in tickers 
-            if t.get("symbol", "").endswith(QUOTE_COIN) 
-            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
-            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
-        ]
-        if valid:
-            valid.sort(key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
-            res = [t["symbol"] for t in valid[:limit_count]]
-            if "PEPEUSDC" not in res: res.append("PEPEUSDC")
-            return res
-    except Exception:
-        pass
-    return []
-
-def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
-    try:
-        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        valid = [
-            t for t in tickers 
-            if t.get("symbol", "").endswith(QUOTE_COIN) 
-            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
-            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
-        ]
-        if valid:
-            losers = [t for t in valid if safe_float(t.get("price24hPcnt")) <= -0.03]
-            losers.sort(key=lambda x: safe_float(x.get("price24hPcnt")))
-            return [t["symbol"] for t in losers[:limit_count]]
-    except Exception:
-        pass
-    return []
-
-def get_top_gainers_symbols(limit_count=TOP_GAINERS_COUNT):
-    try:
-        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        valid = [
-            t for t in tickers 
-            if t.get("symbol", "").endswith(QUOTE_COIN) 
-            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
-            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
-        ]
-        if valid:
-            gainers = [t for t in valid if safe_float(t.get("price24hPcnt")) >= 0.02]
-            gainers.sort(key=lambda x: safe_float(x.get("price24hPcnt")), reverse=True)
-            return [t["symbol"] for t in gainers[:limit_count]]
-    except Exception:
-        pass
-    return []
-
-# ==============================================================================
-# PEŁNA SYNCHRONIZACJA Z BYBIT (WSZYSTKIE 6 TWOICH MONET)
-# ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
     if not session: return
@@ -689,8 +627,7 @@ def get_market_data(symbol, interval="15", limit=250):
 # FILTRY MAKROEKONOMICZNE BTC + ETH + ROTACJA ETH/BTC
 # ==============================================================================
 def update_market_sentiment():
-    global MAX_TOTAL_POSITIONS, MAX_EMA_CROSS_POSITIONS, SAFE_RISK_PCT, MODERATE_RISK_PCT, HIGH_RISK_PCT
-    global SENTIMENT_STATE, ETH_SENTIMENT_STATE, ALTCOIN_FLOW_STATE
+    global SENTIMENT_STATE
     try:
         df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
         df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
@@ -736,56 +673,19 @@ def update_market_sentiment():
             ratio_ema21 = eth_btc_ratio.ewm(span=21, adjust=False).mean()
 
             if eth_btc_ratio.iloc[-1] > ratio_ema21.iloc[-1]:
-                alt_flow = "ALT_FLOW 🟢 (Kapitał w altach)"
+                alt_flow = "ALT_FLOW 🟢"
             else:
-                alt_flow = "ALT_PRESSURE 🔴 (Dominacja Bitcoina)"
-
-        ETH_SENTIMENT_STATE = eth_sentiment
-        ALTCOIN_FLOW_STATE = alt_flow
+                alt_flow = "ALT_PRESSURE 🔴"
 
         if btc_sentiment == "BULLISH":
             SENTIMENT_STATE = "BULLISH"
-            MAX_TOTAL_POSITIONS = 8
-            MAX_EMA_CROSS_POSITIONS = 5
-            SAFE_RISK_PCT = 0.15
-            MODERATE_RISK_PCT = 0.10
-            HIGH_RISK_PCT = 0.07
-            sentiment_label = "BULLISH 🟢 (Pełna Hossa)"
-
+            sentiment_label = "BULLISH 🟢"
         elif btc_sentiment == "BEARISH":
             SENTIMENT_STATE = "BEARISH"
-            btc_is_rebounding = False
-            try:
-                df_btc_1h = get_market_data_no_cache("BTCUSDC", interval="60", limit=10)
-                if df_btc_1h is not None and len(df_btc_1h) >= 4:
-                    c_now = df_btc_1h.iloc[-1]['close']
-                    open_2h = df_btc_1h.iloc[-3]['open']
-                    ema21_1h = df_btc_1h.iloc[-1]['ema21']
-                    growth_2h = (c_now - open_2h) / open_2h
-                    if c_now > ema21_1h and growth_2h >= 0.003:
-                        btc_is_rebounding = True
-            except Exception: pass
-
-            if btc_is_rebounding:
-                sentiment_label = "BEARISH 🔴 (Lokalne Odbicie BTC 🟢)"
-                MAX_TOTAL_POSITIONS = 5
-            else:
-                sentiment_label = "BEARISH 🔴 (Ścisła Defensywa)"
-                MAX_TOTAL_POSITIONS = 5
-
-            MAX_EMA_CROSS_POSITIONS = 0
-            SAFE_RISK_PCT = 0.12      
-            MODERATE_RISK_PCT = 0.0   
-            HIGH_RISK_PCT = 0.0       
-
+            sentiment_label = "BEARISH 🔴"
         else:
             SENTIMENT_STATE = "NEUTRAL"
-            sentiment_label = "NEUTRAL 🟡 (Rynek Boczny)"
-            MAX_TOTAL_POSITIONS = 6
-            MAX_EMA_CROSS_POSITIONS = 2
-            SAFE_RISK_PCT = 0.14
-            MODERATE_RISK_PCT = 0.08
-            HIGH_RISK_PCT = 0.0       
+            sentiment_label = "NEUTRAL 🟡"
         
         mode_str = "AKTYWNE WSZYSTKIE STRATEGIE (10 POZIOMÓW)" if ENABLE_LEGACY_STRATEGIES else "TYLKO EMA 29/89 (5 MONET x 20%)"
         logging.info(f"📊 [MAKRO BTC+ETH] BTC 4H: {sentiment_label} | ETH 4H: {eth_sentiment} | Rotacja: {alt_flow} | Tryb: {mode_str}")
@@ -824,10 +724,10 @@ def is_btc_market_healthy(drop_threshold=BTC_FAST_DROP_BUY_BLOCK_PCT):
     return True
 
 # ==============================================================================
-# STRATEGIA 1: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU)
+# STRATEGIA GŁÓWNA: EMA 29/89 SWING (5 MONET x 20% KAPITAŁU) - POPRAWIONA
 # ==============================================================================
 def run_ema29_89_swing_strategy():
-    """Nowa strategia dla 5 wyznaczonych monet. Alokacja 20%. Wyjście po SL kroczącym za dołkami."""
+    """Strategia EMA 29/89 dla 5 monet. Kupuje po potwierdzonym przecięciu w oknie 3 świec."""
     global active_positions
     total_equity, free_usdc = get_balances()
     target_allocation = total_equity * EMA29_89_CAPITAL_PCT
@@ -837,11 +737,8 @@ def run_ema29_89_swing_strategy():
     if current_count >= MAX_TOTAL_POSITIONS:
         return
 
-    # W bessie wymagamy potwierdzenia stabilności Bitcoina
-    if "BEARISH" in SENTIMENT_STATE:
-        return
-
-    logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam 5 monet ({EMA29_89_COINS}) | Budżet pozycji: {target_allocation:.2f}$ (20%)")
+    # Usunięto blokadę 'BEARISH' - strategia skanuje 5 kluczowych monet w każdym reżimie rynku!
+    logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam 5 monet ({EMA29_89_COINS}) | Alokacja: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
     for symbol in EMA29_89_COINS:
         with lock_pos:
@@ -856,18 +753,21 @@ def run_ema29_89_swing_strategy():
             df = get_market_data(symbol, interval="15", limit=120)
             if df is None or len(df) < 95: continue
 
-            c = df.iloc[-2]  # Ostatnia ZAMKNIĘTA świeca 15M
-            p = df.iloc[-3]  # Przedostatnia
+            c = df.iloc[-2]  # Ostatnia zamknięta świeca 15M
+            p = df.iloc[-3]  # Świeca wcześniejsza
+            p2 = df.iloc[-4] # 3 świece wstecz
 
-            # Warunek 1: Przecięcie EMA 29 powyżej EMA 89
-            basic_crossover = (p['ema29'] <= p['ema89']) and (c['ema29'] > c['ema89'])
+            # Przecięcie w oknie ostatnich 2-3 świec + utrzymanie EMA 29 nad EMA 89
+            crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
+                               (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89'])
+            
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
-            has_clean_spread = spread_pct >= 0.0025  # Wymagane min. +0.25% spreadu rozwarcia
-            candle_green = c['close'] > c['open']
+            is_bullish_aligned = c['ema29'] > c['ema89'] and spread_pct >= 0.0008  # Realistyczny próg +0.08%
+            candle_confirmed = (c['close'] >= c['open']) or (c['close'] > c['ema29'])
 
-            if basic_crossover and has_clean_spread and candle_green:
+            if crossed_recently and is_bullish_aligned and candle_confirmed:
                 recent_low = df['low'].iloc[-4:-1].min()
-                initial_sl = recent_low * 0.998  # Lekki bufor pod knotem
+                initial_sl = recent_low * 0.998
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
@@ -1249,7 +1149,6 @@ def monitoring_worker():
                         if len(c_list) >= 4:
                             recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
                             local_swing_low = min(recent_lows) * 0.998
-                            
                             curr_sl = pos.get("trailing_sl_low", 0.0)
                             
                             if local_swing_low > curr_sl and c_curr > bp:
@@ -1369,7 +1268,6 @@ def bot_loop():
     auto_liquidate_stables_to_btc()
     last_hourly_cost_report = time.time()
 
-    # Szybki asynchroniczny wątek sprawdzający Stop Loss / Trailing co 3 sekundy
     t_mon = threading.Thread(target=monitoring_worker, daemon=True)
     t_mon.start()
 
@@ -1398,7 +1296,6 @@ def bot_loop():
             logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Zmiana Bybit: {diff:+.2f}$ | Porażki: {consec_losses}/3")
             logging.info(f"🛡️ [DRAWDOWN] Szczyt dnia: {peak_eq:.2f}$ | Spadek: -{drop_peak:.2f}/{MAX_TRAILING_EQUITY_DROP_USD:.2f}$ | Blokada przy: {(peak_eq - MAX_TRAILING_EQUITY_DROP_USD):.2f}$")
 
-            # Pełna synchronizacja stanu Twojego portfela z giełdą
             sync_positions_from_bybit()
             auto_liquidate_stables_to_btc()
 
@@ -1425,10 +1322,10 @@ def bot_loop():
             # SKANOWANIE I ZAKUPY
             # ==================================================================
             if can_buy and is_btc_market_healthy() and usdc_ok:
-                # 1. ZAWSZE AKTYWNA: NOWA STRATEGIA EMA 29/89 SWING (5 MONET x 20%)
+                # 1. ZAWSZE AKTYWNA: STRATEGIA EMA 29/89 SWING (5 MONET x 20%)
                 run_ema29_89_swing_strategy()
                 
-                # 2. STRATEGIE POPRZEDNIE (KONTROLOWANE FLAGĄ ENABLE_LEGACY_STRATEGIES)
+                # 2. POZOSTAŁE STRATEGIE (KONTROLOWANE PRZEŁĄCZNIKIEM ENABLE_LEGACY_STRATEGIES)
                 if ENABLE_LEGACY_STRATEGIES:
                     top_vols = get_top_volume_symbols(TOP_MARKETS_COUNT)
                     if top_vols:
