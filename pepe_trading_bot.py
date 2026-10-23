@@ -18,6 +18,38 @@ from pybit.unified_trading import HTTP
 socket.setdefaulttimeout(15)
 
 # ==============================================================================
+# SYNCHRONIZACJA ZEGARA Z BYBIT (ZAPOBIEGA BŁĘDOWI 10002)
+# ==============================================================================
+time_offset_sec = 0.0
+
+def synced_time():
+    """Zwraca bieżący czas z nanosekundową precyzją powiększony o offset Bybit."""
+    return (time.time_ns() / 1_000_000_000.0) + time_offset_sec
+
+time.time = synced_time
+
+def sync_bybit_clock():
+    """Pobiera czas z publicznego endpointu Bybit i koryguje zegar bez podpisów."""
+    global time_offset_sec
+    for url in ["https://api.bybit.eu/v5/market/time", "https://api.bybit.com/v5/market/time"]:
+        try:
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("retCode") == 0:
+                    server_ms = int(data["result"]["timeNano"]) // 1_000_000
+                    local_ms = int(time.time_ns() / 1_000_000)
+                    time_offset_sec = (server_ms - local_ms) / 1000.0
+                    print(f"⏱️ Zsynchronizowano zegar z Bybit (Offset: {time_offset_sec*1000:+.1f} ms)", flush=True)
+                    return True
+        except Exception:
+            pass
+    return False
+
+# Wstępna synchronizacja zegara przed jakimkolwiek zapytaniem prywatnym
+sync_bybit_clock()
+
+# ==============================================================================
 # KONFIGURACJA BOTA SPOT (RYNEK USDC)
 # ==============================================================================
 FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
@@ -102,10 +134,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-
-_original_time = time.time
-time_offset_sec = 0.0
-time.time = lambda: _original_time() + time_offset_sec
 
 kline_cache_15m = {}
 kline_cache_lock = threading.Lock()
@@ -295,29 +323,14 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     return 0.0, "Brak środków"
 
 # ==============================================================================
-# INICJALIZACJA SESJI BYBIT I SYNCHRONIZACJA CZASU
+# INICJALIZACJA SESJI BYBIT
 # ==============================================================================
-def sync_server_time(client):
-    global time_offset_sec
-    try:
-        res_time = client.get_server_time()
-        if res_time.get("retCode") == 0:
-            bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
-            local_ms = int(_original_time() * 1000)
-            time_offset_sec = (bybit_ms - local_ms) / 1000.0
-            print(f"⏱️ Zsynchronizowano czas z Bybit (Offset: {time_offset_sec*1000:+.1f} ms)", flush=True)
-            return True
-    except Exception as e:
-        print(f"⚠️ Błąd synchronizacji czasu: {e}", flush=True)
-    return False
-
 endpoints = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
 session = None
 for name, url in endpoints:
     try:
         s = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
         s.endpoint = url
-        sync_server_time(s)
         res = s.get_wallet_balance(accountType="UNIFIED")
         if res.get("retCode") == 0:
             session = s
@@ -329,7 +342,6 @@ for name, url in endpoints:
 if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
-    sync_server_time(session)
 
 instrument_filters = {}
 def get_symbol_lot_filter(symbol):
@@ -404,6 +416,9 @@ def get_coin_available_balance(coin_name):
     except Exception: pass
     return 0.0
 
+# ==============================================================================
+# SYNCHRONIZACJA Z BYBIT (Z PEŁNYM PRZEJĘCIEM POD EMA 29/89 SWING)
+# ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
     if not session: return
@@ -413,23 +428,53 @@ def sync_positions_from_bybit():
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
             for coin_info in res["result"]["list"][0].get("coin", []):
                 coin = coin_info.get("coin")
-                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN"]: continue
+                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: continue
                 bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
                 if bal <= 0: continue
                 sym = f"{coin}USDC"
+                if sym in STABLE_PAIRS_BLACKLIST: continue
+
                 if sym not in active_positions:
-                    df = get_market_data_no_cache(sym, interval="15", limit=5)
+                    df = get_market_data_no_cache(sym, interval="15", limit=10)
                     if df is not None and len(df) > 0:
                         cp = df.iloc[-1]['close']
-                        if bal * cp >= MIN_SYNC_POSITION_VALUE:
+                        val_usd = bal * cp
+                        if val_usd >= MIN_SYNC_POSITION_VALUE:
+                            # Pobieramy faktyczną cenę zakupu ze zleceń giełdowych jeśli jest dostępna
+                            buy_p = cp
+                            try:
+                                ex = session.get_executions(category=CATEGORY, symbol=sym, limit=5)
+                                if ex.get("retCode") == 0:
+                                    buys = [e for e in ex.get("result", {}).get("list", []) if e.get("side") == "Buy"]
+                                    if buys: buy_p = safe_float(buys[0].get("execPrice"), cp)
+                            except Exception: pass
+
                             step, minq = get_symbol_lot_filter(sym)
                             q_str = format_qty_with_step(bal, step, minq)
                             if q_str:
-                                active_positions[sym] = {
-                                    "strategy": "AUTO_RESTORED", "buy_price": cp, 
-                                    "peak_price": cp, "qty": q_str, "trailing_sl_low": cp * 0.98
-                                }
-                                logging.info(f"🔄 [SYNC] Przywrócono {sym}: {q_str} szt.")
+                                if sym in EMA29_89_COINS:
+                                    # Monety z Twojej piątki przejmujemy pod dedykowany Trailing SL za dołkami 15M
+                                    recent_low = df['low'].iloc[-4:-1].min() if len(df) >= 4 else buy_p * 0.98
+                                    initial_sl = recent_low * 0.998
+                                    active_positions[sym] = {
+                                        "strategy": "EMA29_89_SWING",
+                                        "buy_price": buy_p,
+                                        "peak_price": max(cp, buy_p),
+                                        "qty": q_str,
+                                        "sold_half": False,
+                                        "trailing_sl_low": initial_sl
+                                    }
+                                    logging.info(f"🎯 [RĘCZNY ZAKUP / SYNC] Wykryto {sym} ({val_usd:.2f}$)! Przejęto pod strategię EMA29_89_SWING | SL pod dołkiem: {initial_sl:.4f}")
+                                else:
+                                    active_positions[sym] = {
+                                        "strategy": "AUTO_RESTORED",
+                                        "buy_price": buy_p,
+                                        "peak_price": max(cp, buy_p),
+                                        "qty": q_str,
+                                        "sold_half": False,
+                                        "trailing_sl_low": buy_p * 0.98
+                                    }
+                                    logging.info(f"🔄 [SYNC] Przywrócono {sym}: {q_str} szt. (Tryb obronny)")
             save_positions(active_positions)
     except Exception as e:
         logging.error(f"Błąd synchronizacji: {e}")
@@ -753,7 +798,7 @@ def run_mtf_alignment_strategy(top_symbols):
                     step, minq = get_symbol_lot_filter(symbol)
                     qty_str = format_qty_with_step(order_val / c15['close'], step, minq)
                     with lock_pos:
-                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": qty_str or "1", "sold_half": False}
+                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": q_str or "1", "sold_half": False}
                         save_positions(active_positions)
                     logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Kwota: {order_val:.2f}$ ({risk_label})")
                     break
@@ -980,7 +1025,7 @@ def scan_pepe_specialist():
         macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
         ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
         if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
-            res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
             if res.get("retCode") == 0:
                 step, minq = get_symbol_lot_filter(sym)
                 q_str = format_qty_with_step(order_val / c['close'], step, minq)
@@ -1170,6 +1215,11 @@ def bot_loop():
             logging.info("--------------------------------------------------------------------------------")
             logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU...")
 
+            # Okresowa resynchronizacja zegara co godzinę
+            if time.time() - last_hourly_cost_report >= 3600:
+                sync_bybit_clock()
+                report_hourly_costs(total_equity)
+
             current_sentiment = update_market_sentiment()
             total_equity, free_usdc = get_balances()
 
@@ -1200,9 +1250,6 @@ def bot_loop():
                     logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Szczyt: {pos.get('peak_price', cp)}{sl_info}")
                 except Exception:
                     pass
-
-            if time.time() - last_hourly_cost_report >= 3600:
-                report_hourly_costs(total_equity)
 
             # ==================================================================
             # SKANOWANIE I ZAKUPY (BEZ BLOKAD PORTFELOWYCH)
@@ -1257,7 +1304,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V8: Full Engine + Strategy Toggle)!")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V8: Full Engine + Dynamic Clock Sync)!")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
