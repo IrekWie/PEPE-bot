@@ -104,6 +104,8 @@ logging.basicConfig(
 )
 
 _original_time = time.time
+time_offset_sec = 0.0
+time.time = lambda: _original_time() + time_offset_sec
 
 kline_cache_15m = {}
 kline_cache_lock = threading.Lock()
@@ -293,21 +295,33 @@ def get_order_budget(total_equity, free_usdc, target_pct):
     return 0.0, "Brak środków"
 
 # ==============================================================================
-# INICJALIZACJA SESJI BYBIT
+# INICJALIZACJA SESJI BYBIT I SYNCHRONIZACJA CZASU
 # ==============================================================================
+def sync_server_time(client):
+    global time_offset_sec
+    try:
+        res_time = client.get_server_time()
+        if res_time.get("retCode") == 0:
+            bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
+            local_ms = int(_original_time() * 1000)
+            time_offset_sec = (bybit_ms - local_ms) / 1000.0
+            print(f"⏱️ Zsynchronizowano czas z Bybit (Offset: {time_offset_sec*1000:+.1f} ms)", flush=True)
+            return True
+    except Exception as e:
+        print(f"⚠️ Błąd synchronizacji czasu: {e}", flush=True)
+    return False
+
 endpoints = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
 session = None
 for name, url in endpoints:
     try:
         s = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
         s.endpoint = url
+        sync_server_time(s)
         res = s.get_wallet_balance(accountType="UNIFIED")
         if res.get("retCode") == 0:
             session = s
             print(f"✅ POŁĄCZONO: {name}", flush=True)
-            res_time = s.get_server_time()
-            bybit_ms = int(res_time["result"]["timeNano"]) // 1000000
-            time.time = lambda: _original_time() + (bybit_ms - int(_original_time() * 1000)) / 1000.0
             break
     except Exception:
         pass
@@ -315,6 +329,7 @@ for name, url in endpoints:
 if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
+    sync_server_time(session)
 
 instrument_filters = {}
 def get_symbol_lot_filter(symbol):
@@ -474,6 +489,61 @@ def get_market_data(symbol, interval="15", limit=300):
     return df
 
 # ==============================================================================
+# FILTRY PŁYNNOŚCI (DLA STRATEGII POBOCZNYCH)
+# ==============================================================================
+def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        valid = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
+        if valid:
+            valid.sort(key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
+            res = [t["symbol"] for t in valid[:limit_count]]
+            if "PEPEUSDC" not in res: res.append("PEPEUSDC")
+            return res
+    except Exception:
+        pass
+    return []
+
+def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        valid = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
+        if valid:
+            losers = [t for t in valid if safe_float(t.get("price24hPcnt")) <= -0.03]
+            losers.sort(key=lambda x: safe_float(x.get("price24hPcnt")))
+            return [t["symbol"] for t in losers[:limit_count]]
+    except Exception:
+        pass
+    return []
+
+def get_top_gainers_symbols(limit_count=TOP_GAINERS_COUNT):
+    try:
+        tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+        valid = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
+        if valid:
+            gainers = [t for t in valid if safe_float(t.get("price24hPcnt")) >= 0.02]
+            gainers.sort(key=lambda x: safe_float(x.get("price24hPcnt")), reverse=True)
+            return [t["symbol"] for t in gainers[:limit_count]]
+    except Exception:
+        pass
+    return []
+
+# ==============================================================================
 # FILTRY MAKROEKONOMICZNE BTC + ETH
 # ==============================================================================
 def update_market_sentiment():
@@ -578,12 +648,13 @@ def run_ema29_89_swing_strategy():
             p2 = df.iloc[-4]  # 45 min temu
             p3 = df.iloc[-5]  # 60 min temu
 
+            # Wykrywanie przecięcia w oknie ostatnich 45-60 minut (ostatnie 4 świece)
             crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
                                (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or \
                                (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
             
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
-            is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005
+            is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005  # min. +0.05%
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
 
             logging.info(f"🔍 [{symbol}] EMA29: {c['ema29']:.4f} | EMA89: {c['ema89']:.4f} | Spread: {spread_pct*100:+.3f}% | Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
@@ -909,7 +980,7 @@ def scan_pepe_specialist():
         macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
         ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
         if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
-            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
             if res.get("retCode") == 0:
                 step, minq = get_symbol_lot_filter(sym)
                 q_str = format_qty_with_step(order_val / c['close'], step, minq)
