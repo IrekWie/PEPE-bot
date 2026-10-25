@@ -64,20 +64,21 @@ CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
 # --- FLAGA KONTROLI STRATEGII (PRZEŁĄCZNIK) ---
-ENABLE_LEGACY_STRATEGIES = False
+ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 12 monetach
+                                     # True = Odblokowuje wszystkie 10 starych strategii (Poziomy 0-9)
 
-# --- STRATEGIA GŁÓWNA: EMA 29/89 SWING ---
+# --- STRATEGIA GŁÓWNA: EMA 29/89 (KOSZYK 12 MONET x 20% KAPITAŁU) ---
 EMA29_89_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
     "RENDERUSDC", "LINKUSDC"
 ]
-EMA29_89_CAPITAL_PCT = 0.20
-MAX_TOTAL_POSITIONS = 5
+EMA29_89_CAPITAL_PCT = 0.20          # Dokładnie 20% kapitału na pozycję
+MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 pozycji (5 x 20% = 100%)
 
-# --- USTAWIENIA SKANOWANIA I PŁYNNOŚCI ---
+# --- USTAWIENIA SKANOWANIA I PŁYNNOŚCI (DLA STRATEGII POBOCZNYCH) ---
 TOP_MARKETS_COUNT = 150
-MIN_24H_TURNOVER_USDC = 150000.0
+MIN_24H_TURNOVER_USDC = 150000.0     # Odrzucanie niepłynnych monet (obrót < 150k USD dziennie)
 TOP_DIPS_COUNT = 6
 TOP_GAINERS_COUNT = 4
 MAX_PUMP_POSITIONS = 3
@@ -89,16 +90,16 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 # --- LIMITY FINANSOWE I REZERWY ---
-STANDARD_MIN_ORDER_VALUE = 20.0
+STANDARD_MIN_ORDER_VALUE = 20.0      # Minimalna wartość wejścia
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02
+MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe
 
-# Bezpieczniki rynkowe
-USDC_MAX_SPREAD_PCT = 0.0010
-USDC_1M_DUMP_THRESHOLD = -0.005
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012
-BTC_FLASH_CRASH_EXIT_PCT = -0.015
+# Bezpieczniki rynkowe (realistyczne progi)
+USDC_MAX_SPREAD_PCT = 0.0010         # Max spread na BTCUSDC: 0.100%
+USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC na 1M (-0.5%) blokuje zakupy
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015
 
 # ==============================================================================
 # PARAMETRY DLA STRATEGII POBOCZNYCH (LEGACY)
@@ -114,11 +115,14 @@ HIGH_RISK_PCT = 0.07
 EMA_CROSS_MIN_SPREAD_PCT = 0.0020  
 EMA_CROSS_VOL_MULTIPLIER = 1.10    
 EMA_EXIT_HYSTERESIS_PCT  = 0.0020  
+
 DIP_RSI_5M_MAX = 30          
 DIP_VOL_MULTIPLIER = 2.5     
+
 PARTIAL_TP_PCT = 0.030          
 BREAKEVEN_TRIGGER_PCT = 0.015   
 BREAKEVEN_SL_PCT = 0.003        
+
 RSI_OVERBOUGHT_SELL = 82     
 PUMP_VOL_MULTIPLIER = 2.5    
 PUMP_PRICE_CHANGE_PCT = 0.025
@@ -154,13 +158,16 @@ def load_trade_history():
                 data = json.load(f)
                 if "trades_log" not in data: data["trades_log"] = []
                 return data
-        except Exception: pass
+        except Exception:
+            pass
     return {"total_realized_usd": 0.0, "total_trades": 0, "wins": 0, "losses": 0, "trades_log": [], "daily": {}}
 
 def save_trade_history(history):
     try:
-        with open(TRADE_HISTORY_FILE, "w") as f: json.dump(history, f, indent=4)
-    except Exception as e: logging.error(f"Błąd zapisu historii: {e}")
+        with open(TRADE_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=4)
+    except Exception as e:
+        logging.error(f"Błąd zapisu historii: {e}")
 
 trade_history = load_trade_history()
 lock_history = threading.Lock()
@@ -190,7 +197,9 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
             "fee": round(estimated_fee, 4), "gross_pnl": round(raw_pnl_usd, 2), "net_pnl": pnl_usd
         })
 
-        if len(trade_history["trades_log"]) > 200: trade_history["trades_log"] = trade_history["trades_log"][-200:]
+        if len(trade_history["trades_log"]) > 200:
+            trade_history["trades_log"] = trade_history["trades_log"][-200:]
+
         if "daily" not in trade_history: trade_history["daily"] = {}
         if today_str not in trade_history["daily"]:
             trade_history["daily"][today_str] = {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0, "total_fees": 0.0, "total_turnover": 0.0}
@@ -215,14 +224,17 @@ def report_hourly_costs(total_equity):
     global last_hourly_cost_report, trade_history
     now_ts = time.time()
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     with lock_history:
         trades_log = trade_history.get("trades_log", [])
         recent_trades = [t for t in trades_log if t.get("timestamp", 0) >= now_ts - 3600]
+
         h_trades_count = len(recent_trades)
         h_turnover = sum(t.get("turnover", 0.0) for t in recent_trades)
         h_fees = sum(t.get("fee", 0.0) for t in recent_trades)
         h_gross = sum(t.get("gross_pnl", 0.0) for t in recent_trades)
         h_net = sum(t.get("net_pnl", 0.0) for t in recent_trades)
+
         today_stats = trade_history.get("daily", {}).get(today_str, {})
         d_fees = today_stats.get("total_fees", 0.0)
         d_turnover = today_stats.get("total_turnover", 0.0)
@@ -232,6 +244,7 @@ def report_hourly_costs(total_equity):
 
     sign_gross = "+" if h_gross >= 0 else ""
     sign_net = "+" if h_net >= 0 else ""
+
     logging.info("================================================================================")
     logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
     logging.info("--------------------------------------------------------------------------------")
@@ -244,6 +257,7 @@ def report_hourly_costs(total_equity):
     logging.info(f"   • Łączny obrót dzienny: {d_turnover:.2f} USD")
     logging.info(f"   • Średni koszt prowizji na transakcję: -{avg_fee_per_trade:.2f} USD")
     logging.info("================================================================================")
+
     last_hourly_cost_report = now_ts
 
 # ==============================================================================
@@ -282,7 +296,9 @@ def check_usdc_market_dependencies():
                     if abs(peg_price - 1.0) >= 0.003:
                         logging.warning(f"⚠️ [GLOBAL USDC PEG ALERT] Odchylenie kursu USDC: {peg_price:.4f}!")
                         return False, f"GLOBAL_DEPEG_{peg_price:.4f}"
-        except Exception: pass
+        except Exception:
+            pass
+
         return True, "USDC_HEALTHY"
     except Exception as e:
         logging.warning(f"Błąd analizy zależności USDC: {e}")
@@ -301,9 +317,11 @@ def get_order_budget(total_equity, free_usdc, target_pct):
         if available >= MIN_EXCHANGE_NOTIONAL:
             return available, f"Zredukowane ({available:.2f}$) by zachować rezerwę ({MIN_CASH_RESERVE_PCT*100:.0f}%)"
         return 0.0, f"Brak gotówki (Chronię {MIN_CASH_RESERVE_PCT*100:.0f}% rezerwy)"
+
     if free_usdc >= effective_target:
         label = f"{target_pct * 100:.0f}%" if target_val >= STANDARD_MIN_ORDER_VALUE else f"Min. {STANDARD_MIN_ORDER_VALUE:.0f}$"
         return round(effective_target, 2), label
+
     return 0.0, "Brak środków"
 
 # ==============================================================================
@@ -320,7 +338,8 @@ for name, url in endpoints:
             session = s
             print(f"✅ POŁĄCZONO: {name}", flush=True)
             break
-    except Exception: pass
+    except Exception:
+        pass
 
 if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
@@ -336,7 +355,8 @@ def get_symbol_lot_filter(symbol):
             step = lot.get("basePrecision") or lot.get("qtyStep") or "0.000001"
             instrument_filters[symbol] = (step, lot.get("minOrderQty", "0.000001"))
             return instrument_filters[symbol]
-    except Exception: pass
+    except Exception:
+        pass
     return "0.0001", "0.0001"
 
 def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
@@ -383,7 +403,8 @@ def get_balances():
                     fu = safe_float(avail) if avail else safe_float(c.get("equity"))
                     break
             return te, fu
-    except Exception: pass
+    except Exception:
+        pass
     return 0.0, 0.0
 
 def get_coin_available_balance(coin_name):
@@ -411,6 +432,7 @@ def sync_positions_from_bybit():
                 if bal <= 0: continue
                 sym = f"{coin}USDC"
                 if sym in STABLE_PAIRS_BLACKLIST: continue
+
                 if sym not in active_positions:
                     df = get_market_data_no_cache(sym, interval="15", limit=10)
                     if df is not None and len(df) > 0:
@@ -424,6 +446,7 @@ def sync_positions_from_bybit():
                                     buys = [e for e in ex.get("result", {}).get("list", []) if e.get("side") == "Buy"]
                                     if buys: buy_p = safe_float(buys[0].get("execPrice"), cp)
                             except Exception: pass
+
                             step, minq = get_symbol_lot_filter(sym)
                             q_str = format_qty_with_step(bal, step, minq)
                             if q_str:
@@ -431,24 +454,30 @@ def sync_positions_from_bybit():
                                     recent_low = df['low'].iloc[-4:-1].min() if len(df) >= 4 else buy_p * 0.98
                                     initial_sl = recent_low * 0.998
                                     active_positions[sym] = {
-                                        "strategy": "EMA29_89_SWING", "buy_price": buy_p,
-                                        "peak_price": max(cp, buy_p), "qty": q_str,
-                                        "sold_half": False, "trailing_sl_low": initial_sl
+                                        "strategy": "EMA29_89_SWING",
+                                        "buy_price": buy_p,
+                                        "peak_price": max(cp, buy_p),
+                                        "qty": q_str,
+                                        "sold_half": False,
+                                        "trailing_sl_low": initial_sl
                                     }
-                                    logging.info(f"🎯 [RĘCZNY ZAKUP / SYNC] Wykryto {sym} ({val_usd:.2f}$)! Przejęto pod EMA29_89_SWING | SL: {initial_sl:.4f}")
+                                    logging.info(f"🎯 [RĘCZNY ZAKUP / SYNC] Wykryto {sym} ({val_usd:.2f}$)! Przejęto pod strategię EMA29_89_SWING | SL pod dołkiem: {initial_sl:.4f}")
                                 else:
                                     active_positions[sym] = {
-                                        "strategy": "AUTO_RESTORED", "buy_price": buy_p,
-                                        "peak_price": max(cp, buy_p), "qty": q_str,
-                                        "sold_half": False, "trailing_sl_low": buy_p * 0.98
+                                        "strategy": "AUTO_RESTORED",
+                                        "buy_price": buy_p,
+                                        "peak_price": max(cp, buy_p),
+                                        "qty": q_str,
+                                        "sold_half": False,
+                                        "trailing_sl_low": buy_p * 0.98
                                     }
-                                    logging.info(f"🔄 [SYNC] Przywrócono {sym}: {q_str} szt.")
+                                    logging.info(f"🔄 [SYNC] Przywrócono {sym}: {q_str} szt. (Tryb obronny)")
             save_positions(active_positions)
     except Exception as e:
         logging.error(f"Błąd synchronizacji: {e}")
 
 # ==============================================================================
-# POBIERANIE ŚWIEC I WSKAŹNIKÓW 
+# POBIERANIE ŚWIEC I WSKAŹNIKÓW (LIMIT=300 DLA PEŁNEJ ZGODNOŚCI EMA 89)
 # ==============================================================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -490,7 +519,6 @@ def get_market_data_no_cache(symbol, interval="15", limit=300):
         return None
 
 def fetch_data_worker(symbol):
-    """Pobiera dane asynchronicznie (własny wątek)."""
     return symbol, get_market_data_no_cache(symbol, interval="15", limit=300)
 
 def get_market_data(symbol, interval="15", limit=300):
@@ -498,6 +526,7 @@ def get_market_data(symbol, interval="15", limit=300):
     with kline_cache_lock:
         if interval == "15" and symbol in kline_cache_15m:
             return kline_cache_15m[symbol]
+    
     df = get_market_data_no_cache(symbol, interval, limit)
     if interval == "15" and df is not None:
         with kline_cache_lock:
@@ -510,35 +539,53 @@ def get_market_data(symbol, interval="15", limit=300):
 def get_top_volume_symbols(limit_count=TOP_MARKETS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        valid = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in STABLE_PAIRS_BLACKLIST and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC]
+        valid = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
         if valid:
             valid.sort(key=lambda x: safe_float(x.get("turnover24h")), reverse=True)
             res = [t["symbol"] for t in valid[:limit_count]]
             if "PEPEUSDC" not in res: res.append("PEPEUSDC")
             return res
-    except Exception: pass
+    except Exception:
+        pass
     return []
 
 def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        valid = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in STABLE_PAIRS_BLACKLIST and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC]
+        valid = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
         if valid:
             losers = [t for t in valid if safe_float(t.get("price24hPcnt")) <= -0.03]
             losers.sort(key=lambda x: safe_float(x.get("price24hPcnt")))
             return [t["symbol"] for t in losers[:limit_count]]
-    except Exception: pass
+    except Exception:
+        pass
     return []
 
 def get_top_gainers_symbols(limit_count=TOP_GAINERS_COUNT):
     try:
         tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-        valid = [t for t in tickers if t.get("symbol", "").endswith(QUOTE_COIN) and t.get("symbol") not in STABLE_PAIRS_BLACKLIST and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC]
+        valid = [
+            t for t in tickers 
+            if t.get("symbol", "").endswith(QUOTE_COIN) 
+            and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
         if valid:
             gainers = [t for t in valid if safe_float(t.get("price24hPcnt")) >= 0.02]
             gainers.sort(key=lambda x: safe_float(x.get("price24hPcnt")), reverse=True)
             return [t["symbol"] for t in gainers[:limit_count]]
-    except Exception: pass
+    except Exception:
+        pass
     return []
 
 # ==============================================================================
@@ -549,6 +596,7 @@ def update_market_sentiment():
     try:
         df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
         df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
+
         if df_btc is None or len(df_btc) < 50:
             SENTIMENT_STATE = "NEUTRAL"
             return "NEUTRAL (Brak danych BTC)"
@@ -626,7 +674,7 @@ def run_ema29_89_swing_strategy():
 
     logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam {len(EMA29_89_COINS)} wyselekcjonowanych monet | Cel: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
-    # Pobieranie danych równolegle dla 12 monet (oszczędność ~3 sekund)
+    # Pobieranie danych równolegle dla 12 monet
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in EMA29_89_COINS}
@@ -636,7 +684,6 @@ def run_ema29_89_swing_strategy():
                 results[sym] = df
                 with kline_cache_lock: kline_cache_15m[sym] = df
 
-    # Analiza pobranych danych w oryginalnej kolejności
     for symbol in EMA29_89_COINS:
         with lock_pos: is_active = (symbol in active_positions)
         if is_active: continue
@@ -646,25 +693,25 @@ def run_ema29_89_swing_strategy():
             continue
 
         try:
-            c_now = df.iloc[-1]   # Świeca bieżąca (w trakcie trwania)
-            c = df.iloc[-2]       # Świeca zamknięta 15M temu
-            p = df.iloc[-3]       # 30 min temu
-            p2 = df.iloc[-4]      # 45 min temu
-            p3 = df.iloc[-5]      # 60 min temu
+            c_now = df.iloc[-1]   # Świeca bieżąca
+            c = df.iloc[-2]       # Świeca zamknięta
+            p = df.iloc[-3]
+            p2 = df.iloc[-4]
+            p3 = df.iloc[-5]
 
-            # 1. Sprawdzenie przecięcia na świecach historycznych
-            crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or                                (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or                                (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
+            crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
+                               (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or \
+                               (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
             is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
             is_valid_signal = crossed_recently and is_bullish_trend and candle_ok
 
-            # 2. HYBRYDOWE WEJŚCIE: Złoty Krzyż w locie (na świecy bieżącej c_now)
+            # Hybrydowe wejście w trakcie świecy (wybicie w locie)
             spread_now = (c_now['ema29'] - c_now['ema89']) / c_now['ema89']
             crossed_now = (c['ema29'] <= c['ema89']) and (c_now['ema29'] > c_now['ema89'])
             is_strong_breakout = crossed_now and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema29'])
 
-            # Logika wyświetlania - dobieramy precyzję ułamkową i kolor
             disp_ema29 = c_now['ema29'] if crossed_now else c['ema29']
             disp_ema89 = c_now['ema89'] if crossed_now else c['ema89']
             disp_spread = spread_now if crossed_now else spread_pct
@@ -711,7 +758,7 @@ def run_ema29_89_swing_strategy():
             logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
-# PEŁNA PALETA 9 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
+# PEŁNA PALETA 10 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
 # ==============================================================================
 def run_support_bounce_strategy(top_symbols):
     global active_positions
@@ -720,6 +767,7 @@ def run_support_bounce_strategy(top_symbols):
     order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
     logging.info("=== [POZ 0: DNO SINUSOIDY] CONFIRMED BOLLINGER / SUPPORT BOUNCE (15M) ===")
     if order_val <= 0: return
+
     for symbol in top_symbols:
         if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
         if len(active_positions) >= MAX_TOTAL_POSITIONS: break
@@ -728,12 +776,14 @@ def run_support_bounce_strategy(top_symbols):
             if df is None or len(df) < 60: continue
             c_prev = df.iloc[-2]
             c_curr = df.iloc[-1]
+
             if (c_prev['low'] <= c_prev['bb_lower'] * 1.002 or c_prev['rsi'] <= 35.0):
                 body = abs(c_prev['close'] - c_prev['open'])
                 wick = min(c_prev['open'], c_prev['close']) - c_prev['low']
                 reversal = (c_prev['close'] > c_prev['open']) or (wick >= body * 1.5)
                 vol_ok = c_prev['volume'] >= (c_prev['vol_ma20'] * 0.85)
                 upside = (c_curr['close'] < c_prev['ema200']) or (c_curr['close'] < c_prev['bb_mid'])
+
                 if reversal and vol_ok and upside and c_curr['close'] >= c_prev['low']:
                     res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
                     if res.get("retCode") == 0:
@@ -751,23 +801,267 @@ def run_support_bounce_strategy(top_symbols):
         except Exception: pass
 
 def run_mtf_alignment_strategy(top_symbols):
-    pass # Pozostawione puste dla oszczędności miejsca
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 1: NAJBEZPIECZNIEJSZA] MULTI-TIMEFRAME ALIGNMENT 4H+15M ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df_4h = get_market_data_no_cache(symbol, interval="240", limit=60)
+            if df_4h is None or len(df_4h) < 45: continue
+            c4h = df_4h.iloc[-1]
+            if not (c4h['close'] > c4h['ema50'] and c4h['ema21'] > c4h['ema50']): continue
+
+            df_15m = get_market_data(symbol, interval="15", limit=60)
+            if df_15m is None: continue
+            c15 = df_15m.iloc[-2]
+            if c15['rsi'] <= 36 and ((c15['close'] > c15['open']) or ((c15['open'] - c15['low']) > abs(c15['close'] - c15['open']) * 1.5)):
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    qty_str = format_qty_with_step(order_val / c15['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": qty_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
 def scan_top150_for_ema_signals(top_symbols):
-    pass
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 2: BARDZO BEZPIECZNA] EMA TREND SCANNER ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=120)
+            if df is None: continue
+            c = df.iloc[-2]
+            if c['ema21'] > c['ema89'] and (c['low'] <= max(c['ema21'], c['ema89'])) and (c['low'] >= min(c['ema21'], c['ema89'])):
+                if c['close'] > c['open'] and 40 <= c['rsi'] <= 65 and c['volume'] >= c['vol_ma20']:
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                    if res.get("retCode") == 0:
+                        step, minq = get_symbol_lot_filter(symbol)
+                        q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                        with lock_pos:
+                            active_positions[symbol] = {"strategy": "EMA_SCAN", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                            save_positions(active_positions)
+                        logging.info(f"🔥 [KUPNO] {symbol} (EMA Scan) | Kwota: {order_val:.2f}$ ({risk_label})")
+                        break
+        except Exception: pass
+
 def run_top_gainers_strategy():
-    pass
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
+    logging.info("=== [POZ 3: UMIARKOWANIE BEZPIECZNA] TOP GAINERS PULLBACK ===")
+    if order_val <= 0: return
+
+    for symbol in get_top_gainers_symbols():
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        try:
+            df = get_market_data(symbol, interval="15", limit=120)
+            if df is None: continue
+            c = df.iloc[-2]
+            if (c['close'] > c['ema89']) and (c['ema21'] > c['ema89']) and (c['low'] <= max(c['ema9'], c['ema21'])) and (c['close'] >= c['ema21']) and (c['close'] > c['open']):
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "TOP_GAINER", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"🚀 [KUPNO] {symbol} (Gainer Pullback) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
 def run_relative_strength_strategy(top_symbols):
-    pass
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, SAFE_RISK_PCT)
+    logging.info("=== [POZ 4: BEZPIECZNA / OBRONNA] RELATIVE STRENGTH VS BTC ===")
+    if order_val <= 0: return
+
+    try:
+        df_btc = get_market_data("BTCUSDC", interval="15", limit=10)
+        if df_btc is None or len(df_btc) < 6: return
+        btc_change = (df_btc.iloc[-2]['close'] - df_btc.iloc[-5]['open']) / df_btc.iloc[-5]['open']
+        if not (-0.015 <= btc_change <= -0.003): return
+
+        for symbol in top_symbols:
+            if symbol in active_positions or symbol == "BTCUSDC" or symbol in STABLE_PAIRS_BLACKLIST: continue
+            if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+            try:
+                df_alt = get_market_data(symbol, interval="15", limit=60)
+                if df_alt is None or len(df_alt) < 40: continue
+                c_now = df_alt.iloc[-2]
+                alt_change = (c_now['close'] - df_alt.iloc[-5]['open']) / df_alt.iloc[-5]['open']
+                if alt_change >= 0.010 and c_now['close'] > c_now['ema21'] and c_now['volume'] >= (c_now['vol_ma20'] * 1.3):
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                    if res.get("retCode") == 0:
+                        step, minq = get_symbol_lot_filter(symbol)
+                        q_str = format_qty_with_step(order_val / c_now['close'], step, minq)
+                        with lock_pos:
+                            active_positions[symbol] = {"strategy": "RELATIVE_STRENGTH", "buy_price": c_now['close'], "peak_price": c_now['close'], "qty": q_str or "1", "sold_half": False}
+                            save_positions(active_positions)
+                        logging.info(f"🛡️ [KUPNO] {symbol} (RS vs BTC) | Kwota: {order_val:.2f}$ ({risk_label})")
+                        break
+            except Exception: pass
+    except Exception: pass
+
 def run_bb_squeeze_strategy(top_symbols):
-    pass
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
+    logging.info("=== [POZ 5: ŚREDNIE RYZYKO] BOLLINGER BANDS SQUEEZE ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=60)
+            if df is None or len(df) < 40: continue
+            c = df.iloc[-2]
+            recent_widths = df['bb_width'].iloc[-20:-2]
+            avg_width = df['bb_width'].iloc[-40:-2].mean()
+            if recent_widths.min() <= (avg_width * 0.70) and c['close'] > c['bb_upper'] and c['close'] > c['open'] and c['volume'] >= (c['vol_ma20'] * 2.5):
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "BB_SQUEEZE", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"💥 [KUPNO] {symbol} (BB Squeeze) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
 def run_ema21_89_pure_crossover_strategy(top_symbols):
-    pass
+    global active_positions
+    cross_cnt = sum(1 for p in active_positions.values() if p.get("strategy") == "EMA21_89_CROSS")
+    if cross_cnt >= MAX_EMA_CROSS_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, MODERATE_RISK_PCT)
+    logging.info("=== [POZ 6: ŚREDNIO-WYŻSZE RYZYKO] CZYSTY CROSS EMA 21/89 ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=120)
+            if df is None or len(df) < 95: continue
+            c = df.iloc[-2]
+            p = df.iloc[-3]
+            if (p['ema21'] <= p['ema89']) and (c['ema21'] > c['ema89']) and ((c['ema21'] - c['ema89']) / c['ema89'] >= EMA_CROSS_MIN_SPREAD_PCT):
+                if c['close'] > c['ema21'] and c['close'] > c['open'] and c['volume'] >= (c['vol_ma20'] * EMA_CROSS_VOL_MULTIPLIER):
+                    res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                    if res.get("retCode") == 0:
+                        step, minq = get_symbol_lot_filter(symbol)
+                        q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                        with lock_pos:
+                            active_positions[symbol] = {"strategy": "EMA21_89_CROSS", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                            save_positions(active_positions)
+                        logging.info(f"⚡ [KUPNO] {symbol} (Złoty Krzyż EMA 21/89) | Kwota: {order_val:.2f}$ ({risk_label})")
+                        break
+        except Exception: pass
+
 def run_dip_hunter_strategy():
-    pass
+    global active_positions
+    if len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
+    logging.info("=== [POZ 7: WYŻSZE RYZYKO] REAL-TIME DIP HUNTER (5M) ===")
+    if order_val <= 0: return
+
+    for symbol in get_top_losers_symbols(limit_count=6):
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        try:
+            df = get_market_data_no_cache(symbol, interval="5", limit=30)
+            if df is None or len(df) < 25: continue
+            c = df.iloc[-1]
+            body = abs(c['close'] - c['open'])
+            wick = min(c['open'], c['close']) - c['low']
+            if wick > (body * 2.0) and c['volume'] >= (c['vol_ma20'] * DIP_VOL_MULTIPLIER) and c['rsi'] <= DIP_RSI_5M_MAX:
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "DIP_HUNTER_5M", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"🔥 [KUPNO] {symbol} (Dip Hunter 5M) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
 def scan_for_pumps(top_symbols):
-    pass
+    global active_positions
+    pumps_cnt = sum(1 for p in active_positions.values() if p.get("strategy") == "PUMP_HUNTER")
+    if pumps_cnt >= MAX_PUMP_POSITIONS or len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
+    logging.info("=== [POZ 8: WYSOKIE RYZYKO] MOMENTUM PUMP HUNTER ===")
+    if order_val <= 0: return
+
+    for symbol in top_symbols:
+        if symbol in active_positions or symbol in STABLE_PAIRS_BLACKLIST: continue
+        if len(active_positions) >= MAX_TOTAL_POSITIONS: break
+        try:
+            df = get_market_data(symbol, interval="15", limit=25)
+            if df is None: continue
+            c = df.iloc[-2]
+            if (c['close'] - c['open']) / c['open'] >= PUMP_PRICE_CHANGE_PCT and c['volume'] >= (c['vol_ma20'] * PUMP_VOL_MULTIPLIER) and 45 <= c['rsi'] <= 75:
+                res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+                if res.get("retCode") == 0:
+                    step, minq = get_symbol_lot_filter(symbol)
+                    q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                    with lock_pos:
+                        active_positions[symbol] = {"strategy": "PUMP_HUNTER", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                        save_positions(active_positions)
+                    logging.info(f"🚀 [KUPNO] {symbol} (Pump Hunter) | Kwota: {order_val:.2f}$ ({risk_label})")
+                    break
+        except Exception: pass
+
 def scan_pepe_specialist():
-    pass
+    global active_positions
+    sym = "PEPEUSDC"
+    if sym in active_positions or len(active_positions) >= MAX_TOTAL_POSITIONS: return
+    total_equity, free_usdc = get_balances()
+    order_val, risk_label = get_order_budget(total_equity, free_usdc, HIGH_RISK_PCT)
+    logging.info("=== [POZ 9: NAJBARDZIEJ RYZYKOWNA / MEME] PEPE EMA SPECIALIST ===")
+    if order_val <= 0: return
+
+    try:
+        df = get_market_data(sym, interval="15", limit=250)
+        if df is None or len(df) < 200: return
+        c = df.iloc[-2]
+        p = df.iloc[-3]
+        macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
+        ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
+        if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
+            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            if res.get("retCode") == 0:
+                step, minq = get_symbol_lot_filter(sym)
+                q_str = format_qty_with_step(order_val / c['close'], step, minq)
+                with lock_pos:
+                    active_positions[sym] = {"strategy": "PEPE_SPECIALIST", "buy_price": c['close'], "peak_price": c['close'], "qty": q_str or "1", "sold_half": False}
+                    save_positions(active_positions)
+                logging.info(f"🐸 [KUPNO] PEPEUSDC (Odbicie EMA 21) | Kwota: {order_val:.2f}$ ({risk_label})")
+    except Exception: pass
 
 # ==============================================================================
 # SZYBKI ASYNCHRONICZNY WĄTEK MONITOROWANIA (ODŚWIEŻANIE CO 3 SEKUNDY)
@@ -793,6 +1087,7 @@ def monitoring_worker():
             except: pass
 
             symbols_to_del = []
+
             for symbol, pos in items:
                 try:
                     res = session.get_kline(category=CATEGORY, symbol=symbol, interval="15", limit=15)
@@ -802,31 +1097,43 @@ def monitoring_worker():
                     c_curr = safe_float(c_list[0][4])
                     bp = pos["buy_price"]
                     peak = max(pos.get("peak_price", bp), c_curr)
+
                     with lock_pos:
-                        if symbol in active_positions: active_positions[symbol]["peak_price"] = peak
+                        if symbol in active_positions:
+                            active_positions[symbol]["peak_price"] = peak
 
                     total_pnl = (c_curr - bp) / bp
                     strat = pos.get("strategy", "")
-                    sl_hit = be_hit = dyn_hit = trail_hit = False
+
+                    sl_hit = False
+                    be_hit = False
+                    dyn_hit = False
+                    trail_hit = False
                     sl_type = ""
 
+                    # 1. DEDYKOWANE PROWADZENIE DLA NOWEJ STRATEGII EMA 29/89
                     if strat == "EMA29_89_SWING":
                         if len(c_list) >= 4:
                             recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
                             local_swing_low = min(recent_lows) * 0.998
                             curr_sl = pos.get("trailing_sl_low", 0.0)
+                            
                             if local_swing_low > curr_sl and c_curr > bp:
                                 with lock_pos:
                                     if symbol in active_positions:
                                         active_positions[symbol]["trailing_sl_low"] = local_swing_low
                                         save_positions(active_positions)
                                 logging.info(f"📈 [TRAILING SL] Podniesiono SL dla {symbol} na {local_swing_low:.4f} (za lokalnym dołkiem).")
+                                
                             if curr_sl > 0 and c_curr <= curr_sl:
                                 sl_hit = True
                                 sl_type = f"Wyjście z trendu (Stop za dołkiem: {curr_sl:.4f})"
+                    
+                    # 2. STANDARDOWA OBSŁUGA POZYCJI DLA STARYCH / PRZYWRÓCONYCH MONET
                     else:
                         sold_half = pos.get("sold_half", False)
                         struc_sl = pos.get("structural_sl")
+                        
                         tr_list = []
                         for i in range(len(c_list)-1):
                             h = safe_float(c_list[i][2])
@@ -935,7 +1242,6 @@ def bot_loop():
         try:
             with kline_cache_lock: kline_cache_15m.clear()
             
-            # Wypisywanie nagłówka cyklu tylko co 60 sekund (choć sam skan działa co 10s)
             now_ts = time.time()
             if now_ts - last_scan_print_time >= 60:
                 logging.info("--------------------------------------------------------------------------------")
@@ -1007,7 +1313,6 @@ def bot_loop():
         except Exception as e:
             logging.error(f"Błąd głównej pętli: {e}")
             
-        # SKRÓCONY CZAS PĘTLI
         time.sleep(10)
 
 def self_ping_loop():
