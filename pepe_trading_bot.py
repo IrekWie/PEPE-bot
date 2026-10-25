@@ -64,14 +64,15 @@ CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
 # --- FLAGA KONTROLI STRATEGII (PRZEŁĄCZNIK) ---
-ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 12 monetach
+ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 16 monetach
                                      # True = Odblokowuje wszystkie 10 starych strategii (Poziomy 0-9)
 
-# --- STRATEGIA GŁÓWNA: EMA 29/89 (KOSZYK 12 MONET x 20% KAPITAŁU) ---
+# --- STRATEGIA GŁÓWNA: EMA 29/89 (KOSZYK 16 MONET x 20% KAPITAŁU) ---
 EMA29_89_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
-    "RENDERUSDC", "LINKUSDC"
+    "RENDERUSDC", "LINKUSDC", "INJUSDC", "TIAUSDC", "FETUSDC",
+    "ONDOUSDC"
 ]
 EMA29_89_CAPITAL_PCT = 0.20          # Dokładnie 20% kapitału na pozycję
 MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 pozycji (5 x 20% = 100%)
@@ -561,8 +562,7 @@ def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
             t for t in tickers 
             if t.get("symbol", "").endswith(QUOTE_COIN) 
             and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
-            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
-        ]
+            and safe_float(t.get("price24hPcnt")) <= -0.03]
         if valid:
             losers = [t for t in valid if safe_float(t.get("price24hPcnt")) <= -0.03]
             losers.sort(key=lambda x: safe_float(x.get("price24hPcnt")))
@@ -674,9 +674,9 @@ def run_ema29_89_swing_strategy():
 
     logging.info(f"🎯 [SKANER EMA 29/89] Sprawdzam {len(EMA29_89_COINS)} wyselekcjonowanych monet | Cel: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
-    # Pobieranie danych równolegle dla 12 monet
+    # Pobieranie danych równolegle dla 16 monet
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in EMA29_89_COINS}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
@@ -1063,7 +1063,7 @@ def scan_pepe_specialist():
         macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
         ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
         if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
-            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
             if res.get("retCode") == 0:
                 step, minq = get_symbol_lot_filter(sym)
                 q_str = format_qty_with_step(order_val / c['close'], step, minq)
@@ -1121,6 +1121,7 @@ def monitoring_worker():
                     trail_hit = False
                     sl_type = ""
 
+                    # 1. DEDYKOWANE PROWADZENIE DLA NOWEJ STRATEGII EMA 29/89
                     if strat == "EMA29_89_SWING":
                         sold_half = pos.get("sold_half", False)
                         
