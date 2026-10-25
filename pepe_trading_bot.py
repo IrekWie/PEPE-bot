@@ -693,24 +693,33 @@ def run_ema29_89_swing_strategy():
             continue
 
         try:
-            c_now = df.iloc[-1]   # Świeca bieżąca
-            c = df.iloc[-2]       # Świeca zamknięta
+            c_now = df.iloc[-1]   # Świeca bieżąca (w trakcie trwania)
+            c = df.iloc[-2]       # Świeca zamknięta 15M temu
             p = df.iloc[-3]
             p2 = df.iloc[-4]
             p3 = df.iloc[-5]
 
+            # 1. Przecięcie na świecach historycznych (ostatnia godzina)
             crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
                                (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or \
                                (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
             is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
-            is_valid_signal = crossed_recently and is_bullish_trend and candle_ok
 
-            # Hybrydowe wejście w trakcie świecy (wybicie w locie)
+            # Filtr wolumenu: min. 1.10x (110%) 20-okresowej średniej wolumenu
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
+            vol_ok = vol_ratio >= 1.10
+
+            is_valid_signal = crossed_recently and is_bullish_trend and candle_ok and vol_ok
+
+            # 2. Hybrydowe wejście w trakcie świecy (wybicie w locie)
             spread_now = (c_now['ema29'] - c_now['ema89']) / c_now['ema89']
             crossed_now = (c['ema29'] <= c['ema89']) and (c_now['ema29'] > c_now['ema89'])
-            is_strong_breakout = crossed_now and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema29'])
+            vol_now_ratio = (c_now['volume'] / c_now['vol_ma20']) if (c_now['vol_ma20'] and c_now['vol_ma20'] > 0) else 1.0
+            
+            # W locie wymagamy spreadu >= +0.10% oraz podwyższonego tempa obrotu
+            is_strong_breakout = crossed_now and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema29']) and (vol_now_ratio >= 0.50 or vol_ratio >= 1.0)
 
             disp_ema29 = c_now['ema29'] if crossed_now else c['ema29']
             disp_ema89 = c_now['ema89'] if crossed_now else c['ema89']
@@ -718,7 +727,8 @@ def run_ema29_89_swing_strategy():
             
             dec = 8 if disp_ema29 < 0.01 else 4
             spread_tag = f"🟢 +{disp_spread*100:.3f}%" if disp_spread >= 0 else f"🔴 {disp_spread*100:.3f}%"
-            log_msg = f"🔍 [{symbol}] EMA29: {disp_ema29:.{dec}f} | EMA89: {disp_ema89:.{dec}f} | Spread: {spread_tag} | "
+            vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ok else '🔴'})"
+            log_msg = f"🔍 [{symbol}] EMA29: {disp_ema29:.{dec}f} | EMA89: {disp_ema89:.{dec}f} | Spread: {spread_tag} | {vol_tag} | "
             
             if is_strong_breakout:
                 logging.info(log_msg + f"🚀 HYBRYDOWE PRZEBICIE W LOCIE (Kupno natychmiastowe!)")
@@ -826,7 +836,7 @@ def run_mtf_alignment_strategy(top_symbols):
                     step, minq = get_symbol_lot_filter(symbol)
                     qty_str = format_qty_with_step(order_val / c15['close'], step, minq)
                     with lock_pos:
-                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": qty_str or "1", "sold_half": False}
+                        active_positions[symbol] = {"strategy": "MTF_ALIGNMENT", "buy_price": c15['close'], "peak_price": c15['close'], "qty": q_str or "1", "sold_half": False}
                         save_positions(active_positions)
                     logging.info(f"💎 [KUPNO] {symbol} (MTF Alignment) | Kwota: {order_val:.2f}$ ({risk_label})")
                     break
