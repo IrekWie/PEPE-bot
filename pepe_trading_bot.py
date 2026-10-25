@@ -1121,23 +1121,60 @@ def monitoring_worker():
                     trail_hit = False
                     sl_type = ""
 
-                    # 1. DEDYKOWANE PROWADZENIE DLA NOWEJ STRATEGII EMA 29/89
                     if strat == "EMA29_89_SWING":
+                        sold_half = pos.get("sold_half", False)
+                        
+                        # 1. Cząstkowy TP (33% przy +2.5%)
+                        if not sold_half and total_pnl >= 0.025:
+                            rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
+                            if rb > 0:
+                                st, mq = get_symbol_lot_filter(symbol)
+                                qs = format_qty_with_step(rb * 0.33, st, mq)
+                                if qs:
+                                    ticker = session.get_tickers(category=CATEGORY, symbol=symbol)
+                                    ask_p = safe_float(ticker.get("result", {}).get("list", [{}])[0].get("ask1Price", c_curr))
+                                    session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Limit", qty=qs, price=str(ask_p), timeInForce="PostOnly")
+                                    with lock_pos:
+                                        if symbol in active_positions:
+                                            active_positions[symbol]["sold_half"] = True
+                                            save_positions(active_positions)
+                                    logging.info(f"💸 [PARTIAL TP] {symbol} LIMIT ORDER po {ask_p:.4f} USD (+2.5%).")
+                        
+                        # 2. Obliczenie aktywnego poziomu obrony (BreakEven vs Trailing)
+                        be_level = bp * 1.003
+                        if (peak - bp) / bp >= 0.015 or sold_half:
+                            # Próg BreakEven aktywowany
+                            curr_sl = max(pos.get("trailing_sl_low", 0.0), be_level)
+                        else:
+                            curr_sl = pos.get("trailing_sl_low", 0.0)
+
+                        # 3. Dynamiczne podnoszenie za dołkami 15M
                         if len(c_list) >= 4:
                             recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
                             local_swing_low = min(recent_lows) * 0.998
-                            curr_sl = pos.get("trailing_sl_low", 0.0)
                             
-                            if local_swing_low > curr_sl and c_curr > bp:
+                            if local_swing_low > pos.get("trailing_sl_low", 0.0) and c_curr > bp:
                                 with lock_pos:
                                     if symbol in active_positions:
                                         active_positions[symbol]["trailing_sl_low"] = local_swing_low
                                         save_positions(active_positions)
-                                logging.info(f"📈 [TRAILING SL] Podniesiono SL dla {symbol} na {local_swing_low:.4f} (za lokalnym dołkiem).")
-                                
-                            if curr_sl > 0 and c_curr <= curr_sl:
-                                sl_hit = True
+                                logging.info(f"📈 [TRAILING SL] Podniesiono bazowy SL dla {symbol} na {local_swing_low:.4f} (za lokalnym dołkiem).")
+
+                        # Aktualizacja bieżącego Stop Lossa po ewentualnym wyznaczeniu nowego dołka
+                        curr_sl = max(curr_sl, pos.get("trailing_sl_low", 0.0))
+
+                        # 4. Sprawdzenie wybicia obrony dołem
+                        if curr_sl > 0 and c_curr <= curr_sl:
+                            sl_hit = True
+                            if curr_sl == be_level:
+                                sl_type = f"BreakEven (Obrona kapitału)"
+                            else:
                                 sl_type = f"Wyjście z trendu (Stop za dołkiem: {curr_sl:.4f})"
+                                
+                        # 5. Ochrona zysku prosto ze szczytu (-1.0% od peaku przy zysku min +2.0%)
+                        if (peak - bp) / bp >= 0.020 and (peak - c_curr) / peak >= 0.010:
+                            trail_hit = True
+                            sl_type = f"Ochrona zysku ze szczytu (Trailing -1.0%)"
                     
                     # 2. STANDARDOWA OBSŁUGA POZYCJI DLA STARYCH / PRZYWRÓCONYCH MONET
                     else:
@@ -1337,7 +1374,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V9: Hybrydowe skanowanie w locie + Wielowatkowosc)")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V10: Volume Filter + Peak Trailing + BreakEven)")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
