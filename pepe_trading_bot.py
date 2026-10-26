@@ -63,15 +63,15 @@ TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# --- KOSZYK 16 WYSELEKCJONOWANYCH MONET SPOT USDC ---
+# --- KOSZYK 20 WYSELEKCJONOWANYCH MONET SPOT USDC ---
 SNIPER_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
     "RENDERUSDC", "LINKUSDC", "INJUSDC", "TIAUSDC", "FETUSDC",
-    "ONDOUSDC"
+    "ONDOUSDC", "XRPUSDC", "ENAUSDC", "ARBUSDC", "ADAUSDC"
 ]
-CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję[cite: 8]
-MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)[cite: 8]
+CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję
+MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -82,22 +82,22 @@ STABLE_PAIRS_BLACKLIST = [
 STANDARD_MIN_ORDER_VALUE = 20.0
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe[cite: 8]
+MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe
 
 # --- BEZPIECZNIKI RYNKOWE ---
-USDC_MAX_SPREAD_PCT = 0.0010         # Max spread rynkowy 0.10%[cite: 8]
-USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy[cite: 8]
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy[cite: 8]
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015 # Paniczny zrzut BTC 15M > -1.5%[cite: 8]
+USDC_MAX_SPREAD_PCT = 0.0010         # Max spread rynkowy 0.10%
+USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015 # Paniczny zrzut BTC 15M > -1.5%
 
 CURRENT_SENTIMENT = "NEUTRAL 🟡"
 
 # --- PARAMETRY RYZYKA I REALIZACJI ZYSKU ---
-PARTIAL_TP_PCT = 0.025               # Częściowy TP: 33% przy +2.5%[cite: 8]
-BREAKEVEN_TRIGGER_PCT = 0.015        # Próg aktywacji BreakEven przy +1.5%[cite: 8]
-BREAKEVEN_SL_PCT = 0.003             # Poziom SL BreakEven (+0.3% zysku - pokrywa fee)[cite: 8]
-PEAK_TRAIL_TRIGGER_PCT = 0.020       # Ochrona ze szczytu: aktywacja powyżej +2.0%[cite: 8]
-PEAK_TRAIL_PULLBACK_PCT = 0.010      # Zamknięcie przy cofnięciu 1.0% od szczytu[cite: 8]
+PARTIAL_TP_PCT = 0.025               # Częściowy TP: 33% przy +2.5%
+BREAKEVEN_TRIGGER_PCT = 0.015        # Próg aktywacji BreakEven przy +1.5%
+BREAKEVEN_SL_PCT = 0.003             # Poziom SL BreakEven (+0.3% zysku - pokrywa fee)
+PEAK_TRAIL_TRIGGER_PCT = 0.020       # Ochrona ze szczytu: aktywacja powyżej +2.0%
+PEAK_TRAIL_PULLBACK_PCT = 0.010      # Zamknięcie przy cofnięciu 1.0% od szczytu
 
 APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
@@ -483,7 +483,7 @@ def update_market_sentiment():
             if eth_candle['close'] > eth_candle['ema50'] and eth_candle['ema21'] > eth_candle['ema50']: eth_sentiment = "BULLISH 🟢"
             else: eth_sentiment = "BEARISH 🔴"
 
-        logging.info(f"📊 [MAKRO TREND 4H] BTC: {btc_sentiment} | ETH: {eth_sentiment} | Strategia: JEDNOLITY BOTTOM SNIPER (16 MONET)")
+        logging.info(f"📊 [MAKRO TREND 4H] BTC: {btc_sentiment} | ETH: {eth_sentiment} | Strategia: JEDNOLITY BOTTOM SNIPER (20 MONET)")
         CURRENT_SENTIMENT = btc_sentiment
         return btc_sentiment
     except Exception as e:
@@ -528,9 +528,9 @@ def run_bottom_sniper_strategy():
 
     logging.info(f"🎯 [BOTTOM SNIPER 15M] Skanowanie {len(SNIPER_COINS)} par | Alokacja: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
-    # Pobieranie równoległe (8 wątków - czas ~300ms)
+    # Pobieranie równoległe
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in SNIPER_COINS}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
@@ -557,6 +557,7 @@ def run_bottom_sniper_strategy():
 
             # ------------------------------------------------------------------
             # KROK 1: FILTR DNA / SCHŁODZENIA (ANTI-TOP GUARD)
+            # Moneta MUSI być lokalnie tania i po schłodzeniu, a NIE na szczycie
             # ------------------------------------------------------------------
             recent_min_rsi = min(p3['rsi'], p2['rsi'], p['rsi'], c['rsi'])
             was_cooled_down = recent_min_rsi <= 44.0 or (min(p['low'], c['low']) <= c['bb_lower'] * 1.005)
@@ -565,12 +566,12 @@ def run_bottom_sniper_strategy():
 
             # ------------------------------------------------------------------
             # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE NA EMA 9/21)
+            # A) Zamknięta świeca: Przecięcie EMA 9 ponad EMA 21 ze wzrostem
             # ------------------------------------------------------------------
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or \
-                                 (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and \
-                                (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
+            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or                                  (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and                                 (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
 
+            # B) W locie: Dynamiczne wybicie w sekundzie przecięcia (Spread >= +0.10%)
             cross_in_flight = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
             spread_now = (c_now['ema9'] - c_now['ema21']) / c_now['ema21']
             fast_cross_live = cross_in_flight and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema9'])
@@ -610,6 +611,7 @@ def run_bottom_sniper_strategy():
                     logging.warning(f"⏳ [{symbol}] Sygnał zakupu na dnie, ale brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
                     continue
 
+                # Ciasny Stop Loss tuż pod lokalnym dołkiem zwrotnym (ryzyko zazwyczaj poniżej 1%)
                 swing_low = min(c['low'], p['low'], c_now['low'])
                 initial_sl = swing_low * 0.997
 
@@ -698,11 +700,11 @@ def monitoring_worker():
                         eff_peak_pullback = 0.006     # Wystarczy -0.6% cofnięcia ze szczytu by zamknąć zysk
                     else:
                         # Tryb STANDARDOWY (BULLISH / NEUTRAL): Szerszy oddech dla pozycji
-                        eff_partial_tp = PARTIAL_TP_PCT         # 0.025 (+2.5%)[cite: 8]
-                        eff_be_trigger = BREAKEVEN_TRIGGER_PCT  # 0.015 (+1.5%)[cite: 8]
-                        eff_be_sl = BREAKEVEN_SL_PCT            # 0.003 (+0.3%)[cite: 8]
-                        eff_peak_trigger = PEAK_TRAIL_TRIGGER_PCT     # 0.020 (+2.0%)[cite: 8]
-                        eff_peak_pullback = PEAK_TRAIL_PULLBACK_PCT   # 0.010 (-1.0%)[cite: 8]
+                        eff_partial_tp = PARTIAL_TP_PCT         # 0.025 (+2.5%)
+                        eff_be_trigger = BREAKEVEN_TRIGGER_PCT  # 0.015 (+1.5%)
+                        eff_be_sl = BREAKEVEN_SL_PCT            # 0.003 (+0.3%)
+                        eff_peak_trigger = PEAK_TRAIL_TRIGGER_PCT     # 0.020 (+2.0%)
+                        eff_peak_pullback = PEAK_TRAIL_PULLBACK_PCT   # 0.010 (-1.0%)
 
                     # ----------------------------------------------------------
                     # 1. CZĘŚCIOWY TAKE PROFIT (33% pozycji zleceniem limit ask)
@@ -914,7 +916,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot 24/7 - Unified Bottom Sniper Active")
+        self.wfile.write(b"Bybit Spot Trading Bot 24/7 - Unified Bottom Sniper Active (20 Pairs)")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
