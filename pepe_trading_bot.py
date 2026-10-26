@@ -64,10 +64,10 @@ CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
 # --- FLAGA KONTROLI STRATEGII (PRZEŁĄCZNIK) ---
-ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 16 monetach
+ENABLE_LEGACY_STRATEGIES = False     # False = Aktywna TYLKO strategia EMA 29/89 Swing na 12 monetach
                                      # True = Odblokowuje wszystkie 10 starych strategii (Poziomy 0-9)
 
-# --- STRATEGIA GŁÓWNA: EMA 29/89 (KOSZYK 16 MONET x 20% KAPITAŁU) ---
+# --- STRATEGIA GŁÓWNA: EMA 29/89 (KOSZYK 12 MONET x 20% KAPITAŁU) ---
 EMA29_89_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
@@ -562,7 +562,8 @@ def get_top_losers_symbols(limit_count=TOP_DIPS_COUNT):
             t for t in tickers 
             if t.get("symbol", "").endswith(QUOTE_COIN) 
             and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
-            and safe_float(t.get("price24hPcnt")) <= -0.03]
+            and safe_float(t.get("turnover24h")) >= MIN_24H_TURNOVER_USDC
+        ]
         if valid:
             losers = [t for t in valid if safe_float(t.get("price24hPcnt")) <= -0.03]
             losers.sort(key=lambda x: safe_float(x.get("price24hPcnt")))
@@ -663,7 +664,7 @@ def is_btc_market_healthy():
 # STRATEGIA GŁÓWNA: EMA 29/89 SWING (SZYBKIE SKANOWANIE RÓWNOLEGŁE)
 # ==============================================================================
 def run_ema29_89_swing_strategy():
-    global active_positions, kline_cache_15m
+    global active_positions, kline_cache_15m, trade_history
     total_equity, free_usdc = get_balances()
     target_allocation = total_equity * EMA29_89_CAPITAL_PCT
 
@@ -684,6 +685,8 @@ def run_ema29_89_swing_strategy():
                 results[sym] = df
                 with kline_cache_lock: kline_cache_15m[sym] = df
 
+    now_ts = time.time()
+
     for symbol in EMA29_89_COINS:
         with lock_pos: is_active = (symbol in active_positions)
         if is_active: continue
@@ -699,40 +702,71 @@ def run_ema29_89_swing_strategy():
             p2 = df.iloc[-4]
             p3 = df.iloc[-5]
 
-            # 1. Przecięcie na świecach historycznych (ostatnia godzina)
-            crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or \
-                               (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or \
-                               (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
+            # ------------------------------------------------------------------
+            # SYGNAŁ 1: KLASYCZNE PRZECIĘCIE (ZŁOTY KRZYŻ)
+            # ------------------------------------------------------------------
+            crossed_recently = (p['ema29'] <= p['ema89'] and c['ema29'] > c['ema89']) or                                (p2['ema29'] <= p2['ema89'] and c['ema29'] > c['ema89']) or                                (p3['ema29'] <= p3['ema89'] and c['ema29'] > c['ema89'])
             spread_pct = (c['ema29'] - c['ema89']) / c['ema89']
             is_bullish_trend = c['ema29'] > c['ema89'] and spread_pct >= 0.0005
             candle_ok = (c['close'] >= c['open']) or (c['close'] >= c['ema29'])
-
-            # Filtr wolumenu: min. 1.10x (110%) 20-okresowej średniej wolumenu
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             vol_ok = vol_ratio >= 1.10
 
             is_valid_signal = crossed_recently and is_bullish_trend and candle_ok and vol_ok
 
-            # 2. Hybrydowe wejście w trakcie świecy (wybicie w locie)
+            # ------------------------------------------------------------------
+            # SYGNAŁ 2: HYBRYDOWE WEJŚCIE W LOCIE
+            # ------------------------------------------------------------------
             spread_now = (c_now['ema29'] - c_now['ema89']) / c_now['ema89']
             crossed_now = (c['ema29'] <= c['ema89']) and (c_now['ema29'] > c_now['ema89'])
             vol_now_ratio = (c_now['volume'] / c_now['vol_ma20']) if (c_now['vol_ma20'] and c_now['vol_ma20'] > 0) else 1.0
             
-            # W locie wymagamy spreadu >= +0.10% oraz podwyższonego tempa obrotu
             is_strong_breakout = crossed_now and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema29']) and (vol_now_ratio >= 0.50 or vol_ratio >= 1.0)
+            
+            # ------------------------------------------------------------------
+            # SYGNAŁ 3: PULLBACK RE-ENTRY (PONOWNE WEJŚCIE PO ODBICIU OD EMA29)
+            # ------------------------------------------------------------------
+            is_reentry = False
+            # 1. Trend bazowy musi nadal trwać i być silny
+            if not crossed_recently and not crossed_now and c['ema29'] > c['ema89'] and spread_pct >= 0.0010:
+                # 2. Sprawdzamy czy ostatnio nas wyrzuciło (cooldown min. 15 minut)
+                cooldown_ok = True
+                with lock_history:
+                    trades_log = trade_history.get("trades_log", [])
+                    # Szukamy ostatniej transakcji na tym symbolu
+                    for t in reversed(trades_log):
+                        if t.get("symbol") == symbol:
+                            if now_ts - t.get("timestamp", 0) < 900:  # Zablokuj na 15 minut (900 sek) po wyrzuceniu na SL
+                                cooldown_ok = False
+                            break
+                
+                if cooldown_ok:
+                    # 3. Kształt korekty - cena musiała naruszyć/zbliżyć się do EMA29 i odbić w górę
+                    touched_ema = (c['low'] <= c['ema29'] * 1.002) or (p['low'] <= p['ema29'] * 1.002)
+                    bounced_up = c['close'] > c['open'] and c['close'] > p['high'] and c['close'] > c['ema29']
+                    reentry_vol = vol_ratio >= 1.05  # Odbicie poparte wolumenem
+                    
+                    if touched_ema and bounced_up and reentry_vol:
+                        is_reentry = True
+                        is_valid_signal = True
 
+            # ------------------------------------------------------------------
+            # LOGIKA WYŚWIETLANIA I SKŁADANIA ZAMÓWIEŃ
+            # ------------------------------------------------------------------
             disp_ema29 = c_now['ema29'] if crossed_now else c['ema29']
             disp_ema89 = c_now['ema89'] if crossed_now else c['ema89']
             disp_spread = spread_now if crossed_now else spread_pct
             
             dec = 8 if disp_ema29 < 0.01 else 4
             spread_tag = f"🟢 +{disp_spread*100:.3f}%" if disp_spread >= 0 else f"🔴 {disp_spread*100:.3f}%"
-            vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ok else '🔴'})"
+            vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ok or (is_reentry and vol_ratio>=1.05) else '🔴'})"
             log_msg = f"🔍 [{symbol}] EMA29: {disp_ema29:.{dec}f} | EMA89: {disp_ema89:.{dec}f} | Spread: {spread_tag} | {vol_tag} | "
             
             if is_strong_breakout:
                 logging.info(log_msg + f"🚀 HYBRYDOWE PRZEBICIE W LOCIE (Kupno natychmiastowe!)")
                 is_valid_signal = True
+            elif is_reentry:
+                logging.info(log_msg + f"♻️ PULLBACK RE-ENTRY (Odbicie od EMA29 w trendzie!)")
             else:
                 logging.info(log_msg + f"Krzyż w 1h: {crossed_recently} | Świeca OK: {candle_ok}")
 
@@ -741,8 +775,12 @@ def run_ema29_89_swing_strategy():
                     logging.warning(f"⏳ [{symbol}] Sygnał zakupu, ale brak środków ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
                     continue
 
-                recent_low = df['low'].iloc[-4:-1].min()
-                initial_sl = recent_low * 0.998
+                if is_reentry:
+                    recent_low = min(c['low'], p['low'])
+                else:
+                    recent_low = df['low'].iloc[-4:-1].min()
+                    
+                initial_sl = recent_low * 0.997
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
@@ -760,15 +798,15 @@ def run_ema29_89_swing_strategy():
                         save_positions(active_positions)
                     p_fmt = f"{curr_price:.8f}" if curr_price < 0.01 else f"{curr_price:.4f}"
                     sl_fmt = f"{initial_sl:.8f}" if initial_sl < 0.01 else f"{initial_sl:.4f}"
-                    logging.info(f"⚡🚀 [SUKCES - KUPNO 20%] {symbol} | Kwota: {target_allocation:.2f}$ | Cena: {p_fmt} | Początkowy SL: {sl_fmt}")
+                    tag = "PONOWNE WEJŚCIE (RE-ENTRY)" if is_reentry else "KUPNO 20%"
+                    logging.info(f"⚡🚀 [SUKCES - {tag}] {symbol} | Kwota: {target_allocation:.2f}$ | Cena: {p_fmt} | Początkowy SL: {sl_fmt}")
                     free_usdc -= target_allocation
                 else:
                     logging.error(f"❌ Błąd zlecenia {symbol}: {res}")
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
-
 # ==============================================================================
-# PEŁNA PALETA 10 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
+# PEŁNA PALETA 9 POZOSTAŁYCH STRATEGII (ZACHOWANA W PLIKU)
 # ==============================================================================
 def run_support_bounce_strategy(top_symbols):
     global active_positions
@@ -1063,7 +1101,7 @@ def scan_pepe_specialist():
         macro = (c['close'] > c['ema200']) and (c['ema21'] > c['ema200'])
         ema_bounce = (c['ema21'] > c['ema89']) and (c['low'] <= c['ema21']) and (c['close'] > c['ema21']) and (c['close'] > c['open'])
         if macro and ema_bounce and 45 <= c['rsi'] <= 70 and c['volume'] >= c['vol_ma20']:
-            res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
+            res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{order_val:.2f}")
             if res.get("retCode") == 0:
                 step, minq = get_symbol_lot_filter(sym)
                 q_str = format_qty_with_step(order_val / c['close'], step, minq)
@@ -1375,7 +1413,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V10: Volume Filter + Peak Trailing + BreakEven)")
+        self.wfile.write(b"Bybit Spot Trading Bot is Running 24/7 (V9: Hybrydowe skanowanie w locie + Wielowatkowosc)")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
