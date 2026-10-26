@@ -70,8 +70,8 @@ SNIPER_COINS = [
     "RENDERUSDC", "LINKUSDC", "INJUSDC", "TIAUSDC", "FETUSDC",
     "ONDOUSDC"
 ]
-CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję
-MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
+CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję[cite: 8]
+MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)[cite: 8]
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -82,20 +82,22 @@ STABLE_PAIRS_BLACKLIST = [
 STANDARD_MIN_ORDER_VALUE = 20.0
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe
+MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe[cite: 8]
 
 # --- BEZPIECZNIKI RYNKOWE ---
-USDC_MAX_SPREAD_PCT = 0.0010         # Max spread rynkowy 0.10%
-USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015 # Paniczny zrzut BTC 15M > -1.5%
+USDC_MAX_SPREAD_PCT = 0.0010         # Max spread rynkowy 0.10%[cite: 8]
+USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy[cite: 8]
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy[cite: 8]
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015 # Paniczny zrzut BTC 15M > -1.5%[cite: 8]
+
+CURRENT_SENTIMENT = "NEUTRAL 🟡"
 
 # --- PARAMETRY RYZYKA I REALIZACJI ZYSKU ---
-PARTIAL_TP_PCT = 0.025               # Częściowy TP: 33% przy +2.5%
-BREAKEVEN_TRIGGER_PCT = 0.015        # Próg aktywacji BreakEven przy +1.5%
-BREAKEVEN_SL_PCT = 0.003             # Poziom SL BreakEven (+0.3% zysku - pokrywa fee)
-PEAK_TRAIL_TRIGGER_PCT = 0.020       # Ochrona ze szczytu: aktywacja powyżej +2.0%
-PEAK_TRAIL_PULLBACK_PCT = 0.010      # Zamknięcie przy cofnięciu 1.0% od szczytu
+PARTIAL_TP_PCT = 0.025               # Częściowy TP: 33% przy +2.5%[cite: 8]
+BREAKEVEN_TRIGGER_PCT = 0.015        # Próg aktywacji BreakEven przy +1.5%[cite: 8]
+BREAKEVEN_SL_PCT = 0.003             # Poziom SL BreakEven (+0.3% zysku - pokrywa fee)[cite: 8]
+PEAK_TRAIL_TRIGGER_PCT = 0.020       # Ochrona ze szczytu: aktywacja powyżej +2.0%[cite: 8]
+PEAK_TRAIL_PULLBACK_PCT = 0.010      # Zamknięcie przy cofnięciu 1.0% od szczytu[cite: 8]
 
 APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
@@ -458,6 +460,7 @@ def get_market_data(symbol, interval="15", limit=120):
 # FILTRY MAKROEKONOMICZNE BTC + ETH
 # ==============================================================================
 def update_market_sentiment():
+    global CURRENT_SENTIMENT
     try:
         df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
         df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
@@ -481,6 +484,7 @@ def update_market_sentiment():
             else: eth_sentiment = "BEARISH 🔴"
 
         logging.info(f"📊 [MAKRO TREND 4H] BTC: {btc_sentiment} | ETH: {eth_sentiment} | Strategia: JEDNOLITY BOTTOM SNIPER (16 MONET)")
+        CURRENT_SENTIMENT = btc_sentiment
         return btc_sentiment
     except Exception as e:
         logging.error(f"Błąd sentymentu: {e}")
@@ -553,7 +557,6 @@ def run_bottom_sniper_strategy():
 
             # ------------------------------------------------------------------
             # KROK 1: FILTR DNA / SCHŁODZENIA (ANTI-TOP GUARD)
-            # Moneta MUSI być lokalnie tania i po schłodzeniu, a NIE na szczycie
             # ------------------------------------------------------------------
             recent_min_rsi = min(p3['rsi'], p2['rsi'], p['rsi'], c['rsi'])
             was_cooled_down = recent_min_rsi <= 44.0 or (min(p['low'], c['low']) <= c['bb_lower'] * 1.005)
@@ -562,14 +565,12 @@ def run_bottom_sniper_strategy():
 
             # ------------------------------------------------------------------
             # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE NA EMA 9/21)
-            # A) Zamknięta świeca: Przecięcie EMA 9 ponad EMA 21 ze wzrostem
             # ------------------------------------------------------------------
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or \
                                  (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and \
                                 (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
 
-            # B) W locie: Dynamiczne wybicie w sekundzie przecięcia (Spread >= +0.10%)
             cross_in_flight = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
             spread_now = (c_now['ema9'] - c_now['ema21']) / c_now['ema21']
             fast_cross_live = cross_in_flight and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema9'])
@@ -609,7 +610,6 @@ def run_bottom_sniper_strategy():
                     logging.warning(f"⏳ [{symbol}] Sygnał zakupu na dnie, ale brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
                     continue
 
-                # Ciasny Stop Loss tuż pod lokalnym dołkiem zwrotnym (ryzyko zazwyczaj poniżej 1%)
                 swing_low = min(c['low'], p['low'], c_now['low'])
                 initial_sl = swing_low * 0.997
 
@@ -686,9 +686,28 @@ def monitoring_worker():
                     sl_type = ""
 
                     # ----------------------------------------------------------
-                    # 1. CZĘŚCIOWY TAKE PROFIT (33% przy +2.5%)
+                    # DYNAMICZNA ADAPTACJA PARAMETRÓW RYZYKA (BEARISH vs RESZTA)
                     # ----------------------------------------------------------
-                    if not sold_half and total_pnl >= PARTIAL_TP_PCT:
+                    is_bearish = ("BEARISH" in CURRENT_SENTIMENT)
+                    if is_bearish:
+                        # Tryb BEARISH: Szybka ucieczka z zyskiem (Hit & Run)
+                        eff_partial_tp = 0.020        # Szybszy TP: 33% przy +2.0%
+                        eff_be_trigger = 0.010        # BreakEven aktywuje się już przy +1.0%
+                        eff_be_sl = 0.003             # SL przestawiony na +0.3% (pokrywa prowizje)
+                        eff_peak_trigger = 0.014      # Ochrona ze szczytu czuwa już od +1.4%
+                        eff_peak_pullback = 0.006     # Wystarczy -0.6% cofnięcia ze szczytu by zamknąć zysk
+                    else:
+                        # Tryb STANDARDOWY (BULLISH / NEUTRAL): Szerszy oddech dla pozycji
+                        eff_partial_tp = PARTIAL_TP_PCT         # 0.025 (+2.5%)[cite: 8]
+                        eff_be_trigger = BREAKEVEN_TRIGGER_PCT  # 0.015 (+1.5%)[cite: 8]
+                        eff_be_sl = BREAKEVEN_SL_PCT            # 0.003 (+0.3%)[cite: 8]
+                        eff_peak_trigger = PEAK_TRAIL_TRIGGER_PCT     # 0.020 (+2.0%)[cite: 8]
+                        eff_peak_pullback = PEAK_TRAIL_PULLBACK_PCT   # 0.010 (-1.0%)[cite: 8]
+
+                    # ----------------------------------------------------------
+                    # 1. CZĘŚCIOWY TAKE PROFIT (33% pozycji zleceniem limit ask)
+                    # ----------------------------------------------------------
+                    if not sold_half and total_pnl >= eff_partial_tp:
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
                         if rb > 0:
                             st, mq = get_symbol_lot_filter(symbol)
@@ -701,13 +720,15 @@ def monitoring_worker():
                                     if symbol in active_positions:
                                         active_positions[symbol]["sold_half"] = True
                                         save_positions(active_positions)
-                                logging.info(f"💸 [PARTIAL TP] {symbol} LIMIT ORDER po {ask_p:.4f} USD (+2.5% inkasowane!).")
+                                tp_label = f"{eff_partial_tp*100:.1f}%"
+                                mode_tag = "[BEARISH HIT&RUN]" if is_bearish else "[SWING]"
+                                logging.info(f"💸 [PARTIAL TP {mode_tag}] {symbol} LIMIT ORDER po {ask_p:.4f} USD (+{tp_label} zrealizowane).")
 
                     # ----------------------------------------------------------
-                    # 2. PRÓG BREAKEVEN (+1.5% zysku -> SL na +0.3%)
+                    # 2. PRÓG BREAKEVEN (OBRONA PRZED POWROTEM NA STRATĘ)
                     # ----------------------------------------------------------
-                    be_level = bp * (1.0 + BREAKEVEN_SL_PCT)
-                    if peak_pnl >= BREAKEVEN_TRIGGER_PCT or sold_half:
+                    be_level = bp * (1.0 + eff_be_sl)
+                    if peak_pnl >= eff_be_trigger or sold_half:
                         curr_sl = max(pos.get("trailing_sl_low", 0.0), be_level)
                     else:
                         curr_sl = pos.get("trailing_sl_low", 0.0)
@@ -732,16 +753,19 @@ def monitoring_worker():
                     if curr_sl > 0 and c_curr <= curr_sl:
                         sl_hit = True
                         if curr_sl == be_level:
-                            sl_type = f"BreakEven (Obrona kapitału +0.3%)"
+                            mode_info = "BEARISH Obrona (+0.3%)" if is_bearish else "BreakEven (+0.3%)"
+                            sl_type = f"BreakEven ({mode_info})"
                         else:
                             sl_type = f"Wyjście ze Stop Lossa ({curr_sl:.4f})"
 
                     # ----------------------------------------------------------
                     # 4. KROCZĄCA OCHRONA ZE SZCZYTU (TRAILING FROM PEAK)
                     # ----------------------------------------------------------
-                    if peak_pnl >= PEAK_TRAIL_TRIGGER_PCT and ((peak - c_curr) / peak) >= PEAK_TRAIL_PULLBACK_PCT:
+                    if peak_pnl >= eff_peak_trigger and ((peak - c_curr) / peak) >= eff_peak_pullback:
                         trail_hit = True
-                        sl_type = f"Ochrona zysku ze szczytu (-1.0% od peaku)"
+                        p_drop = eff_peak_pullback * 100
+                        mode_info = "BEARISH HIT&RUN" if is_bearish else "Peak Trailing"
+                        sl_type = f"Ochrona zysku ze szczytu [{mode_info}] (-{p_drop:.1f}% od peaku)"
 
                     panic_hit = btc_flash_crash and total_pnl < -0.005
 
