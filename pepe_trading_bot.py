@@ -63,7 +63,7 @@ TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# --- KOSZYK 20 WYSELEKCJONOWANYCH MONET SPOT USDC ---
+# --- KOSZYK 16 WYSELEKCJONOWANYCH MONET SPOT USDC ---
 SNIPER_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
@@ -71,7 +71,7 @@ SNIPER_COINS = [
     "ONDOUSDC", "XRPUSDC", "ENAUSDC", "ARBUSDC", "ADAUSDC"
 ]
 CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję
-MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
+MAX_TOTAL_POSITIONS = 5             # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -82,22 +82,22 @@ STABLE_PAIRS_BLACKLIST = [
 STANDARD_MIN_ORDER_VALUE = 20.0
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02          # 2% rezerwy na fee giełdowe
+MIN_CASH_RESERVE_PCT = 0.02         # 2% rezerwy na fee giełdowe
 
 # --- BEZPIECZNIKI RYNKOWE ---
-USDC_MAX_SPREAD_PCT = 0.0010         # Max spread rynkowy 0.10%
-USDC_1M_DUMP_THRESHOLD = -0.005      # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012 # Zrzut BTC 5M > -1.2% blokuje zakupy
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015 # Paniczny zrzut BTC 15M > -1.5%
+USDC_MAX_SPREAD_PCT = 0.0010        # Max spread rynkowy 0.10%
+USDC_1M_DUMP_THRESHOLD = -0.005     # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012# Zrzut BTC 5M > -1.2% blokuje zakupy
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015# Paniczny zrzut BTC 15M > -1.5%
 
 CURRENT_SENTIMENT = "NEUTRAL 🟡"
 
 # --- PARAMETRY RYZYKA I REALIZACJI ZYSKU ---
-PARTIAL_TP_PCT = 0.025               # Częściowy TP: 33% przy +2.5%
-BREAKEVEN_TRIGGER_PCT = 0.015        # Próg aktywacji BreakEven przy +1.5%
-BREAKEVEN_SL_PCT = 0.003             # Poziom SL BreakEven (+0.3% zysku - pokrywa fee)
-PEAK_TRAIL_TRIGGER_PCT = 0.020       # Ochrona ze szczytu: aktywacja powyżej +2.0%
-PEAK_TRAIL_PULLBACK_PCT = 0.010      # Zamknięcie przy cofnięciu 1.0% od szczytu
+PARTIAL_TP_PCT = 0.025              # Częściowy TP: 33% przy +2.5%
+BREAKEVEN_TRIGGER_PCT = 0.015       # Próg aktywacji BreakEven przy +1.5%
+BREAKEVEN_SL_PCT = 0.003            # Poziom SL BreakEven (+0.3% zysku - pokrywa fee)
+PEAK_TRAIL_TRIGGER_PCT = 0.020      # Ochrona ze szczytu: aktywacja powyżej +2.0%
+PEAK_TRAIL_PULLBACK_PCT = 0.010     # Zamknięcie przy cofnięciu 1.0% od szczytu
 
 APP_URL = "https://bybit-bot-i1lw.onrender.com"
 POSITIONS_FILE = "active_spot_positions.json"
@@ -570,9 +570,7 @@ def run_bottom_sniper_strategy():
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             
             # TRIGGER A: Klasyczne odwrócenie przez krzyż EMA 9/21
-            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or \
-                                 (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and \
-                                (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
+            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or                                  (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and                                 (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
 
             cross_in_flight = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
             spread_now = (c_now['ema9'] - c_now['ema21']) / c_now['ema21']
@@ -706,12 +704,12 @@ def monitoring_worker():
                     # ----------------------------------------------------------
                     is_bearish = ("BEARISH" in CURRENT_SENTIMENT)
                     if is_bearish:
-                        # Tryb BEARISH: Szybka ucieczka z zyskiem (Hit & Run)
-                        eff_partial_tp = 0.020        # Szybszy TP: 33% przy +2.0%
-                        eff_be_trigger = 0.010        # BreakEven aktywuje się już przy +1.0%
-                        eff_be_sl = 0.003             # SL przestawiony na +0.3% (pokrywa prowizje)
-                        eff_peak_trigger = 0.014      # Ochrona ze szczytu czuwa już od +1.4%
-                        eff_peak_pullback = 0.006     # Wystarczy -0.6% cofnięcia ze szczytu by zamknąć zysk
+                        # Tryb BEARISH: Hierarchia progów chroniąca przed przedwczesnym wybiciem knota
+                        eff_partial_tp = 0.018        # Szybszy TP: ułamek 33% zysku księgowany już przy +1.8%
+                        eff_be_trigger = 0.010        # BreakEven bezpiecznie aktywuje się przy +1.0%
+                        eff_be_sl = 0.003             # SL ląduje na +0.3% (chroni prowizje)
+                        eff_peak_trigger = 0.022      # Peak Trail wchodzi do gry DOPIERO po zrzuceniu 33% pozycji na TP
+                        eff_peak_pullback = 0.012     # Szerszy margines na szum / knot oporowy (-1.2% od szczytu zamiast -0.6%)
                     else:
                         # Tryb STANDARDOWY (BULLISH / NEUTRAL): Szerszy oddech dla pozycji
                         eff_partial_tp = PARTIAL_TP_PCT         # 0.025 (+2.5%)
@@ -930,7 +928,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot 24/7 - Unified Bottom Sniper Active (20 Pairs)")
+        self.wfile.write(b"Bybit Spot Trading Bot 24/7 - Unified Bottom Sniper Active")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
