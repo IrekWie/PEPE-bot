@@ -420,7 +420,7 @@ def calculate_rsi(series, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     return 100 - (100 / (1 + (gain / loss)))
 
-def get_market_data_no_cache(symbol, interval="15", limit=120):
+def get_market_data_no_cache(symbol, interval="15", limit=250):
     try:
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
@@ -432,19 +432,29 @@ def get_market_data_no_cache(symbol, interval="15", limit=120):
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
         df['rsi'] = calculate_rsi(df['close'], period=14)
         df['vol_ma20'] = df['volume'].rolling(window=20).mean()
         df['bb_mid'] = df['close'].rolling(window=20).mean()
         df['bb_std'] = df['close'].rolling(window=20).std()
         df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
+        
+        # Obliczenie ATR (Average True Range) do pomiaru rozmiaru świec
+        df['tr0'] = abs(df['high'] - df['low'])
+        df['tr1'] = abs(df['high'] - df['close'].shift())
+        df['tr2'] = abs(df['low'] - df['close'].shift())
+        df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+        df['atr'] = df['tr'].rolling(14).mean()
+        
         return df
     except Exception:
         return None
 
 def fetch_data_worker(symbol):
-    return symbol, get_market_data_no_cache(symbol, interval="15", limit=120)
+    return symbol, get_market_data_no_cache(symbol, interval="15", limit=250)
 
-def get_market_data(symbol, interval="15", limit=120):
+def get_market_data(symbol, interval="15", limit=250):
     global kline_cache_15m
     with kline_cache_lock:
         if interval == "15" and symbol in kline_cache_15m:
@@ -556,13 +566,28 @@ def run_bottom_sniper_strategy():
             p3 = df.iloc[-5]
 
             # ------------------------------------------------------------------
-            # KROK 1: FILTR DNA / SCHŁODZENIA (ANTI-TOP GUARD)
-            # Moneta MUSI być lokalnie tania i po schłodzeniu, a NIE na szczycie
+            # KROK 1: FILTRY DNA, ZAKRESU I OPORÓW (ANTI-TOP & ANTI-CLIMAX GUARD)
             # ------------------------------------------------------------------
             recent_min_rsi = min(p3['rsi'], p2['rsi'], p['rsi'], c['rsi'])
             was_cooled_down = recent_min_rsi <= 44.0 or (min(p['low'], c['low']) <= c['bb_lower'] * 1.005)
             is_not_overbought = (c['rsi'] <= 65.0) and (c_now['rsi'] <= 68.0)
             not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
+
+            # FILTR 1: Odległość od oporów makro (Brak ściany zaraz nad głową)
+            # Szukamy, gdzie są średnie zrzucające (EMA 89 i EMA 200). Cena musi mieć min 1.0% luzu do nich.
+            dist_to_ema89 = (c['ema89'] - c['close']) / c['close']
+            dist_to_ema200 = (c['ema200'] - c['close']) / c['close']
+            
+            # Zablokuj, jeśli cena uderza od dołu w EMA 89 lub 200 z marginesem mniejszym niż 1.0%
+            wall_89 = (dist_to_ema89 > 0) and (dist_to_ema89 < 0.010)
+            wall_200 = (dist_to_ema200 > 0) and (dist_to_ema200 < 0.010)
+            has_room_to_grow = not (wall_89 or wall_200)
+
+            # FILTR 2: Odrzucenie świecy wyczerpania (Exhaustion / Climax Candle)
+            # Świeca 'c' (potwierdzająca wzrost) nie może być nienaturalnie gigantyczna.
+            atr_val = c['atr'] if c['atr'] > 0 else (c['close'] * 0.005)
+            candle_body = abs(c['close'] - c['open'])
+            is_not_climax = candle_body <= (atr_val * 2.5)  # Blokada jeśli ciało świecy = 2.5x średniej zmienności
 
             # ------------------------------------------------------------------
             # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE / V-REVERSAL)
@@ -598,7 +623,7 @@ def run_bottom_sniper_strategy():
                         break
 
             # Weryfikacja sygnału ostatecznego
-            is_signal = was_cooled_down and is_not_overbought and not_extended and cooldown_ok and (fast_cross_closed or fast_cross_live or v_reversal_signal)
+            is_signal = was_cooled_down and is_not_overbought and not_extended and has_room_to_grow and is_not_climax and cooldown_ok and (fast_cross_closed or fast_cross_live or v_reversal_signal)
 
             # Prezentacja logów
             spread_disp = spread_now if fast_cross_live else ((c['ema9'] - c['ema21']) / c['ema21'])
