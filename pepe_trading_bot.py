@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 from pybit.unified_trading import HTTP
 
 # ==============================================================================
@@ -341,6 +342,17 @@ for name, url in endpoints:
 if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
+
+# ==============================================================================
+# ZWIĘKSZENIE PULI POŁĄCZEŃ DLA WIELOWĄTKOWOŚCI (LIKWIDUJE WARNINGI W LOGACH)
+# ==============================================================================
+try:
+    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
+    if hasattr(session, "client"):
+        session.client.mount("https://", adapter)
+        session.client.mount("http://", adapter)
+except Exception:
+    pass
 
 instrument_filters = {}
 def get_symbol_lot_filter(symbol):
