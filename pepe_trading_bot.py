@@ -528,7 +528,7 @@ def run_bottom_sniper_strategy():
 
     logging.info(f"🎯 [BOTTOM SNIPER 15M] Skanowanie {len(SNIPER_COINS)} par | Alokacja: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
-    # Pobieranie równoległe
+    # Pobieranie równoległe (8 wątków - czas ~300ms)
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in SNIPER_COINS}
@@ -565,16 +565,27 @@ def run_bottom_sniper_strategy():
             not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
 
             # ------------------------------------------------------------------
-            # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE NA EMA 9/21)
-            # A) Zamknięta świeca: Przecięcie EMA 9 ponad EMA 21 ze wzrostem
+            # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE / V-REVERSAL)
             # ------------------------------------------------------------------
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or                                  (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and                                 (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
+            
+            # TRIGGER A: Klasyczne odwrócenie przez krzyż EMA 9/21
+            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or \
+                                 (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and \
+                                (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
 
-            # B) W locie: Dynamiczne wybicie w sekundzie przecięcia (Spread >= +0.10%)
             cross_in_flight = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
             spread_now = (c_now['ema9'] - c_now['ema21']) / c_now['ema21']
             fast_cross_live = cross_in_flight and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema9'])
+
+            # TRIGGER B: Formacja "V-Reversal" ze skokiem wolumenu (Złapanie dna Price Action)
+            is_dump_candle = (p['close'] < p['open']) and ((p['open'] - p['close']) / p['open'] >= 0.0025)
+            is_rebound_candle = (c['close'] > c['open'])
+            rebound_strength = (c['close'] - p['close']) / (p['open'] - p['close']) if (p['open'] > p['close']) else 0.0
+            is_engulfing = rebound_strength >= 0.70  # Zamknięcie zielonej znosi min. 70% spadku poprzedniej
+            vol_spike = (c['volume'] >= (c['vol_ma20'] * 1.15)) or (p['volume'] >= (p['vol_ma20'] * 1.15))
+            
+            v_reversal_signal = is_dump_candle and is_rebound_candle and is_engulfing and vol_spike
 
             # ------------------------------------------------------------------
             # KROK 3: COOLDOWN PO STOP LOSS (CHRONI PRZED SPADAJĄCYM NOŻEM)
@@ -588,22 +599,25 @@ def run_bottom_sniper_strategy():
                             cooldown_ok = False
                         break
 
-            # Weryfikacja sygnału
-            is_signal = was_cooled_down and is_not_overbought and not_extended and (fast_cross_closed or fast_cross_live) and cooldown_ok
+            # Weryfikacja sygnału ostatecznego
+            is_signal = was_cooled_down and is_not_overbought and not_extended and cooldown_ok and (fast_cross_closed or fast_cross_live or v_reversal_signal)
 
             # Prezentacja logów
             spread_disp = spread_now if fast_cross_live else ((c['ema9'] - c['ema21']) / c['ema21'])
             dec = 8 if c['ema9'] < 0.01 else 4
             spread_tag = f"🟢 +{spread_disp*100:.2f}%" if spread_disp >= 0 else f"🔴 {spread_disp*100:.2f}%"
-            vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ratio >= 1.05 else '🔴'})"
+            vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ratio >= 1.05 or vol_spike else '🔴'})"
             rsi_tag = f"RSI: {c['rsi']:.1f} (Min4: {recent_min_rsi:.1f})"
             log_msg = f"🔍 [{symbol}] EMA9: {c['ema9']:.{dec}f} | EMA21: {c['ema21']:.{dec}f} | {spread_tag} | {vol_tag} | {rsi_tag} | "
 
             if is_signal:
-                mode = "W LOCIE ⚡" if fast_cross_live else "POTWIERDZONE 15M 🕯️"
+                if v_reversal_signal and not fast_cross_closed and not fast_cross_live:
+                    mode = "V-REVERSAL PA 📉⬆️"
+                else:
+                    mode = "W LOCIE ⚡" if fast_cross_live else "POTWIERDZONE 15M 🕯️"
                 logging.info(log_msg + f"🚀 [SNIPER DNA: {mode}] Zakup w dołku!")
             else:
-                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross 9/21: {fast_cross_closed or fast_cross_live}")
+                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross 9/21: {fast_cross_closed or fast_cross_live} | V-Reversal: {v_reversal_signal}")
 
             # EGZEKUCJA TRANSAKCJI
             if is_signal:
