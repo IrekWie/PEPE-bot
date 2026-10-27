@@ -590,7 +590,7 @@ def run_bottom_sniper_strategy():
             is_not_climax = candle_body <= (atr_val * 2.5)  # Blokada jeśli ciało świecy = 2.5x średniej zmienności
 
             # ------------------------------------------------------------------
-            # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE / V-REVERSAL)
+            # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE / V-REVERSAL / SQUEEZE BREAKOUT)
             # ------------------------------------------------------------------
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             
@@ -609,6 +609,21 @@ def run_bottom_sniper_strategy():
             vol_spike = (c['volume'] >= (c['vol_ma20'] * 1.15)) or (p['volume'] >= (p['vol_ma20'] * 1.15))
             
             v_reversal_signal = is_dump_candle and is_rebound_candle and is_engulfing and vol_spike
+            
+            # TRIGGER C: "Squeeze Breakout" - Wybicie z płaskiej konsolidacji (Kontynuacja Trendu)
+            # 1. EMA 9 nad EMA 21 (Trend rosnący)
+            trend_active = (c['ema9'] > c['ema21']) and (p['ema9'] > p['ema21'])
+            # 2. Ciasna baza: 3 ostatnie świece były bardzo małe (kompresja zmienności / odpoczynek)
+            p_body = abs(p['close'] - p['open'])
+            p2_body = abs(p2['close'] - p2['open'])
+            p3_body = abs(p3['close'] - p3['open'])
+            tight_consolidation = max(p_body, p2_body, p3_body) < (atr_val * 0.8)
+            # 3. Cena kręciła się wokół lub odpoczywała na średniej EMA 21
+            rested_on_ema = min(p['low'], p2['low'], p3['low']) <= c['ema21'] * 1.002
+            # 4. Spust: Bieżąca świeca gwałtownie wybija opór z wolumenem
+            local_high = max(p['high'], p2['high'], p3['high'])
+            squeeze_breakout_closed = trend_active and tight_consolidation and rested_on_ema and (c['close'] > local_high) and (vol_ratio >= 1.25)
+            squeeze_breakout_live = trend_active and tight_consolidation and rested_on_ema and (c_now['close'] > local_high) and (c_now['volume'] >= (c_now['vol_ma20'] * 0.80))
 
             # ------------------------------------------------------------------
             # KROK 3: COOLDOWN PO STOP LOSS (CHRONI PRZED SPADAJĄCYM NOŻEM)
@@ -623,10 +638,14 @@ def run_bottom_sniper_strategy():
                         break
 
             # Weryfikacja sygnału ostatecznego
-            is_signal = was_cooled_down and is_not_overbought and not_extended and has_room_to_grow and is_not_climax and cooldown_ok and (fast_cross_closed or fast_cross_live or v_reversal_signal)
+            # UWAGA: Wybicie z konsolidacji (Squeeze Breakout) NIE wymaga uprzedniego wychłodzenia RSI (was_cooled_down)
+            is_bottom_signal = was_cooled_down and (fast_cross_closed or fast_cross_live or v_reversal_signal)
+            is_breakout_signal = squeeze_breakout_closed or squeeze_breakout_live
+            
+            is_signal = (is_bottom_signal or is_breakout_signal) and is_not_overbought and not_extended and has_room_to_grow and is_not_climax and cooldown_ok
 
             # Prezentacja logów
-            spread_disp = spread_now if fast_cross_live else ((c['ema9'] - c['ema21']) / c['ema21'])
+            spread_disp = spread_now if (fast_cross_live or squeeze_breakout_live) else ((c['ema9'] - c['ema21']) / c['ema21'])
             dec = 8 if c['ema9'] < 0.01 else 4
             spread_tag = f"🟢 +{spread_disp*100:.2f}%" if spread_disp >= 0 else f"🔴 {spread_disp*100:.2f}%"
             vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ratio >= 1.05 or vol_spike else '🔴'})"
@@ -634,13 +653,15 @@ def run_bottom_sniper_strategy():
             log_msg = f"🔍 [{symbol}] EMA9: {c['ema9']:.{dec}f} | EMA21: {c['ema21']:.{dec}f} | {spread_tag} | {vol_tag} | {rsi_tag} | "
 
             if is_signal:
-                if v_reversal_signal and not fast_cross_closed and not fast_cross_live:
+                if is_breakout_signal:
+                    mode = "SQUEEZE BREAKOUT 📈🚀"
+                elif v_reversal_signal and not fast_cross_closed and not fast_cross_live:
                     mode = "V-REVERSAL PA 📉⬆️"
                 else:
                     mode = "W LOCIE ⚡" if fast_cross_live else "POTWIERDZONE 15M 🕯️"
-                logging.info(log_msg + f"🚀 [SNIPER DNA: {mode}] Zakup w dołku!")
+                logging.info(log_msg + f"🚀 [SNIPER: {mode}] Transakcja zaakceptowana!")
             else:
-                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross 9/21: {fast_cross_closed or fast_cross_live} | V-Reversal: {v_reversal_signal}")
+                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross: {fast_cross_closed or fast_cross_live} | Breakout: {is_breakout_signal}")
 
             # EGZEKUCJA TRANSAKCJI
             if is_signal:
