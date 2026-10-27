@@ -592,7 +592,7 @@ def run_bottom_sniper_strategy():
 
     # Pobieranie równoległe (8 wątków - czas ~300ms)
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in target_coins}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
