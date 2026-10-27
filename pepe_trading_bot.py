@@ -63,20 +63,71 @@ TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# --- KOSZYK 16 WYSELEKCJONOWANYCH MONET SPOT USDC ---
-SNIPER_COINS = [
+# --- KOSZYK STRATEGII (HYBRYDOWY SKANER: 20 BAZOWYCH + LIDERZY ZMIENNOŚCI) ---
+CORE_SNIPER_COINS = [
     "SOLUSDC", "SUIUSDC", "NEARUSDC", "DOGEUSDC", "PEPEUSDC",
     "APTUSDC", "AVAXUSDC", "SEIUSDC", "WIFUSDC", "BONKUSDC",
     "RENDERUSDC", "LINKUSDC", "INJUSDC", "TIAUSDC", "FETUSDC",
     "ONDOUSDC", "XRPUSDC", "ENAUSDC", "ARBUSDC", "ADAUSDC"
 ]
+DYNAMIC_COINS_ADDED_LIMIT = 20       # Ile dodatkowych liderów płynności dobrać z rynku
+MIN_24H_TURNOVER_USDC = 400000.0     # Odrzucanie monet bez płynności (< 400k USDC obrotu)
 CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję
-MAX_TOTAL_POSITIONS = 5             # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
+MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
-    "USDEUSDC", "DAIUSDC", "FDUSDUSDC", "TUSDUSDC"
+    "USDEUSDC", "DAIUSDC", "FDUSDUSDC", "TUSDUSDC", "USDT", "USDC"
 ]
+
+current_sniper_coins = []
+last_dynamic_scan = 0
+
+def get_dynamic_top_coins():
+    global current_sniper_coins, last_dynamic_scan
+    now = time.time()
+    
+    # Aktualizuj listę dynamicznych liderów tylko raz na godzinę
+    if current_sniper_coins and (now - last_dynamic_scan < 3600):
+        return current_sniper_coins
+
+    try:
+        if session:
+            tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
+            valid = [
+                t for t in tickers 
+                if t.get("symbol", "").endswith(QUOTE_COIN) 
+                and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
+                and float(t.get("turnover24h", 0)) >= MIN_24H_TURNOVER_USDC
+            ]
+            
+            combined_list = list(CORE_SNIPER_COINS) # Kopia 20 bazowych
+            
+            if valid:
+                # Sortuj rynek po obrocie
+                valid.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
+                
+                # Dodaj do koszyka liderów, których jeszcze w nim nie ma (aż dobijemy limit)
+                added_count = 0
+                for t in valid:
+                    sym = t["symbol"]
+                    if sym not in combined_list:
+                        combined_list.append(sym)
+                        added_count += 1
+                    if added_count >= DYNAMIC_COINS_ADDED_LIMIT:
+                        break
+                        
+            current_sniper_coins = combined_list
+            last_dynamic_scan = now
+            logging.info(f"🔄 [HYBRYDOWY SKANER] Baza {len(CORE_SNIPER_COINS)} + {len(current_sniper_coins)-len(CORE_SNIPER_COINS)} liderów obrotu. Łącznie skanowane: {len(current_sniper_coins)} par.")
+            return current_sniper_coins
+    except Exception as e:
+        logging.warning(f"Błąd pobierania dynamicznych monet: {e}")
+    
+    # Awaryjna pula (Fallabck) gdyby API padło
+    if not current_sniper_coins:
+        current_sniper_coins = list(CORE_SNIPER_COINS)
+    return current_sniper_coins
 
 # --- LIMITY FINANSOWE I REZERWY ---
 STANDARD_MIN_ORDER_VALUE = 20.0
@@ -493,7 +544,7 @@ def update_market_sentiment():
             if eth_candle['close'] > eth_candle['ema50'] and eth_candle['ema21'] > eth_candle['ema50']: eth_sentiment = "BULLISH 🟢"
             else: eth_sentiment = "BEARISH 🔴"
 
-        logging.info(f"📊 [MAKRO TREND 4H] BTC: {btc_sentiment} | ETH: {eth_sentiment} | Strategia: JEDNOLITY BOTTOM SNIPER (20 MONET)")
+        logging.info(f"📊 [MAKRO TREND 4H] BTC: {btc_sentiment} | ETH: {eth_sentiment} | Strategia: BOTTOM SNIPER & BREAKOUT (DYNAMIC TOP 40)")
         CURRENT_SENTIMENT = btc_sentiment
         return btc_sentiment
     except Exception as e:
@@ -527,6 +578,7 @@ def is_btc_market_healthy():
 # GŁÓWNA I JEDYNA STRATEGIA: ZINTEGROWANY BOTTOM SNIPER (SEKWENCJA DNO -> SPUST)
 # ==============================================================================
 def run_bottom_sniper_strategy():
+    target_coins = get_dynamic_top_coins()
     global active_positions, kline_cache_15m, trade_history
     total_equity, free_usdc = get_balances()
     target_allocation = total_equity * CAPITAL_PER_TRADE_PCT
@@ -536,12 +588,12 @@ def run_bottom_sniper_strategy():
         logging.info(f"ℹ️ [LIMIT POZYCJI] Osiągnięto limit {current_count}/{MAX_TOTAL_POSITIONS}. Czekam na realizację zysków.")
         return
 
-    logging.info(f"🎯 [BOTTOM SNIPER 15M] Skanowanie {len(SNIPER_COINS)} par | Alokacja: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
+    logging.info(f"🎯 [BOTTOM SNIPER 15M] Skanowanie {len(target_coins)} najpłynniejszych par | Alokacja: {target_allocation:.2f}$ (20%) | Wolne: {free_usdc:.2f}$")
 
     # Pobieranie równoległe (8 wątków - czas ~300ms)
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in SNIPER_COINS}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in target_coins}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
             if df is not None:
@@ -550,7 +602,7 @@ def run_bottom_sniper_strategy():
 
     now_ts = time.time()
 
-    for symbol in SNIPER_COINS:
+    for symbol in target_coins:
         with lock_pos: is_active = (symbol in active_positions)
         if is_active: continue
 
