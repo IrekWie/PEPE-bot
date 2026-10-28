@@ -72,8 +72,8 @@ CORE_SNIPER_COINS = [
 ]
 DYNAMIC_COINS_ADDED_LIMIT = 20       # Ile dodatkowych liderów płynności dobrać z rynku
 MIN_24H_TURNOVER_USDC = 400000.0     # Odrzucanie monet bez płynności (< 400k USDC obrotu)
-CAPITAL_PER_TRADE_PCT = 0.20         # 20% kapitału na transakcję
-MAX_TOTAL_POSITIONS = 5              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
+CAPITAL_PER_TRADE_PCT = 0.50         # 20% kapitału na transakcję
+MAX_TOTAL_POSITIONS = 2              # Maksymalnie 5 otwartych pozycji (5 x 20% = 100%)
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -84,50 +84,8 @@ current_sniper_coins = []
 last_dynamic_scan = 0
 
 def get_dynamic_top_coins():
-    global current_sniper_coins, last_dynamic_scan
-    now = time.time()
-    
-    # Aktualizuj listę dynamicznych liderów tylko raz na godzinę
-    if current_sniper_coins and (now - last_dynamic_scan < 3600):
-        return current_sniper_coins
-
-    try:
-        if session:
-            tickers = session.get_tickers(category=CATEGORY).get("result", {}).get("list", [])
-            valid = [
-                t for t in tickers 
-                if t.get("symbol", "").endswith(QUOTE_COIN) 
-                and t.get("symbol") not in STABLE_PAIRS_BLACKLIST
-                and float(t.get("turnover24h", 0)) >= MIN_24H_TURNOVER_USDC
-            ]
-            
-            combined_list = list(CORE_SNIPER_COINS) # Kopia 20 bazowych
-            
-            if valid:
-                # Sortuj rynek po obrocie
-                valid.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
-                
-                # Dodaj do koszyka liderów, których jeszcze w nim nie ma (aż dobijemy limit)
-                added_count = 0
-                for t in valid:
-                    sym = t["symbol"]
-                    if sym not in combined_list:
-                        combined_list.append(sym)
-                        added_count += 1
-                    if added_count >= DYNAMIC_COINS_ADDED_LIMIT:
-                        break
-                        
-            current_sniper_coins = combined_list
-            last_dynamic_scan = now
-            logging.info(f"🔄 [HYBRYDOWY SKANER] Baza {len(CORE_SNIPER_COINS)} + {len(current_sniper_coins)-len(CORE_SNIPER_COINS)} liderów obrotu. Łącznie skanowane: {len(current_sniper_coins)} par.")
-            return current_sniper_coins
-    except Exception as e:
-        logging.warning(f"Błąd pobierania dynamicznych monet: {e}")
-    
-    # Awaryjna pula (Fallabck) gdyby API padło
-    if not current_sniper_coins:
-        current_sniper_coins = list(CORE_SNIPER_COINS)
-    return current_sniper_coins
+    # BOT ZMODYFIKOWANY STRICTE POD PEPEUSDC - PURE PEPE SWING BOT
+    return ["PEPEUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
 STANDARD_MIN_ORDER_VALUE = 20.0
@@ -618,100 +576,55 @@ def run_bottom_sniper_strategy():
             p3 = df.iloc[-5]
 
             # ------------------------------------------------------------------
-            # KROK 1: FILTRY DNA, ZAKRESU I OPORÓW (ANTI-TOP & ANTI-CLIMAX GUARD)
+            # STRATEGIA "PEPE PERFECT SWING" - KUPNO NA WSPARCIU EMA
             # ------------------------------------------------------------------
-            recent_min_rsi = min(p3['rsi'], p2['rsi'], p['rsi'], c['rsi'])
-            was_cooled_down = recent_min_rsi <= 44.0 or (min(p['low'], c['low']) <= c['bb_lower'] * 1.005)
-            is_not_overbought = (c['rsi'] <= 65.0) and (c_now['rsi'] <= 68.0)
-            not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
-
-            # FILTR 1: Odległość od oporów makro (Brak ściany zaraz nad głową)
-            # Szukamy, gdzie są średnie zrzucające (EMA 89 i EMA 200). Cena musi mieć min 1.0% luzu do nich.
-            dist_to_ema89 = (c['ema89'] - c['close']) / c['close']
-            dist_to_ema200 = (c['ema200'] - c['close']) / c['close']
+            # Wykrywamy trend makro (EMA 50 nad EMA 200, EMA 89 rosnąca)
+            is_uptrend = c['ema50'] > c['ema200']
             
-            # Zablokuj, jeśli cena uderza od dołu bezpośrednio w czoło EMA 89 lub 200 (margines mniejszy niż 0.2%)
-            # Pozwala to wejść na dołku głęboko pod średnimi, dając miejsce na zebranie zysku na odbiciu.
-            wall_89 = (dist_to_ema89 > 0) and (dist_to_ema89 < 0.002)
-            wall_200 = (dist_to_ema200 > 0) and (dist_to_ema200 < 0.002)
-            has_room_to_grow = not (wall_89 or wall_200)
-
-            # FILTR 2: Odrzucenie świecy wyczerpania (Exhaustion / Climax Candle)
-            # Świeca 'c' (potwierdzająca wzrost) nie może być nienaturalnie gigantyczna.
-            atr_val = c['atr'] if c['atr'] > 0 else (c['close'] * 0.005)
-            candle_body = abs(c['close'] - c['open'])
-            is_not_climax = candle_body <= (atr_val * 2.5)  # Blokada jeśli ciało świecy = 2.5x średniej zmienności
-
-            # ------------------------------------------------------------------
-            # KROK 2: SPUST EGZEKUCJI (CONFIRMED BOUNCE / V-REVERSAL / SQUEEZE BREAKOUT)
-            # ------------------------------------------------------------------
-            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
+            # FILTR 1: Cena testuje strefę wsparcia (Pomiędzy EMA 9 a EMA 89)
+            # To odpowiada idealnie pierwszemu i drugiemu niebieskiemu polu [B] z Twojego screena.
+            # Cena po wzroście spada i knotami dotyka EMA 21 lub EMA 50.
+            dipped_to_support = min(p['low'], c['low'], c_now['low']) <= (c['ema21'] * 1.005)
+            not_crashing = c['close'] >= (c['ema89'] * 0.995) # Nie spada poniżej głównego wsparcia EMA 89
             
-            # TRIGGER A: Klasyczne odwrócenie przez krzyż EMA 9/21
-            fast_cross_closed = ((p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) or                                  (p2['ema9'] <= p2['ema21'] and c['ema9'] > c['ema21'])) and                                 (c['close'] > c['open']) and (c['close'] >= c['ema9']) and (vol_ratio >= 1.05)
+            # FILTR 2: Akcja cenowa potwierdzająca odbicie z dołka w trendzie
+            # Świeca musi być zielona i odbijać w górę od wsparcia
+            is_green = c['close'] > c['open']
+            engulfing_or_pinbar = (c['close'] > p['high']) or ((c['close'] - c['open']) > abs(p['close'] - p['open']) * 0.8)
+            crossed_ema9_back = (p['close'] < p['ema9']) and (c['close'] > c['ema9'])
+            
+            # Alternatywa w locie (c_now): jeśli gwałtownie zawraca do góry w trakcie 15M
+            live_bounce = (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and (c_now['close'] > c_now['ema9'])
 
-            cross_in_flight = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
-            spread_now = (c_now['ema9'] - c_now['ema21']) / c_now['ema21']
-            fast_cross_live = cross_in_flight and (spread_now >= 0.0010) and (c_now['close'] > c_now['open']) and (c_now['close'] > c_now['ema9'])
+            # FILTR 3: Zabezpieczenie przed kupnem na górce
+            # Cena musi być blisko średniej EMA 21 (max 2% odjazdu), nie gonimy uciekających świec!
+            not_extended = ((c['close'] - c['ema21']) / c['ema21']) < 0.02
 
-            # TRIGGER B: Formacja "V-Reversal" ze skokiem wolumenu (Złapanie dna Price Action)
-            is_dump_candle = (p['close'] < p['open']) and ((p['open'] - p['close']) / p['open'] >= 0.0025)
-            is_rebound_candle = (c['close'] > c['open'])
-            rebound_strength = (c['close'] - p['close']) / (p['open'] - p['close']) if (p['open'] > p['close']) else 0.0
-            is_engulfing = rebound_strength >= 0.70  # Zamknięcie zielonej znosi min. 70% spadku poprzedniej
-            vol_spike = (c['volume'] >= (c['vol_ma20'] * 1.15)) or (p['volume'] >= (p['vol_ma20'] * 1.15))
-            
-            v_reversal_signal = is_dump_candle and is_rebound_candle and is_engulfing and vol_spike
-            
-            # TRIGGER C: "Pullback on EMA 21" - Bezpieczne dokupowanie na korekcie w trendzie wzrostowym (bez gonienia wybić)
-            # Warunek 1: Sztywny trend wzrostowy
-            strong_trend = (c['ema9'] > c['ema21']) and (p['ema9'] > p['ema21']) and (p2['ema9'] > p2['ema21'])
-            # Warunek 2: Kurs wykonał korektę i ZSZEDŁ testować EMA 21 (wystarczy, że spadł do strefy bliskiej EMA21)
-            pulled_back = min(p['low'], c['low']) <= (c['ema21'] * 1.004)
-            # Warunek 3: Odtrącenie spadku - cena musi zamknąć się w górze (zielona świeca na teście)
-            rejected_support = (c['close'] > c['open']) and (c['close'] > c['ema21'])
-            # Warunek 4: Ostatnia świeca NIE może być pionowym drągiem uciekającym w kosmos
-            not_chasing = ((c['close'] - c['ema9']) / c['ema9']) <= 0.006
-            
-            pullback_signal = strong_trend and pulled_back and rejected_support and not_chasing
+            # TRIGGER WEJŚCIA DLA PEPE
+            pepe_buy_signal = is_uptrend and dipped_to_support and not_crashing and not_extended and (is_green and (engulfing_or_pinbar or crossed_ema9_back) or live_bounce)
 
             # ------------------------------------------------------------------
-            # KROK 3: COOLDOWN PO STOP LOSS (CHRONI PRZED SPADAJĄCYM NOŻEM)
+            # KROK 3: COOLDOWN PO STOP LOSS
             # ------------------------------------------------------------------
             cooldown_ok = True
             with lock_history:
                 trades_log = trade_history.get("trades_log", [])
                 for t in reversed(trades_log):
                     if t.get("symbol") == symbol:
-                        if now_ts - t.get("timestamp", 0) < 600:  # 10 minut przerwy po SL
+                        if now_ts - t.get("timestamp", 0) < 600:
                             cooldown_ok = False
                         break
 
-            # Weryfikacja sygnału ostatecznego
-            # Bottom Sniper łapie dno (wymaga schłodzenia RSI), a Pullback łapie korektę (nie wymaga schłodzonego RSI)
-            bottom_catch = was_cooled_down and (fast_cross_closed or fast_cross_live or v_reversal_signal)
-            trend_catch = pullback_signal
-            
-            is_signal = (bottom_catch or trend_catch) and is_not_overbought and not_extended and has_room_to_grow and is_not_climax and cooldown_ok
+            is_signal = pepe_buy_signal and cooldown_ok
 
-            # Prezentacja logów
-            spread_disp = spread_now if fast_cross_live else ((c['ema9'] - c['ema21']) / c['ema21'])
-            dec = 8 if c['ema9'] < 0.01 else 4
-            spread_tag = f"🟢 +{spread_disp*100:.2f}%" if spread_disp >= 0 else f"🔴 {spread_disp*100:.2f}%"
-            vol_tag = f"Vol: {vol_ratio:.2f}x ({'🟢' if vol_ratio >= 1.05 or vol_spike else '🔴'})"
-            rsi_tag = f"RSI: {c['rsi']:.1f} (Min4: {recent_min_rsi:.1f})"
-            log_msg = f"🔍 [{symbol}] EMA9: {c['ema9']:.{dec}f} | EMA21: {c['ema21']:.{dec}f} | {spread_tag} | {vol_tag} | {rsi_tag} | "
+            # Logowanie
+            dist_to_ema21 = ((c['close'] - c['ema21']) / c['ema21']) * 100
+            log_msg = f"🐸 [{symbol}] EMA21 dist: {dist_to_ema21:.2f}% | Support: {dipped_to_support} | Bounce: {(is_green and (engulfing_or_pinbar or crossed_ema9_back) or live_bounce)} | "
 
             if is_signal:
-                if trend_catch:
-                    mode = "TREND PULLBACK 🌊"
-                elif v_reversal_signal and not fast_cross_closed and not fast_cross_live:
-                    mode = "V-REVERSAL PA 📉⬆️"
-                else:
-                    mode = "W LOCIE ⚡" if fast_cross_live else "POTWIERDZONE 15M 🕯️"
-                logging.info(log_msg + f"🚀 [SNIPER: {mode}] Akceptacja wejścia!")
+                logging.info(log_msg + f"🚀 [PEPE SWING] Idealny dołek wyłapany! Wchodzę!")
             else:
-                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross: {fast_cross_closed or fast_cross_live} | Pullback: {trend_catch}")
+                logging.info(log_msg + "Czekam na korektę do średnich...")
 
             # EGZEKUCJA TRANSAKCJI
             if is_signal:
@@ -808,11 +721,13 @@ def monitoring_worker():
                         eff_peak_pullback = 0.012     # 1.2% bufor na szum
                     else:
                         # Tryb STANDARDOWY (BULLISH / NEUTRAL): Szerszy oddech dla pozycji
-                        eff_partial_tp = 0.025                  # Czekamy cierpliwiej na 2.5%
-                        eff_be_trigger = 0.020                  # BE aktywowane głęboko, przy +2.0%
-                        eff_be_sl = 0.001                       # BE ląduje na +0.1% a nie 0.3% żeby knot go nie wybił
-                        eff_peak_trigger = 0.028                # Trailing rusza dopiero blisko 3%
-                        eff_peak_pullback = 0.014               # Dajemy cenie aż 1.4% przestrzeni do oddychania na korekty
+                        # USTAWIENIA PEPE TOP CATCHER
+                        eff_partial_tp = 0.040                  # Czekamy na solidny wystrzał (4%)
+                        eff_be_trigger = 0.025                  # BE aktywuje się bezpiecznie wysoko by nie wylecieć na re-teście
+                        eff_be_sl = 0.002                       
+                        # Kluczowe dla złapania górek oznaczonych "S": agresywny trailing po pompach
+                        eff_peak_trigger = 0.035                # Zaczynamy śledzić szczyt od +3.5% zysku
+                        eff_peak_pullback = 0.015               # Jeśli ze szczytu PEPE spadnie o 1.5%, tniemy (Koniec rajdu)
 
                     # ----------------------------------------------------------
                     # 1. CZĘŚCIOWY TAKE PROFIT (33% pozycji zleceniem limit ask)
