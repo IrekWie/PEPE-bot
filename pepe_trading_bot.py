@@ -663,7 +663,17 @@ def run_bottom_sniper_strategy():
             
             v_reversal_signal = is_dump_candle and is_rebound_candle and is_engulfing and vol_spike
             
-
+            # TRIGGER C: "Pullback on EMA 21" - Bezpieczne dokupowanie na korekcie w trendzie wzrostowym (bez gonienia wybić)
+            # Warunek 1: Sztywny trend wzrostowy
+            strong_trend = (c['ema9'] > c['ema21']) and (p['ema9'] > p['ema21']) and (p2['ema9'] > p2['ema21'])
+            # Warunek 2: Kurs wykonał korektę i ZSZEDŁ testować EMA 21 (wystarczy, że spadł do strefy bliskiej EMA21)
+            pulled_back = min(p['low'], c['low']) <= (c['ema21'] * 1.004)
+            # Warunek 3: Odtrącenie spadku - cena musi zamknąć się w górze (zielona świeca na teście)
+            rejected_support = (c['close'] > c['open']) and (c['close'] > c['ema21'])
+            # Warunek 4: Ostatnia świeca NIE może być pionowym drągiem uciekającym w kosmos
+            not_chasing = ((c['close'] - c['ema9']) / c['ema9']) <= 0.006
+            
+            pullback_signal = strong_trend and pulled_back and rejected_support and not_chasing
 
             # ------------------------------------------------------------------
             # KROK 3: COOLDOWN PO STOP LOSS (CHRONI PRZED SPADAJĄCYM NOŻEM)
@@ -677,8 +687,12 @@ def run_bottom_sniper_strategy():
                             cooldown_ok = False
                         break
 
-            # Weryfikacja sygnału ostatecznego (Tylko Bottom Sniper)
-            is_signal = was_cooled_down and is_not_overbought and not_extended and has_room_to_grow and is_not_climax and cooldown_ok and (fast_cross_closed or fast_cross_live or v_reversal_signal)
+            # Weryfikacja sygnału ostatecznego
+            # Bottom Sniper łapie dno (wymaga schłodzenia RSI), a Pullback łapie korektę (nie wymaga schłodzonego RSI)
+            bottom_catch = was_cooled_down and (fast_cross_closed or fast_cross_live or v_reversal_signal)
+            trend_catch = pullback_signal
+            
+            is_signal = (bottom_catch or trend_catch) and is_not_overbought and not_extended and has_room_to_grow and is_not_climax and cooldown_ok
 
             # Prezentacja logów
             spread_disp = spread_now if fast_cross_live else ((c['ema9'] - c['ema21']) / c['ema21'])
@@ -689,13 +703,15 @@ def run_bottom_sniper_strategy():
             log_msg = f"🔍 [{symbol}] EMA9: {c['ema9']:.{dec}f} | EMA21: {c['ema21']:.{dec}f} | {spread_tag} | {vol_tag} | {rsi_tag} | "
 
             if is_signal:
-                if v_reversal_signal and not fast_cross_closed and not fast_cross_live:
+                if trend_catch:
+                    mode = "TREND PULLBACK 🌊"
+                elif v_reversal_signal and not fast_cross_closed and not fast_cross_live:
                     mode = "V-REVERSAL PA 📉⬆️"
                 else:
                     mode = "W LOCIE ⚡" if fast_cross_live else "POTWIERDZONE 15M 🕯️"
-                logging.info(log_msg + f"🚀 [SNIPER DNA: {mode}] Zakup w dołku!")
+                logging.info(log_msg + f"🚀 [SNIPER: {mode}] Akceptacja wejścia!")
             else:
-                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross 9/21: {fast_cross_closed or fast_cross_live} | V-Reversal: {v_reversal_signal}")
+                logging.info(log_msg + f"Dno OK: {was_cooled_down} | Cross: {fast_cross_closed or fast_cross_live} | Pullback: {trend_catch}")
 
             # EGZEKUCJA TRANSAKCJI
             if is_signal:
@@ -786,17 +802,17 @@ def monitoring_worker():
                     if is_bearish:
                         # Tryb BEARISH: Hierarchia progów chroniąca przed przedwczesnym wybiciem knota
                         eff_partial_tp = 0.018        # Szybszy TP: ułamek 33% zysku księgowany już przy +1.8%
-                        eff_be_trigger = 0.010        # BreakEven bezpiecznie aktywuje się przy +1.0%
-                        eff_be_sl = 0.003             # SL ląduje na +0.3% (chroni prowizje)
-                        eff_peak_trigger = 0.022      # Peak Trail wchodzi do gry DOPIERO po zrzuceniu 33% pozycji na TP
-                        eff_peak_pullback = 0.012     # Szerszy margines na szum / knot oporowy (-1.2% od szczytu zamiast -0.6%)
+                        eff_be_trigger = 0.015        # BreakEven aktywuje się dopiero przy +1.5% (pozwala przetrwać retest)
+                        eff_be_sl = 0.001             # SL na +0.1% (tylko na otarcie łez z prowizji, szerszy bufor)
+                        eff_peak_trigger = 0.022      # Peak Trail czuwa po częściowym TP
+                        eff_peak_pullback = 0.012     # 1.2% bufor na szum
                     else:
                         # Tryb STANDARDOWY (BULLISH / NEUTRAL): Szerszy oddech dla pozycji
-                        eff_partial_tp = PARTIAL_TP_PCT         # 0.025 (+2.5%)
-                        eff_be_trigger = BREAKEVEN_TRIGGER_PCT  # 0.015 (+1.5%)
-                        eff_be_sl = BREAKEVEN_SL_PCT            # 0.003 (+0.3%)
-                        eff_peak_trigger = PEAK_TRAIL_TRIGGER_PCT     # 0.020 (+2.0%)
-                        eff_peak_pullback = PEAK_TRAIL_PULLBACK_PCT   # 0.010 (-1.0%)
+                        eff_partial_tp = 0.025                  # Czekamy cierpliwiej na 2.5%
+                        eff_be_trigger = 0.020                  # BE aktywowane głęboko, przy +2.0%
+                        eff_be_sl = 0.001                       # BE ląduje na +0.1% a nie 0.3% żeby knot go nie wybił
+                        eff_peak_trigger = 0.028                # Trailing rusza dopiero blisko 3%
+                        eff_peak_pullback = 0.014               # Dajemy cenie aż 1.4% przestrzeni do oddychania na korekty
 
                     # ----------------------------------------------------------
                     # 1. CZĘŚCIOWY TAKE PROFIT (33% pozycji zleceniem limit ask)
