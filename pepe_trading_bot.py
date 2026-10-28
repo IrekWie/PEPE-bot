@@ -575,58 +575,102 @@ def run_bottom_sniper_strategy():
             p2 = df.iloc[-4]
             p3 = df.iloc[-5]
 
-            # ------------------------------------------------------------------
-            # STRATEGIA "PEPE PERFECT SWING" - KUPNO NA WSPARCIU EMA
-            # ------------------------------------------------------------------
-            # Wykrywamy trend makro (EMA 50 nad EMA 200, EMA 89 rosnąca)
-            is_uptrend = c['ema50'] > c['ema200']
+            # ==================================================================
+            # STRATEGIA "PEPE HISTORICAL BOTTOM SNIPER" (GŁĘBOKIE SPADKI + DOŁKI)
+            # ==================================================================
+            # 1. ANALIZA WIĘKSZEGO SPADKU (MIN. 4.5% ZRZUTU ZE SZCZYTU LUB WYPRZEDANIE)
+            lookback_candles = min(len(df) - 3, 36)
+            local_peak = df['high'].iloc[-lookback_candles:-2].max()
+            drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
             
-            # FILTR 1: Cena testuje strefę wsparcia (Pomiędzy EMA 9 a EMA 89)
-            # To odpowiada idealnie pierwszemu i drugiemu niebieskiemu polu [B] z Twojego screena.
-            # Cena po wzroście spada i knotami dotyka EMA 21 lub EMA 50.
-            dipped_to_support = min(p['low'], c['low'], c_now['low']) <= (c['ema21'] * 1.005)
-            not_crashing = c['close'] >= (c['ema89'] * 0.995) # Nie spada poniżej głównego wsparcia EMA 89
+            # Wymagamy realnego, głębszego zrzutu (min. 4.5% od lokalnego szczytu) LUB mocnego wyprzedania RSI <= 40
+            has_deep_drop = (drop_from_peak >= 0.045) or (c['rsi'] <= 40.0) or (min(p['low'], c['low']) <= c['bb_lower'] * 1.002)
+
+            # 2. WERYFIKACJA WSPARCIA NA HISTORYCZNYCH DOŁKACH I DUŻYCH ŚREDNICH (24H LOW & EMA 89/200)
+            lb_len = min(len(df) - 5, 96)  # 96 świec = 24 godziny
+            history_window = df.iloc[-lb_len:-4]
             
-            # FILTR 2: Akcja cenowa potwierdzająca odbicie z dołka w trendzie
-            # Świeca musi być zielona i odbijać w górę od wsparcia
+            # Wyszukujemy historyczne dołki fraktalne z ostatnich 24h
+            historical_lows = []
+            if len(history_window) >= 10:
+                low_series = history_window['low'].values
+                for idx_low in range(2, len(low_series) - 2):
+                    if low_series[idx_low] <= low_series[idx_low-1] and                        low_series[idx_low] <= low_series[idx_low-2] and                        low_series[idx_low] <= low_series[idx_low+1] and                        low_series[idx_low] <= low_series[idx_low+2]:
+                        historical_lows.append(low_series[idx_low])
+            
+            abs_24h_low = history_window['low'].min() if len(history_window) > 0 else c['close'] * 0.95
+            if abs_24h_low not in historical_lows:
+                historical_lows.append(abs_24h_low)
+
+            # Dołki trendowe na kluczowych średnich makro (EMA 89 - biała, EMA 200 - czerwona)
+            macro_supports = [c['ema89'], c['ema200']]
+            all_support_levels = historical_lows + macro_supports
+
+            # Sprawdzamy czy kurs jest W STREFIE HISTORYCZNEGO DOŁKA (max 1.2% od wsparcia lub knotem w wsparcie)
+            curr_low = min(p['low'], c['low'], c_now['low'])
+            at_historical_support = False
+            nearest_support = 0.0
+            min_dist = 999.0
+            
+            for sup in all_support_levels:
+                if sup > 0:
+                    dist = (c['close'] - sup) / sup
+                    if (-0.010 <= dist <= 0.012) or (curr_low <= sup * 1.003 and c['close'] >= sup * 0.990):
+                        at_historical_support = True
+                        if abs(dist) < min_dist:
+                            min_dist = abs(dist)
+                            nearest_support = sup
+
+            # 3. FILTR ANTY-DRYFOWY (POTWIERDZENIE ODBICIA NA DOŁKU)
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             is_green = c['close'] > c['open']
-            engulfing_or_pinbar = (c['close'] > p['high']) or ((c['close'] - c['open']) > abs(p['close'] - p['open']) * 0.8)
-            crossed_ema9_back = (p['close'] < p['ema9']) and (c['close'] > c['ema9'])
             
-            # Alternatywa w locie (c_now): jeśli gwałtownie zawraca do góry w trakcie 15M
-            live_bounce = (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and (c_now['close'] > c_now['ema9'])
+            # Trigger A: Potwierdzone przecięcie EMA 9 ponad EMA 21 w górę
+            fresh_cross_up = (p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) and is_green
+            
+            # Trigger B: Formacja V-Reversal ze skokiem wolumenu na wsparciu
+            rebound_candle = is_green and ((c['close'] - c['open']) >= abs(p['close'] - p['open']) * 0.85 or c['close'] > p['high'])
+            strong_vol = (vol_ratio >= 1.20) or (c['volume'] >= c['vol_ma20'] * 1.10)
+            v_reversal_at_support = rebound_candle and strong_vol
+            
+            # Trigger C w locie: mocny dynamiczny powrót nad EMA 9
+            live_bounce = (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and                           (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 0.85))
 
-            # FILTR 3: Zabezpieczenie przed kupnem na górce
-            # Cena musi być blisko średniej EMA 21 (max 2% odjazdu), nie gonimy uciekających świec!
-            not_extended = ((c['close'] - c['ema21']) / c['ema21']) < 0.02
+            trigger_confirmed = fresh_cross_up or v_reversal_at_support or live_bounce
 
-            # TRIGGER WEJŚCIA DLA PEPE
-            pepe_buy_signal = is_uptrend and dipped_to_support and not_crashing and not_extended and (is_green and (engulfing_or_pinbar or crossed_ema9_back) or live_bounce)
+            # 4. BLOKADA KUPNA NA GÓRCE (ZAKAZ GONIENIA CENY)
+            not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
 
-            # ------------------------------------------------------------------
-            # KROK 3: COOLDOWN PO STOP LOSS
-            # ------------------------------------------------------------------
+            pepe_buy_signal = has_deep_drop and at_historical_support and trigger_confirmed and not_extended
+
+            # 5. ROZSZERZONY COOLDOWN PO STRACIE (OCHRONA SALDA PRZED SERIĄ STRAT)
+            # Jeśli ostatnia transakcja była stratna, czekamy min. 45 minut (2700 sekund), aby rynek dokończył spadek
             cooldown_ok = True
             with lock_history:
                 trades_log = trade_history.get("trades_log", [])
                 for t in reversed(trades_log):
                     if t.get("symbol") == symbol:
-                        if now_ts - t.get("timestamp", 0) < 600:
+                        time_since = now_ts - t.get("timestamp", 0)
+                        if t.get("net_pnl", 0) < 0 and time_since < 2700:
+                            cooldown_ok = False
+                        elif time_since < 600:
                             cooldown_ok = False
                         break
 
             is_signal = pepe_buy_signal and cooldown_ok
 
-            # Logowanie
-            dist_to_ema21 = ((c['close'] - c['ema21']) / c['ema21']) * 100
-            log_msg = f"🐸 [{symbol}] EMA21 dist: {dist_to_ema21:.2f}% | Support: {dipped_to_support} | Bounce: {(is_green and (engulfing_or_pinbar or crossed_ema9_back) or live_bounce)} | "
+            # Logowanie szczegółowe
+            drop_tag = f"Spadek: -{drop_from_peak*100:.2f}% ({'🟢' if has_deep_drop else '🔴'})"
+            sup_tag = f"Wsparcie: {'🟢 TAK' if at_historical_support else '🔴 NIE'}"
+            trig_tag = f"Trigger: {'🟢 TAK' if trigger_confirmed else '🔴 NIE'}"
+            cd_tag = f"Cooldown: {'🟢 OK' if cooldown_ok else '⏳ BLOKADA 45M'}"
+            log_msg = f"🐸 [{symbol}] {drop_tag} | {sup_tag} | {trig_tag} | {cd_tag} | RSI: {c['rsi']:.1f} | "
 
             if is_signal:
-                logging.info(log_msg + f"🚀 [PEPE SWING] Idealny dołek wyłapany! Wchodzę!")
+                sup_info = f"przy {nearest_support:.8f}" if nearest_support > 0 else ""
+                logging.info(log_msg + f"🚀 [PEPE HISTORICAL BOTTOM] Wykryto potężny dołek {sup_info}! Wchodzę!")
             else:
-                logging.info(log_msg + "Czekam na korektę do średnich...")
-
-            # EGZEKUCJA TRANSAKCJI
+                logging.info(log_msg + "Czekam na głębszy spadek i test dołka...")            # EGZEKUCJA TRANSAKCJI
             if is_signal:
                 if free_usdc < (target_allocation * 0.99):
                     logging.warning(f"⏳ [{symbol}] Sygnał zakupu na dnie, ale brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
@@ -634,7 +678,7 @@ def run_bottom_sniper_strategy():
 
                 # Ciasny Stop Loss tuż pod lokalnym dołkiem zwrotnym (ryzyko zazwyczaj poniżej 1%)
                 swing_low = min(c['low'], p['low'], c_now['low'])
-                initial_sl = swing_low * 0.997
+                initial_sl = swing_low * 0.994
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
