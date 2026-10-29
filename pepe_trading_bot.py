@@ -730,19 +730,26 @@ def monitoring_worker():
                     sl_type = ""
 
                     # ----------------------------------------------------------
-                    # DYNAMICZNA ADAPTACJA PARAMETRÓW WYJŚCIA (100% ZYSKU ZE SZCZYTU FALI)
+                    # DYNAMICZNA ADAPTACJA PARAMETRÓW WYJŚCIA (PEPE DIAMOND HANDS - ŁAPANIE MEGA RAJDÓW)
                     # ----------------------------------------------------------
                     is_bearish = ("BEARISH" in CURRENT_SENTIMENT)
                     if is_bearish:
-                        eff_be_trigger = 0.012        # BreakEven uzbraja się przy +1.2%
+                        eff_be_trigger = 0.020        # BreakEven uzbraja się przy +2.0%
                         eff_be_sl = 0.002             # BE SL ląduje na +0.2% (pokrycie fee)
-                        eff_peak_trigger = 0.018      # Śledzenie szczytu fali rusza już od +1.8%
-                        eff_peak_pullback = 0.008     # 0.8% cofnięcia ze szczytu zamyka 100% pozycji
+                        eff_peak_trigger = 0.030      # Śledzenie szczytu fali rusza od +3.0%
+                        eff_peak_pullback = 0.015     # 1.5% cofnięcia ze szczytu tnie pozycję (w bessie ciaśniej)
                     else:
-                        eff_be_trigger = 0.015        # BreakEven uzbraja się przy +1.5%
-                        eff_be_sl = 0.002             # BE SL ląduje na +0.2% (pokrycie fee)
-                        eff_peak_trigger = 0.020      # Śledzenie szczytu fali rusza od +2.0%
-                        eff_peak_pullback = 0.010     # 1.0% cofnięcia ze szczytu zamyka 100% pozycji
+                        eff_be_trigger = 0.025        # Dajemy cenie DUŻO oddechu! BE dopiero przy +2.5%
+                        eff_be_sl = 0.002             # BE SL na +0.2%
+                        eff_peak_trigger = 0.040      # Trailing włącza się dopiero gdy rajd osiągnie +4.0%
+                        
+                        # DYNAMICZNY PULLBACK: Im większy zysk (parabola), tym więcej luzu dajemy na knoty!
+                        if peak_pnl > 0.10:           # Jeśli rajd przekroczył +10% zysku
+                            eff_peak_pullback = 0.035 # Dajemy aż 3.5% miejsca na głębokie knoty
+                        elif peak_pnl > 0.06:         # Jeśli rajd przekroczył +6% zysku
+                            eff_peak_pullback = 0.025 # Dajemy 2.5% miejsca
+                        else:
+                            eff_peak_pullback = 0.018 # Standardowy bufor 1.8% ze szczytu dla mniejszych fal
 
                     # ----------------------------------------------------------
                     # 1. PRÓG BREAKEVEN (BEZWZGLĘDNA OCHRONA PRZED STRATĄ PO WYBICIE)
