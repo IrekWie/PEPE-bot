@@ -730,57 +730,31 @@ def monitoring_worker():
                     sl_type = ""
 
                     # ----------------------------------------------------------
-                    # DYNAMICZNA ADAPTACJA PARAMETRÓW RYZYKA (BEARISH vs RESZTA)
+                    # DYNAMICZNA ADAPTACJA PARAMETRÓW WYJŚCIA (100% ZYSKU ZE SZCZYTU FALI)
                     # ----------------------------------------------------------
                     is_bearish = ("BEARISH" in CURRENT_SENTIMENT)
                     if is_bearish:
-                        # Tryb BEARISH: Hierarchia progów chroniąca przed przedwczesnym wybiciem knota
-                        eff_partial_tp = 0.018        # Szybszy TP: ułamek 33% zysku księgowany już przy +1.8%
-                        eff_be_trigger = 0.015        # BreakEven aktywuje się dopiero przy +1.5% (pozwala przetrwać retest)
-                        eff_be_sl = 0.001             # SL na +0.1% (tylko na otarcie łez z prowizji, szerszy bufor)
-                        eff_peak_trigger = 0.022      # Peak Trail czuwa po częściowym TP
-                        eff_peak_pullback = 0.012     # 1.2% bufor na szum
+                        eff_be_trigger = 0.012        # BreakEven uzbraja się przy +1.2%
+                        eff_be_sl = 0.002             # BE SL ląduje na +0.2% (pokrycie fee)
+                        eff_peak_trigger = 0.018      # Śledzenie szczytu fali rusza już od +1.8%
+                        eff_peak_pullback = 0.008     # 0.8% cofnięcia ze szczytu zamyka 100% pozycji
                     else:
-                        # Tryb STANDARDOWY (BULLISH / NEUTRAL): Szerszy oddech dla pozycji
-                        # USTAWIENIA PEPE TOP CATCHER
-                        eff_partial_tp = 0.040                  # Czekamy na solidny wystrzał (4%)
-                        eff_be_trigger = 0.025                  # BE aktywuje się bezpiecznie wysoko by nie wylecieć na re-teście
-                        eff_be_sl = 0.002                       
-                        # Kluczowe dla złapania górek oznaczonych "S": agresywny trailing po pompach
-                        eff_peak_trigger = 0.035                # Zaczynamy śledzić szczyt od +3.5% zysku
-                        eff_peak_pullback = 0.015               # Jeśli ze szczytu PEPE spadnie o 1.5%, tniemy (Koniec rajdu)
+                        eff_be_trigger = 0.015        # BreakEven uzbraja się przy +1.5%
+                        eff_be_sl = 0.002             # BE SL ląduje na +0.2% (pokrycie fee)
+                        eff_peak_trigger = 0.020      # Śledzenie szczytu fali rusza od +2.0%
+                        eff_peak_pullback = 0.010     # 1.0% cofnięcia ze szczytu zamyka 100% pozycji
 
                     # ----------------------------------------------------------
-                    # 1. CZĘŚCIOWY TAKE PROFIT (33% pozycji zleceniem limit ask)
-                    # ----------------------------------------------------------
-                    if not sold_half and total_pnl >= eff_partial_tp:
-                        rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
-                        if rb > 0:
-                            st, mq = get_symbol_lot_filter(symbol)
-                            qs = format_qty_with_step(rb * 0.33, st, mq)
-                            if qs:
-                                ticker = session.get_tickers(category=CATEGORY, symbol=symbol)
-                                ask_p = safe_float(ticker.get("result", {}).get("list", [{}])[0].get("ask1Price", c_curr))
-                                session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Limit", qty=qs, price=str(ask_p), timeInForce="PostOnly")
-                                with lock_pos:
-                                    if symbol in active_positions:
-                                        active_positions[symbol]["sold_half"] = True
-                                        save_positions(active_positions)
-                                tp_label = f"{eff_partial_tp*100:.1f}%"
-                                mode_tag = "[BEARISH HIT&RUN]" if is_bearish else "[SWING]"
-                                logging.info(f"💸 [PARTIAL TP {mode_tag}] {symbol} LIMIT ORDER po {ask_p:.4f} USD (+{tp_label} zrealizowane).")
-
-                    # ----------------------------------------------------------
-                    # 2. PRÓG BREAKEVEN (OBRONA PRZED POWROTEM NA STRATĘ)
+                    # 1. PRÓG BREAKEVEN (BEZWZGLĘDNA OCHRONA PRZED STRATĄ PO WYBICIE)
                     # ----------------------------------------------------------
                     be_level = bp * (1.0 + eff_be_sl)
-                    if peak_pnl >= eff_be_trigger or sold_half:
+                    if peak_pnl >= eff_be_trigger:
                         curr_sl = max(pos.get("trailing_sl_low", 0.0), be_level)
                     else:
                         curr_sl = pos.get("trailing_sl_low", 0.0)
 
                     # ----------------------------------------------------------
-                    # 3. KROCZĄCY TRAILING ZA WYŻSZYMI DOŁKAMI 15M
+                    # 2. KROCZĄCY TRAILING ZA WYŻSZYMI DOŁKAMI 15M
                     # ----------------------------------------------------------
                     if len(c_list) >= 4:
                         recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
@@ -799,19 +773,21 @@ def monitoring_worker():
                     if curr_sl > 0 and c_curr <= curr_sl:
                         sl_hit = True
                         if curr_sl == be_level:
-                            mode_info = "BEARISH Obrona (+0.3%)" if is_bearish else "BreakEven (+0.3%)"
-                            sl_type = f"BreakEven ({mode_info})"
+                            sl_type = "BreakEven (+0.2% ochrona kapitału)"
                         else:
                             sl_type = f"Wyjście ze Stop Lossa ({curr_sl:.4f})"
 
                     # ----------------------------------------------------------
-                    # 4. KROCZĄCA OCHRONA ZE SZCZYTU (TRAILING FROM PEAK)
+                    # 3. KROCZĄCY RADAR SZCZYTU (PEAK TRAILING 100% - WYJŚCIE NA GÓRCE)
                     # ----------------------------------------------------------
+                    # Dopóki fala rośnie (1, 2, 3 czy 5 świec), bot NIE sprzedaje i wiezie 100% kapitału.
+                    # W momencie gdy kurs cofnie się o bufor (0.8-1.0%) od najwyższego punktu fali,
+                    # zamyka CAŁE 100% pozycji zleceniem rynkowym na szczycie.
                     if peak_pnl >= eff_peak_trigger and ((peak - c_curr) / peak) >= eff_peak_pullback:
                         trail_hit = True
                         p_drop = eff_peak_pullback * 100
-                        mode_info = "BEARISH HIT&RUN" if is_bearish else "Peak Trailing"
-                        sl_type = f"Ochrona zysku ze szczytu [{mode_info}] (-{p_drop:.1f}% od peaku)"
+                        p_net = ((c_curr - bp) / bp) * 100
+                        sl_type = f"Szczyt fali osiągnięty! 100% zamknięcie (+{p_net:.2f}% | knot -{p_drop:.1f}% ze szczytu)"
 
                     panic_hit = btc_flash_crash and total_pnl < -0.005
 
