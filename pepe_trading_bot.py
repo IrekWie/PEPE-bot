@@ -429,7 +429,7 @@ def calculate_rsi(series, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     return 100 - (100 / (1 + (gain / loss)))
 
-def get_market_data_no_cache(symbol, interval="15", limit=250):
+def get_market_data_no_cache(symbol, interval="15", limit=350):
     try:
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
@@ -461,9 +461,9 @@ def get_market_data_no_cache(symbol, interval="15", limit=250):
         return None
 
 def fetch_data_worker(symbol):
-    return symbol, get_market_data_no_cache(symbol, interval="15", limit=250)
+    return symbol, get_market_data_no_cache(symbol, interval="15", limit=350)
 
-def get_market_data(symbol, interval="15", limit=250):
+def get_market_data(symbol, interval="15", limit=350):
     global kline_cache_15m
     with kline_cache_lock:
         if interval == "15" and symbol in kline_cache_15m:
@@ -576,27 +576,52 @@ def run_bottom_sniper_strategy():
             p3 = df.iloc[-5]
 
             # ==================================================================
-            # STRATEGIA "WAVE RIDER" (ŁAPACZ FAL - SINUSOIDA)
+            # STRATEGIA "WAVE RIDER 3D" (ŁAPACZ FAL + ANALIZA HISTORII 3 DNI / 72H)
             # ==================================================================
-            # 1. IDENTYFIKACJA WIĘKSZEGO RAJDU I SPADKU (KSZTAŁT FALI)
-            # Szukamy lokalnego szczytu z ostatnich 10 godzin (40 świec)
-            local_peak = df['high'].iloc[-40:-2].max()
+            # 1. IDENTYFIKACJA RAJDU I KOREKTY (Lokalny szczyt z ostatnich 24h = 96 świec)
+            lookback_peak = min(len(df) - 3, 96)
+            local_peak = df['high'].iloc[-lookback_peak:-2].max()
             drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
             
-            # Wymagamy, aby spadek po rajdzie był zauważalny (minimum 3.0%), co filtruje mikro-szumy
+            # Wymagamy, aby spadek po rajdzie wynosił minimum 3.0% (filtr szumu konsolidacji)
             is_meaningful_dip = drop_from_peak >= 0.030
 
-            # 2. DNO SINUSOIDY (Zatrzymanie na mocnym wsparciu)
-            # Fale po rajdzie zazwyczaj korygują do EMA 50 lub EMA 89. (EMA 21 jest ignorowana przy większych spadkach).
+            # 2. WYZNACZANIE DNA FALI: ŚREDNIE MAKRO + WSPARCIA HISTORYCZNE Z 3 DNI (72H = 288 ŚWIEC)
             curr_low = min(p['low'], c['low'], c_now['low'])
             
-            # Margines +/- 1.0% od średniej (szeroka strefa wyłapywania dna)
+            # A) Średnie kroczące i Bollinger (dynamiczne wsparcia)
             touch_ema50 = (curr_low <= c['ema50'] * 1.01) and (c['close'] >= c['ema50'] * 0.99)
             touch_ema89 = (curr_low <= c['ema89'] * 1.01) and (c['close'] >= c['ema89'] * 0.99)
             touch_ema200 = (curr_low <= c['ema200'] * 1.01) and (c['close'] >= c['ema200'] * 0.99)
-            touch_bb = (curr_low <= c['bb_lower'] * 1.01) # Zejście do dolnej bandy
+            touch_bb = (curr_low <= c['bb_lower'] * 1.01) # Zejście do dolnej wstęgi Bollingera
             
-            at_wave_bottom = touch_ema50 or touch_ema89 or touch_ema200 or touch_bb
+            # B) Skanowanie kluczowych dołków fraktalnych z ostatnich 3 dni (ok. 288 świec)
+            lb_3d = min(len(df) - 5, 288)
+            history_3d = df.iloc[-lb_3d:-4]
+            historical_lows_3d = []
+            if len(history_3d) >= 12:
+                low_vals = history_3d['low'].values
+                for idx_low in range(2, len(low_vals) - 2):
+                    if low_vals[idx_low] <= low_vals[idx_low-1] and \
+                       low_vals[idx_low] <= low_vals[idx_low-2] and \
+                       low_vals[idx_low] <= low_vals[idx_low+1] and \
+                       low_vals[idx_low] <= low_vals[idx_low+2]:
+                        historical_lows_3d.append(low_vals[idx_low])
+            
+            abs_3d_low = history_3d['low'].min() if len(history_3d) > 0 else 0.0
+            if abs_3d_low > 0 and abs_3d_low not in historical_lows_3d:
+                historical_lows_3d.append(abs_3d_low)
+            
+            # Test czy cena dotyka poziomu dołka z ostatnich 3 dni (+/- 1.0%)
+            touch_historical_3d = False
+            for sup_lvl in historical_lows_3d:
+                if sup_lvl > 0:
+                    dist = (c['close'] - sup_lvl) / sup_lvl
+                    if (-0.010 <= dist <= 0.012) or (curr_low <= sup_lvl * 1.005 and c['close'] >= sup_lvl * 0.990):
+                        touch_historical_3d = True
+                        break
+
+            at_wave_bottom = touch_ema50 or touch_ema89 or touch_ema200 or touch_bb or touch_historical_3d
             
             # 3. POTWIERDZENIE ZWRÓCENIA KU GÓRZE (Początek nowej fali)
             is_green = c['close'] > c['open']
