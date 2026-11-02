@@ -627,33 +627,48 @@ def run_bottom_sniper_strategy():
             is_green = c['close'] > c['open']
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             
+            # ------------------------------------------------------------------
+            # TWARDY FILTR TRENDU (BLOKADA "SPIRALI ŚMIERCI")
+            # ------------------------------------------------------------------
+            # Jeśli EMA 50 < EMA 89 < EMA 200, rynek jest w potężnym downtrendzie.
+            # W takich warunkach łapanie zwykłych dołków to samobójstwo.
+            death_spiral = (c['ema50'] < c['ema89'] < c['ema200']) and (c['close'] < c['ema89'])
+            
             # 3A. Weryfikacja dynamiki zrzutu (zakaz kupowania w trakcie wodospadu)
-            # Jeśli przedostatnia świeca (p) zanurkowała mocno (np. > -2%), rynek ma duży rozpęd w dół.
             is_waterfall = (p['open'] - p['close']) / p['open'] > 0.015
             
             # 3B. Struktura odwrócenia (Wymagamy twardej bazy)
-            # Odbicie z objęciem / pinbarem + mocny wolumen. Jeśli był wodospad, objęcie musi przykryć 100% poprzedniego zrzutu.
-            engulfing = (c['close'] > p['high'])
+            # Objęcie: ciało świecy musi zjeść poprzedni spadek
+            engulfing = (c['close'] > p['open'] if p['open'] > p['close'] else c['close'] > p['high'])
             strong_bounce = is_green and engulfing and (vol_ratio >= 1.30)
             
-            # Klasyczne ubicie podwójnego dna z wyższym dołkiem (Higher Low)
-            # Ostatnia zamknięta świeca zielona, ale jej dołek był wyższy niż dołek świecy poprzedzającej
-            higher_low_formed = is_green and (c['low'] > p['low']) and (c['close'] > p['close'])
+            # Wyższy dołek (Uszczelnienie): Nie wystarczy porównać do poprzedniej świecy! 
+            # Wymagamy potwierdzonego swingu: dół, góra, wyższy dół, góra.
+            higher_low_formed = False
+            if len(df) >= 6:
+                higher_low_formed = is_green and (c['low'] > p2['low']) and (c['close'] > p['high'])
             
-            # Przecięcie średnich
             fresh_cross = (p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) and is_green
             
-            # Nagły atak wolumenu V-Shape (Dozwolony tylko jeśli NIE MA wodospadu)
             live_bounce = not is_waterfall and (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and                           (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 0.90))
 
             trigger_confirmed = (strong_bounce or fresh_cross or higher_low_formed or live_bounce)
             
-            # Blokada definitywna: jeśli trwa wodospad, a cena nie zakryła go objęciem (engulfing) ani wyższym dołkiem, to czekamy.
-            if is_waterfall and not (engulfing or higher_low_formed or fresh_cross):
+            # ------------------------------------------------------------------
+            # BEZWZGLĘDNE BLOKADY KUPNA
+            # ------------------------------------------------------------------
+            # 1. Wodospad: Tylko idealne objęcie zjada wodospad. Żadnych wyższych dołków po krwotoku.
+            if is_waterfall and not engulfing:
                 trigger_confirmed = False
+                
+            # 2. Spirala Śmierci: Jeśli mamy mocny trend spadkowy, kupujemy TYLKO
+            # po gigantycznej kapitulacji (zrzut > 6.0% lub RSI < 20). Zwykłe -3% ignorujemy.
+            if death_spiral:
+                is_capitulation = drop_from_peak >= 0.060 or c['rsi'] < 22
+                if not is_capitulation:
+                    trigger_confirmed = False
 
             # 4. ZABEZPIECZENIE PRZED KUPNEM NA GÓRCE (GDY FALA JUŻ ODJĘCHAŁA)
-            # Jeśli cena jest wyżej niż 1.2% od EMA 9, uznajemy, że fala już uciekła.
             not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
 
             pepe_buy_signal = is_meaningful_dip and at_wave_bottom and trigger_confirmed and not_extended
