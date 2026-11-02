@@ -623,22 +623,34 @@ def run_bottom_sniper_strategy():
 
             at_wave_bottom = touch_ema50 or touch_ema89 or touch_ema200 or touch_bb or touch_historical_3d
             
-            # 3. POTWIERDZENIE ZWRÓCENIA KU GÓRZE (Początek nowej fali)
+                        # 3. FILTR SPADAJĄCEGO NOŻA I POTWIERDZENIE ZWRÓCENIA KU GÓRZE (Ubicie Bazy)
             is_green = c['close'] > c['open']
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             
-            # Odbicie z objęciem / pinbarem LUB skok wolumenu
-            engulfing = (c['close'] > p['high']) or ((c['close'] - c['open']) >= abs(p['close'] - p['open']) * 0.8)
-            strong_bounce = is_green and (engulfing or (vol_ratio >= 1.25))
+            # 3A. Weryfikacja dynamiki zrzutu (zakaz kupowania w trakcie wodospadu)
+            # Jeśli przedostatnia świeca (p) zanurkowała mocno (np. > -2%), rynek ma duży rozpęd w dół.
+            is_waterfall = (p['open'] - p['close']) / p['open'] > 0.015
             
-            # Alternatywa 1: Świeże przecięcie szybkich średnich
+            # 3B. Struktura odwrócenia (Wymagamy twardej bazy)
+            # Odbicie z objęciem / pinbarem + mocny wolumen. Jeśli był wodospad, objęcie musi przykryć 100% poprzedniego zrzutu.
+            engulfing = (c['close'] > p['high'])
+            strong_bounce = is_green and engulfing and (vol_ratio >= 1.30)
+            
+            # Klasyczne ubicie podwójnego dna z wyższym dołkiem (Higher Low)
+            # Ostatnia zamknięta świeca zielona, ale jej dołek był wyższy niż dołek świecy poprzedzającej
+            higher_low_formed = is_green and (c['low'] > p['low']) and (c['close'] > p['close'])
+            
+            # Przecięcie średnich
             fresh_cross = (p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) and is_green
             
-            # Alternatywa 2: Nagły atak wolumenu w bieżącej świecy (V-Shape w locie)
-            live_bounce = (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and \
-                          (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 0.85))
+            # Nagły atak wolumenu V-Shape (Dozwolony tylko jeśli NIE MA wodospadu)
+            live_bounce = not is_waterfall and (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and                           (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 0.90))
 
-            trigger_confirmed = strong_bounce or fresh_cross or live_bounce
+            trigger_confirmed = (strong_bounce or fresh_cross or higher_low_formed or live_bounce)
+            
+            # Blokada definitywna: jeśli trwa wodospad, a cena nie zakryła go objęciem (engulfing) ani wyższym dołkiem, to czekamy.
+            if is_waterfall and not (engulfing or higher_low_formed or fresh_cross):
+                trigger_confirmed = False
 
             # 4. ZABEZPIECZENIE PRZED KUPNEM NA GÓRCE (GDY FALA JUŻ ODJĘCHAŁA)
             # Jeśli cena jest wyżej niż 1.2% od EMA 9, uznajemy, że fala już uciekła.
@@ -777,7 +789,40 @@ def monitoring_worker():
                             eff_peak_pullback = 0.018 # Standardowy bufor 1.8% ze szczytu dla mniejszych fal
 
                     # ----------------------------------------------------------
-                    # 1. PRÓG BREAKEVEN (BEZWZGLĘDNA OCHRONA PRZED STRATĄ PO WYBICIE)
+                    # TWARDE OPORY DLA TRENDU SPADKOWEGO (ZABEZPIECZENIE PRZED POWROTEM DO ZERA)
+                    # ----------------------------------------------------------
+                    # Pobranie aktualnych wartości średnich dla otwartej świecy w locie
+                    df_live = get_market_data(symbol, interval="15", limit=2)
+                    ema89_live = df_live.iloc[-1]['ema89'] if df_live is not None else 0.0
+                    ema200_live = df_live.iloc[-1]['ema200'] if df_live is not None else 0.0
+                    
+                    # Jeśli kurs jest uwięziony pod EMA 89 / EMA 200, te średnie są betonowym sufitem.
+                    # Jakiekolwiek dotknięcie ich od dołu zamyka pozycję (Zabezpieczenie na short squeeze).
+                    hard_resistance_hit = False
+                    if bp < ema89_live and c_curr >= ema89_live * 0.998:
+                        hard_resistance_hit = True
+                        sl_type = "Sztywny TP na oporze (Uderzenie w spadkową EMA 89)"
+                    elif bp < ema200_live and c_curr >= ema200_live * 0.998:
+                        hard_resistance_hit = True
+                        sl_type = "Sztywny TP na oporze (Uderzenie w spadkową EMA 200)"
+
+                    # ----------------------------------------------------------
+                    # 1. CIĘCIE ZYSKU PRZY ZAŁAMANIU IMPETU (Zabezpieczenie fali przed zgaśnięciem)
+                    # ----------------------------------------------------------
+                    # Jeśli świeca 15M gaśnie, znosząc ponad 60% swojego wzrostu, i zbliża się do punktu wejścia,
+                    # bot rzuca pozycję natychmiast na rynku (nie czeka na dojechanie do BreakEven).
+                    momentum_crash = False
+                    if len(c_list) >= 2:
+                        last_closed_candle = c_list[1]
+                        open_px = safe_float(last_closed_candle[1])
+                        close_px = safe_float(last_closed_candle[4])
+                        # Jeśli poprzednia świeca to mocny czerwony pinbar, zrzucamy.
+                        if open_px > close_px and (open_px - close_px) / open_px > 0.015 and peak_pnl > 0.02:
+                            momentum_crash = True
+                            sl_type = "Załamanie impetu (Mocna czerwona świeca gasząca rajd)"
+
+                    # ----------------------------------------------------------
+                    # 2. PRÓG BREAKEVEN (BEZWZGLĘDNA OCHRONA PRZED STRATĄ PO WYBICIE)
                     # ----------------------------------------------------------
                     be_level = bp * (1.0 + eff_be_sl)
                     if peak_pnl >= eff_be_trigger:
@@ -786,7 +831,7 @@ def monitoring_worker():
                         curr_sl = pos.get("trailing_sl_low", 0.0)
 
                     # ----------------------------------------------------------
-                    # 2. KROCZĄCY TRAILING ZA WYŻSZYMI DOŁKAMI 15M
+                    # 3. KROCZĄCY TRAILING ZA WYŻSZYMI DOŁKAMI 15M
                     # ----------------------------------------------------------
                     if len(c_list) >= 4:
                         recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
@@ -810,11 +855,8 @@ def monitoring_worker():
                             sl_type = f"Wyjście ze Stop Lossa ({curr_sl:.4f})"
 
                     # ----------------------------------------------------------
-                    # 3. KROCZĄCY RADAR SZCZYTU (PEAK TRAILING 100% - WYJŚCIE NA GÓRCE)
+                    # 4. KROCZĄCY RADAR SZCZYTU (PEAK TRAILING 100% - WYJŚCIE NA GÓRCE)
                     # ----------------------------------------------------------
-                    # Dopóki fala rośnie (1, 2, 3 czy 5 świec), bot NIE sprzedaje i wiezie 100% kapitału.
-                    # W momencie gdy kurs cofnie się o bufor (0.8-1.0%) od najwyższego punktu fali,
-                    # zamyka CAŁE 100% pozycji zleceniem rynkowym na szczycie.
                     if peak_pnl >= eff_peak_trigger and ((peak - c_curr) / peak) >= eff_peak_pullback:
                         trail_hit = True
                         p_drop = eff_peak_pullback * 100
