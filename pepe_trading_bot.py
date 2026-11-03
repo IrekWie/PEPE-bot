@@ -84,7 +84,7 @@ current_sniper_coins = []
 last_dynamic_scan = 0
 
 def get_dynamic_top_coins():
-    # MEMECOIN SNIPER - Opcja A (Polowanie na pierwszego)
+    # MEMECOIN SNIPER - Opcja A (Polowanie na pierwszego: PEPE lub WIF)
     return ["PEPEUSDC", "WIFUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
@@ -406,7 +406,7 @@ def sync_positions_from_bybit():
                             q_str = format_qty_with_step(bal, step, minq)
                             if q_str:
                                 recent_low = df['low'].iloc[-4:-1].min() if len(df) >= 4 else buy_p * 0.98
-                                initial_sl = recent_low * 0.997
+                                initial_sl = recent_low * 0.980
                                 active_positions[sym] = {
                                     "strategy": "BOTTOM_SNIPER",
                                     "buy_price": buy_p,
@@ -666,7 +666,7 @@ def run_bottom_sniper_strategy():
                     continue
 
                 swing_low = min(c['low'], p['low'], c_now['low'])
-                initial_sl = swing_low * 0.992
+                initial_sl = swing_low * 0.980
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
@@ -930,4 +930,3 @@ if __name__ == "__main__":
     t_ping = threading.Thread(target=self_ping_loop, daemon=True)
     t_ping.start()
     run_health_server()
-```[cite: 18]
