@@ -543,14 +543,11 @@ def run_bottom_sniper_strategy():
 
     with lock_pos: current_count = len(active_positions)
     if current_count >= MAX_TOTAL_POSITIONS:
-        logging.info(f"ℹ️ [LIMIT POZYCJI] Osiągnięto limit {current_count}/{MAX_TOTAL_POSITIONS}. Czekam na realizację zysków.")
         return
 
-    logging.info(f"🎯 [BOTTOM SNIPER 15M] Skanowanie {len(target_coins)} najpłynniejszych par | Alokacja: {target_allocation:.2f}$ (80%) | Wolne: {free_usdc:.2f}$")
-
-    # Pobieranie równoległe (8 wątków - czas ~300ms)
+    # Pobieranie świec
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in target_coins}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
@@ -565,170 +562,83 @@ def run_bottom_sniper_strategy():
         if is_active: continue
 
         df = results.get(symbol)
-        if df is None or len(df) < 50:
+        if df is None or len(df) < 60:
             continue
 
         try:
-            c_now = df.iloc[-1]   # Świeca bieżąca (w locie)
-            c = df.iloc[-2]       # Ostatnia zamknięta świeca 15M
+            c_now = df.iloc[-1]   # Bieżąca świeca
+            c = df.iloc[-2]       # Ostatnia zamknięta 15M
             p = df.iloc[-3]
             p2 = df.iloc[-4]
-            p3 = df.iloc[-5]
 
-            # ==================================================================
-            # STRATEGIA "WAVE RIDER 3D" (ŁAPACZ FAL + ANALIZA HISTORII 3 DNI / 72H)
-            # ==================================================================
-            # 1. IDENTYFIKACJA RAJDU I KOREKTY (Lokalny szczyt z ostatnich 24h = 96 świec)
+            # ----------------------------------------------------------
+            # 1. BLOKADA SIECZKI / KONSOLIDACJI (CHOP FILTER)
+            # ----------------------------------------------------------
+            # Sprawdzamy czy średnie nie są sklejone w płaską linię
+            ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
+            is_flat_chop = ema_spread < 0.0035  # Średnie rozjechane o mniej niż 0.35% = konsolidacja
+            
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
+            is_green = c['close'] > c['open']
+
+            # ----------------------------------------------------------
+            # 2. SCENARIUSZ A: DYNAMICZNY RAJD / WYBICIE (BREAKOUT)
+            # ----------------------------------------------------------
+            # Szukamy wybicia 20 ostatnich świec (5 godzin) na mocnym wolumenie
+            highest_20 = df['high'].iloc[-23:-3].max()
+            breakout_confirmed = (c['close'] > highest_20) and is_green and (vol_ratio >= 1.25)
+            
+            # W locie: świeca bieżąca przebija sufit z potężnym wolumenem
+            live_breakout = (c_now['close'] > highest_20) and (c_now['close'] > c_now['open']) and \
+                            (c_now['volume'] >= (c_now['vol_ma20'] * 1.30))
+
+            is_breakout_entry = (breakout_confirmed or live_breakout) and not is_flat_chop
+
+            # ----------------------------------------------------------
+            # 3. SCENARIUSZ B: CZYSTE ODBICIE OD DNA SINUSOIDY (BOTTOM SNIPER)
+            # ----------------------------------------------------------
+            # Dno po wyraźnym spadku (min. 3.0% od szczytu 24h)
             lookback_peak = min(len(df) - 3, 96)
             local_peak = df['high'].iloc[-lookback_peak:-2].max()
             drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
-            
-            # Wymagamy, aby spadek po rajdzie wynosił minimum 3.0% (filtr szumu konsolidacji)
-            is_meaningful_dip = drop_from_peak >= 0.030
+            is_valid_dip = drop_from_peak >= 0.030
 
-            # 2. WYZNACZANIE DNA FALI: ŚREDNIE MAKRO + WSPARCIA HISTORYCZNE Z 3 DNI (72H = 288 ŚWIEC)
+            # Odbicie z wyprzedania: dotknięcie dolnego Bollingera LUB EMA 89/200 + zielona świeca objęcia
             curr_low = min(p['low'], c['low'], c_now['low'])
-            
-            # A) Średnie kroczące i Bollinger (dynamiczne wsparcia)
-            touch_ema50 = (curr_low <= c['ema50'] * 1.01) and (c['close'] >= c['ema50'] * 0.99)
-            touch_ema89 = (curr_low <= c['ema89'] * 1.01) and (c['close'] >= c['ema89'] * 0.99)
-            touch_ema200 = (curr_low <= c['ema200'] * 1.01) and (c['close'] >= c['ema200'] * 0.99)
-            touch_bb = (curr_low <= c['bb_lower'] * 1.01) # Zejście do dolnej wstęgi Bollingera
-            
-            # B) Skanowanie kluczowych dołków fraktalnych z ostatnich 3 dni (ok. 288 świec)
-            lb_3d = min(len(df) - 5, 288)
-            history_3d = df.iloc[-lb_3d:-4]
-            historical_lows_3d = []
-            if len(history_3d) >= 12:
-                low_vals = history_3d['low'].values
-                for idx_low in range(2, len(low_vals) - 2):
-                    if low_vals[idx_low] <= low_vals[idx_low-1] and \
-                       low_vals[idx_low] <= low_vals[idx_low-2] and \
-                       low_vals[idx_low] <= low_vals[idx_low+1] and \
-                       low_vals[idx_low] <= low_vals[idx_low+2]:
-                        historical_lows_3d.append(low_vals[idx_low])
-            
-            abs_3d_low = history_3d['low'].min() if len(history_3d) > 0 else 0.0
-            if abs_3d_low > 0 and abs_3d_low not in historical_lows_3d:
-                historical_lows_3d.append(abs_3d_low)
-            
-            # Test czy cena dotyka poziomu dołka z ostatnich 3 dni (+/- 1.0%)
-            touch_historical_3d = False
-            for sup_lvl in historical_lows_3d:
-                if sup_lvl > 0:
-                    dist = (c['close'] - sup_lvl) / sup_lvl
-                    if (-0.010 <= dist <= 0.012) or (curr_low <= sup_lvl * 1.005 and c['close'] >= sup_lvl * 0.990):
-                        touch_historical_3d = True
-                        break
+            at_support = (curr_low <= c['bb_lower'] * 1.005) or \
+                         ((curr_low <= c['ema89'] * 1.008) and (c['close'] >= c['ema89'] * 0.995)) or \
+                         ((curr_low <= c['ema200'] * 1.008) and (c['close'] >= c['ema200'] * 0.995))
 
-            at_wave_bottom = touch_ema50 or touch_ema89 or touch_ema200 or touch_bb or touch_historical_3d
-            
-                        # 3. FILTR SPADAJĄCEGO NOŻA I POTWIERDZENIE ZWRÓCENIA KU GÓRZE (Ubicie Bazy)
-            is_green = c['close'] > c['open']
-            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-            
-            # ------------------------------------------------------------------
-            # TWARDY FILTR TRENDU (BLOKADA "SPIRALI ŚMIERCI")
-            # ------------------------------------------------------------------
-            # Jeśli EMA 50 < EMA 89 < EMA 200, rynek jest w potężnym downtrendzie.
-            # W takich warunkach łapanie zwykłych dołków to samobójstwo.
-            death_spiral = (c['ema50'] < c['ema89'] < c['ema200']) and (c['close'] < c['ema89'])
-            
-            # 3A. Weryfikacja dynamiki zrzutu (zakaz kupowania w trakcie wodospadu)
-            is_waterfall = (p['open'] - p['close']) / p['open'] > 0.015
-            
-            # 3B. Struktura odwrócenia (Wymagamy twardej bazy)
-            # Objęcie: ciało świecy musi zjeść poprzedni spadek
-            engulfing = (c['close'] > p['open'] if p['open'] > p['close'] else c['close'] > p['high'])
-            strong_bounce = is_green and engulfing and (vol_ratio >= 1.30)
-            
-            # Wyższy dołek (Uszczelnienie): Nie wystarczy porównać do poprzedniej świecy! 
-            # Wymagamy potwierdzonego swingu: dół, góra, wyższy dół, góra.
-            higher_low_formed = False
-            if len(df) >= 6:
-                higher_low_formed = is_green and (c['low'] > p2['low']) and (c['close'] > p['high'])
-            
-            fresh_cross = (p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) and is_green
-            
-            # STANDARDOWY ŁAPACZ DOŁKÓW (BOTTOM SNIPER)
-            trigger_confirmed = (strong_bounce or fresh_cross or higher_low_formed)
-            
-            # ------------------------------------------------------------------
-            # 3C. NOWOŚĆ: TRYB WYBICIA (BREAKOUT / V-SHAPE MODE)
-            # ------------------------------------------------------------------
-            # Gdy cena nagle wyrywa z konsolidacji lub odpala rakietę w locie.
-            # Ignorujemy wtedy warunek dotykania historycznego dna, bo to wejście na momentum.
-            is_breakout = False
-            if not is_waterfall and not death_spiral:
-                # Nagły strzał w locie z ogromnym wolumenem (powyżej 150% średniej)
-                live_rocket = (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and                               (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 1.50))
-                
-                # Złoty krzyż na zamkniętej świecy po okresie uśpienia
-                golden_cross_breakout = fresh_cross and (vol_ratio >= 1.40) and (c['close'] > c['ema89'])
-                
-                if live_rocket or golden_cross_breakout:
-                    is_breakout = True
-                    trigger_confirmed = True
-            
-            # ------------------------------------------------------------------
-            # BEZWZGLĘDNE BLOKADY KUPNA
-            # ------------------------------------------------------------------
-            # 1. Wodospad: Tylko idealne objęcie zjada wodospad. Żadnych wyższych dołków po krwotoku.
-            if is_waterfall and not engulfing:
-                trigger_confirmed = False
-                
-            # 2. Spirala Śmierci: Jeśli mamy mocny trend spadkowy, kupujemy TYLKO
-            # po gigantycznej kapitulacji (zrzut > 6.0% lub RSI < 20). Zwykłe -3% ignorujemy.
-            if death_spiral:
-                is_capitulation = drop_from_peak >= 0.060 or c['rsi'] < 22
-                if not is_capitulation:
-                    trigger_confirmed = False
+            bounce_trigger = is_green and (c['close'] > p['high'] or (c['close'] - c['open']) >= abs(p['close'] - p['open']) * 0.8) and (vol_ratio >= 1.15)
+            is_dip_entry = is_valid_dip and at_support and bounce_trigger and not is_flat_chop
 
-            # 4. ZABEZPIECZENIE PRZED KUPNEM NA GÓRCE (GDY FALA JUŻ ODJĘCHAŁA)
-            not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
-
-            # Sygnał może pochodzić z klasycznego ubicia dna LUB z nagłego wybicia
-            if is_breakout:
-                pepe_buy_signal = is_meaningful_dip and trigger_confirmed and not_extended
-                if pepe_buy_signal: logging.info(f"💥 [{symbol}] BREAKOUT MODE AKTYWNY! Wolumen pcha cenę w górę!")
-            else:
-                pepe_buy_signal = is_meaningful_dip and at_wave_bottom and trigger_confirmed and not_extended
-
-            # 5. ROZSZERZONY COOLDOWN PO STRACIE (OCHRONA SALDA PRZED SERIĄ STRAT)
-            # Jeśli ostatnia transakcja była stratna, czekamy min. 45 minut (2700 sekund), aby rynek dokończył spadek
+            # ----------------------------------------------------------
+            # 4. DECYZJA WEJŚCIA I OCHRONA COOLDOWN
+            # ----------------------------------------------------------
             cooldown_ok = True
             with lock_history:
                 trades_log = trade_history.get("trades_log", [])
                 for t in reversed(trades_log):
                     if t.get("symbol") == symbol:
                         time_since = now_ts - t.get("timestamp", 0)
-                        if t.get("net_pnl", 0) < 0 and time_since < 2700:
+                        if t.get("net_pnl", 0) < 0 and time_since < 1800: # 30 min cooldown po stracie
                             cooldown_ok = False
-                        elif time_since < 600:
+                        elif time_since < 300: # 5 min po wygranej
                             cooldown_ok = False
                         break
 
-            is_signal = pepe_buy_signal and cooldown_ok
+            should_buy = (is_breakout_entry or is_dip_entry) and cooldown_ok
 
-            # Logowanie szczegółowe
-            drop_tag = f"Korekta fali: -{drop_from_peak*100:.2f}% ({'🟢' if is_meaningful_dip else '🔴'})"
-            sup_tag = f"Dno sinusoidy: {'🟢 TAK' if at_wave_bottom else '🔴 NIE'}"
-            trig_tag = f"Odbicie: {'🟢 TAK' if trigger_confirmed else '🔴 NIE'}"
-            cd_tag = f"Cooldown: {'🟢 OK' if cooldown_ok else '⏳ BLOKADA'}"
-            log_msg = f"🐸 [{symbol}] {drop_tag} | {sup_tag} | {trig_tag} | {cd_tag} | "
-
-            if is_signal:
-                logging.info(log_msg + f"🚀 [WAVE RIDER] Fala zawraca do góry! Wchodzę na dnie!")
-            else:
-                logging.info(log_msg + "Czekam na dno sinusoidy...")            # EGZEKUCJA TRANSAKCJI
-            if is_signal:
+            if should_buy:
+                mode_tag = "WYBICIE (BREAKOUT)" if is_breakout_entry else "DNO SINUSOIDY (DIP)"
+                logging.info(f"🚀 [{symbol}] ZNALEZIONO SYGNAŁ {mode_tag}! Wchodzę za 80% kapitału...")
+                
                 if free_usdc < (target_allocation * 0.99):
-                    logging.warning(f"⏳ [{symbol}] Sygnał zakupu na dnie, ale brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
+                    logging.warning(f"⏳ [{symbol}] Sygnał obecny, ale brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
                     continue
 
-                # Ciasny Stop Loss tuż pod lokalnym dołkiem zwrotnym (ryzyko zazwyczaj poniżej 1%)
                 swing_low = min(c['low'], p['low'], c_now['low'])
-                initial_sl = swing_low * 0.994
+                initial_sl = swing_low * 0.992
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
@@ -737,27 +647,22 @@ def run_bottom_sniper_strategy():
                     q_str = format_qty_with_step(target_allocation / curr_price, step, minq)
                     with lock_pos:
                         active_positions[symbol] = {
-                            "strategy": "BOTTOM_SNIPER", 
+                            "strategy": "WAVE_SNIPER", 
                             "buy_price": curr_price, 
                             "peak_price": curr_price, 
                             "qty": q_str or "1", 
-                            "sold_half": False,
-                            "trailing_sl_low": initial_sl
+                            "trailing_sl": initial_sl,
+                            "entry_type": mode_tag
                         }
                         save_positions(active_positions)
-                    p_fmt = f"{curr_price:.8f}" if curr_price < 0.01 else f"{curr_price:.4f}"
-                    sl_fmt = f"{initial_sl:.8f}" if initial_sl < 0.01 else f"{initial_sl:.4f}"
-                    risk_pct = ((curr_price - initial_sl) / curr_price) * 100
-                    logging.info(f"⚡🎯 [SUKCES - KUPNO NA DNIE] {symbol} | Kwota: {target_allocation:.2f}$ | Cena: {p_fmt} | SL: {sl_fmt} (Ryzyko: {risk_pct:.2f}%)")
+                    logging.info(f"⚡🎯 [ZAKUP WYKONANY] {symbol} | Tryb: {mode_tag} | Cena: {curr_price:.8f} | SL: {initial_sl:.8f}")
                     free_usdc -= target_allocation
-                else:
-                    logging.error(f"❌ Błąd zlecenia {symbol}: {res}")
+            else:
+                chop_str = "KONSOLIDACJA (CHOP)" if is_flat_chop else "CZYSTY RYNEK"
+                # logging co minutę w pętli
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
-# ==============================================================================
-# SZYBKI ASYNCHRONICZNY WĄTEK MONITOROWANIA (ODŚWIEŻANIE CO 3 SEKUNDY)
-# ==============================================================================
 def monitoring_worker():
     global active_positions
     while True:
@@ -767,22 +672,11 @@ def monitoring_worker():
                 time.sleep(3)
                 continue
 
-            btc_flash_crash = False
-            try:
-                res = session.get_kline(category=CATEGORY, symbol="BTCUSDC", interval="1", limit=15)
-                c_list = res.get("result", {}).get("list", [])
-                if c_list and len(c_list) >= 15:
-                    c_close = safe_float(c_list[0][4])
-                    highest_15m = max(safe_float(x[2]) for x in c_list)
-                    if (c_close - highest_15m) / highest_15m <= BTC_FLASH_CRASH_EXIT_PCT:
-                        btc_flash_crash = True
-            except: pass
-
             symbols_to_del = []
 
             for symbol, pos in items:
                 try:
-                    res = session.get_kline(category=CATEGORY, symbol=symbol, interval="15", limit=15)
+                    res = session.get_kline(category=CATEGORY, symbol=symbol, interval="15", limit=5)
                     c_list = res.get("result", {}).get("list", [])
                     if not c_list: continue
 
@@ -794,115 +688,40 @@ def monitoring_worker():
                         if symbol in active_positions:
                             active_positions[symbol]["peak_price"] = peak
 
-                    total_pnl = (c_curr - bp) / bp
-                    peak_pnl = (peak - bp) / bp
-                    sold_half = pos.get("sold_half", False)
-
-                    sl_hit = False
-                    trail_hit = False
-                    sl_type = ""
+                    gain_pct = (c_curr - bp) / bp
+                    peak_pct = (peak - bp) / bp
+                    current_sl = pos.get("trailing_sl", bp * 0.985)
 
                     # ----------------------------------------------------------
-                    # DYNAMICZNA ADAPTACJA PARAMETRÓW WYJŚCIA (PEPE DIAMOND HANDS - ŁAPANIE MEGA RAJDÓW)
+                    # SCHODKOWE BLOKOWANIE ZYSKU (PROFIT LADDER)
                     # ----------------------------------------------------------
-                    is_bearish = ("BEARISH" in CURRENT_SENTIMENT)
-                    if is_bearish:
-                        eff_be_trigger = 0.020        # BreakEven uzbraja się przy +2.0%
-                        eff_be_sl = 0.002             # BE SL ląduje na +0.2% (pokrycie fee)
-                        eff_peak_trigger = 0.030      # Śledzenie szczytu fali rusza od +3.0%
-                        eff_peak_pullback = 0.015     # 1.5% cofnięcia ze szczytu tnie pozycję (w bessie ciaśniej)
-                    else:
-                        eff_be_trigger = 0.025        # Dajemy cenie DUŻO oddechu! BE dopiero przy +2.5%
-                        eff_be_sl = 0.002             # BE SL na +0.2%
-                        eff_peak_trigger = 0.040      # Trailing włącza się dopiero gdy rajd osiągnie +4.0%
-                        
-                        # DYNAMICZNY PULLBACK: Im większy zysk (parabola), tym więcej luzu dajemy na knoty!
-                        if peak_pnl > 0.10:           # Jeśli rajd przekroczył +10% zysku
-                            eff_peak_pullback = 0.035 # Dajemy aż 3.5% miejsca na głębokie knoty
-                        elif peak_pnl > 0.06:         # Jeśli rajd przekroczył +6% zysku
-                            eff_peak_pullback = 0.025 # Dajemy 2.5% miejsca
-                        else:
-                            eff_peak_pullback = 0.018 # Standardowy bufor 1.8% ze szczytu dla mniejszych fal
+                    # KROK 1: Zysk osiągnął +2.0% -> Betonowy SL na +1.0% (Zysk gwarantowany!)
+                    if peak_pct >= 0.020:
+                        current_sl = max(current_sl, bp * 1.010)
+
+                    # KROK 2: Zysk osiągnął +4.0% -> SL przeskakuje na +2.8%
+                    if peak_pct >= 0.040:
+                        current_sl = max(current_sl, bp * 1.028)
+
+                    # KROK 3: Zysk osiągnął +6.0% -> SL przeskakuje na +4.5%
+                    if peak_pct >= 0.060:
+                        current_sl = max(current_sl, bp * 1.045)
+
+                    # KROK 4: Rajd powyżej +6.0% -> Ciasny trailing 1.2% ze szczytu
+                    if peak_pct >= 0.060:
+                        trail_from_peak = peak * (1.0 - 0.012)
+                        current_sl = max(current_sl, trail_from_peak)
+
+                    with lock_pos:
+                        if symbol in active_positions:
+                            active_positions[symbol]["trailing_sl"] = current_sl
 
                     # ----------------------------------------------------------
-                    # TWARDE OPORY DLA TRENDU SPADKOWEGO (ZABEZPIECZENIE PRZED POWROTEM DO ZERA)
+                    # EGZEKUCJA WYJŚCIA
                     # ----------------------------------------------------------
-                    # Pobranie aktualnych wartości średnich dla otwartej świecy w locie
-                    df_live = get_market_data(symbol, interval="15", limit=2)
-                    ema89_live = df_live.iloc[-1]['ema89'] if df_live is not None else 0.0
-                    ema200_live = df_live.iloc[-1]['ema200'] if df_live is not None else 0.0
-                    
-                    # Jeśli kurs jest uwięziony pod EMA 89 / EMA 200, te średnie są betonowym sufitem.
-                    # Jakiekolwiek dotknięcie ich od dołu zamyka pozycję (Zabezpieczenie na short squeeze).
-                    hard_resistance_hit = False
-                    if bp < ema89_live and c_curr >= ema89_live * 0.998:
-                        hard_resistance_hit = True
-                        sl_type = "Sztywny TP na oporze (Uderzenie w spadkową EMA 89)"
-                    elif bp < ema200_live and c_curr >= ema200_live * 0.998:
-                        hard_resistance_hit = True
-                        sl_type = "Sztywny TP na oporze (Uderzenie w spadkową EMA 200)"
-
-                    # ----------------------------------------------------------
-                    # 1. CIĘCIE ZYSKU PRZY ZAŁAMANIU IMPETU (Zabezpieczenie fali przed zgaśnięciem)
-                    # ----------------------------------------------------------
-                    # Jeśli świeca 15M gaśnie, znosząc ponad 60% swojego wzrostu, i zbliża się do punktu wejścia,
-                    # bot rzuca pozycję natychmiast na rynku (nie czeka na dojechanie do BreakEven).
-                    momentum_crash = False
-                    if len(c_list) >= 2:
-                        last_closed_candle = c_list[1]
-                        open_px = safe_float(last_closed_candle[1])
-                        close_px = safe_float(last_closed_candle[4])
-                        # Jeśli poprzednia świeca to mocny czerwony pinbar, zrzucamy.
-                        if open_px > close_px and (open_px - close_px) / open_px > 0.015 and peak_pnl > 0.02:
-                            momentum_crash = True
-                            sl_type = "Załamanie impetu (Mocna czerwona świeca gasząca rajd)"
-
-                    # ----------------------------------------------------------
-                    # 2. PRÓG BREAKEVEN (BEZWZGLĘDNA OCHRONA PRZED STRATĄ PO WYBICIE)
-                    # ----------------------------------------------------------
-                    be_level = bp * (1.0 + eff_be_sl)
-                    if peak_pnl >= eff_be_trigger:
-                        curr_sl = max(pos.get("trailing_sl_low", 0.0), be_level)
-                    else:
-                        curr_sl = pos.get("trailing_sl_low", 0.0)
-
-                    # ----------------------------------------------------------
-                    # 3. KROCZĄCY TRAILING ZA WYŻSZYMI DOŁKAMI 15M
-                    # ----------------------------------------------------------
-                    if len(c_list) >= 4:
-                        recent_lows = [safe_float(c_list[i][3]) for i in range(1, 4)]
-                        local_swing_low = min(recent_lows) * 0.998
-                        
-                        if local_swing_low > pos.get("trailing_sl_low", 0.0) and c_curr > bp:
-                            with lock_pos:
-                                if symbol in active_positions:
-                                    active_positions[symbol]["trailing_sl_low"] = local_swing_low
-                                    save_positions(active_positions)
-                            logging.info(f"📈 [TRAILING SL] Podniesiono SL dla {symbol} na {local_swing_low:.4f} (za wyższym dołkiem).")
-
-                    curr_sl = max(curr_sl, pos.get("trailing_sl_low", 0.0))
-
-                    # Sprawdzenie uderzenia w Stop Loss / BreakEven
-                    if curr_sl > 0 and c_curr <= curr_sl:
-                        sl_hit = True
-                        if curr_sl == be_level:
-                            sl_type = "BreakEven (+0.2% ochrona kapitału)"
-                        else:
-                            sl_type = f"Wyjście ze Stop Lossa ({curr_sl:.4f})"
-
-                    # ----------------------------------------------------------
-                    # 4. KROCZĄCY RADAR SZCZYTU (PEAK TRAILING 100% - WYJŚCIE NA GÓRCE)
-                    # ----------------------------------------------------------
-                    if peak_pnl >= eff_peak_trigger and ((peak - c_curr) / peak) >= eff_peak_pullback:
-                        trail_hit = True
-                        p_drop = eff_peak_pullback * 100
-                        p_net = ((c_curr - bp) / bp) * 100
-                        sl_type = f"Szczyt fali osiągnięty! 100% zamknięcie (+{p_net:.2f}% | knot -{p_drop:.1f}% ze szczytu)"
-
-                    panic_hit = btc_flash_crash and total_pnl < -0.005
-
-                    if sl_hit or trail_hit or panic_hit:
-                        reason = "BTC Flash Crash" if panic_hit else (sl_type if sl_type else "Trailing Stop")
+                    if c_curr <= current_sl:
+                        net_result = ((c_curr - bp) / bp) * 100
+                        reason = f"Zabezpieczenie Zysku / Stop Loss ({net_result:+.2f}%)"
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
                         if rb > 0:
                             st, mq = get_symbol_lot_filter(symbol)
@@ -910,11 +729,12 @@ def monitoring_worker():
                             if qs:
                                 res_s = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qs)
                                 if res_s.get("retCode") == 0:
-                                    record_closed_trade(symbol, "BOTTOM_SNIPER", bp, c_curr, safe_float(qs), reason, is_maker=False)
+                                    record_closed_trade(symbol, "WAVE_SNIPER", bp, c_curr, safe_float(qs), reason, is_maker=False)
                                     symbols_to_del.append(symbol)
+                                    logging.info(f"💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {net_result:+.2f}% | Powód: {reason}")
                         else:
                             symbols_to_del.append(symbol)
-                except Exception:
+                except Exception as e:
                     pass
 
             if symbols_to_del:
@@ -926,9 +746,6 @@ def monitoring_worker():
             pass
         time.sleep(3)
 
-# ==============================================================================
-# AUTOMATYCZNA LIKWIDACJA STABLECOINÓW I REINWESTYCJA W BTC
-# ==============================================================================
 def auto_liquidate_stables_to_btc():
     global active_positions
     for coin, sym in [("USDT", "USDTUSDC"), ("EURC", "EURCUSDC")]:
