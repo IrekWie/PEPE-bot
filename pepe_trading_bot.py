@@ -650,9 +650,25 @@ def run_bottom_sniper_strategy():
             
             fresh_cross = (p['ema9'] <= p['ema21'] and c['ema9'] > c['ema21']) and is_green
             
-            live_bounce = not is_waterfall and (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and                           (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 0.90))
-
-            trigger_confirmed = (strong_bounce or fresh_cross or higher_low_formed or live_bounce)
+            # STANDARDOWY ŁAPACZ DOŁKÓW (BOTTOM SNIPER)
+            trigger_confirmed = (strong_bounce or fresh_cross or higher_low_formed)
+            
+            # ------------------------------------------------------------------
+            # 3C. NOWOŚĆ: TRYB WYBICIA (BREAKOUT / V-SHAPE MODE)
+            # ------------------------------------------------------------------
+            # Gdy cena nagle wyrywa z konsolidacji lub odpala rakietę w locie.
+            # Ignorujemy wtedy warunek dotykania historycznego dna, bo to wejście na momentum.
+            is_breakout = False
+            if not is_waterfall and not death_spiral:
+                # Nagły strzał w locie z ogromnym wolumenem (powyżej 150% średniej)
+                live_rocket = (c_now['close'] > c_now['open']) and (c_now['close'] > c['high']) and                               (c_now['close'] > c_now['ema9']) and (c_now['volume'] >= (c_now['vol_ma20'] * 1.50))
+                
+                # Złoty krzyż na zamkniętej świecy po okresie uśpienia
+                golden_cross_breakout = fresh_cross and (vol_ratio >= 1.40) and (c['close'] > c['ema89'])
+                
+                if live_rocket or golden_cross_breakout:
+                    is_breakout = True
+                    trigger_confirmed = True
             
             # ------------------------------------------------------------------
             # BEZWZGLĘDNE BLOKADY KUPNA
@@ -671,7 +687,12 @@ def run_bottom_sniper_strategy():
             # 4. ZABEZPIECZENIE PRZED KUPNEM NA GÓRCE (GDY FALA JUŻ ODJĘCHAŁA)
             not_extended = ((c['close'] - c['ema9']) / c['ema9']) <= 0.012
 
-            pepe_buy_signal = is_meaningful_dip and at_wave_bottom and trigger_confirmed and not_extended
+            # Sygnał może pochodzić z klasycznego ubicia dna LUB z nagłego wybicia
+            if is_breakout:
+                pepe_buy_signal = is_meaningful_dip and trigger_confirmed and not_extended
+                if pepe_buy_signal: logging.info(f"💥 [{symbol}] BREAKOUT MODE AKTYWNY! Wolumen pcha cenę w górę!")
+            else:
+                pepe_buy_signal = is_meaningful_dip and at_wave_bottom and trigger_confirmed and not_extended
 
             # 5. ROZSZERZONY COOLDOWN PO STRACIE (OCHRONA SALDA PRZED SERIĄ STRAT)
             # Jeśli ostatnia transakcja była stratna, czekamy min. 45 minut (2700 sekund), aby rynek dokończył spadek
