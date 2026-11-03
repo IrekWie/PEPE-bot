@@ -1,17 +1,17 @@
-import os
-import time
-import json
-import logging
-import threading
-import socket
-from decimal import Decimal
-import math
 import concurrent.futures
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import logging
+import math
+import os
+import socket
+import threading
+import time
 import pandas as pd
-import requests
 from pybit.unified_trading import HTTP
+import requests
 
 # ==============================================================================
 # OCHRONA PRZED ZAWIESZENIEM POŁĄCZEŃ SIECIOWYCH
@@ -84,8 +84,8 @@ current_sniper_coins = []
 last_dynamic_scan = 0
 
 def get_dynamic_top_coins():
-    # BOT ZMODYFIKOWANY STRICTE POD PEPEUSDC - PURE PEPE SWING BOT
-    return ["PEPEUSDC"]
+    # MEMECOIN SNIPER - Opcja A (Polowanie na pierwszego)
+    return ["PEPEUSDC", "WIFUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
 STANDARD_MIN_ORDER_VALUE = 20.0
@@ -533,7 +533,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# GŁÓWNA I JEDYNA STRATEGIA: ZINTEGROWANY BOTTOM SNIPER (SEKWENCJA DNO -> SPUST)
+# GŁÓWNA STRATEGIA: WAVE SNIPER (PEPE + WIF, 1H TREND, DAILY LOSS CAP, CHOP FILTER)
 # ==============================================================================
 def run_bottom_sniper_strategy():
     target_coins = get_dynamic_top_coins()
@@ -570,6 +570,30 @@ def run_bottom_sniper_strategy():
             c = df.iloc[-2]       # Ostatnia zamknięta 15M
             p = df.iloc[-3]
             p2 = df.iloc[-4]
+
+            # ----------------------------------------------------------
+            # 0. FILTR MAKRO 1H & DAILY LOSS CAP (OCHRONA PRZED OVERTRADINGIEM)
+            # ----------------------------------------------------------
+            # Odpytanie o limit straty dla danej monety (Tylko 1 strata dziennie)
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            daily_loss_hit = False
+            with lock_history:
+                t_log = trade_history.get("trades_log", [])
+                losses_today = sum(1 for t in t_log if t.get("symbol") == symbol and t.get("net_pnl", 0) < 0 and datetime.fromtimestamp(t.get("timestamp", 0), timezone.utc).strftime("%Y-%m-%d") == today_str)
+                if losses_today >= 1:
+                    daily_loss_hit = True
+            
+            # Weryfikacja trendu 1H - zakaz wchodzenia w marazmie pod oporem
+            macro_ok = True
+            df_1h = get_market_data(symbol, interval="60", limit=50)
+            if df_1h is not None and len(df_1h) >= 20:
+                c1h = df_1h.iloc[-2] # Zamknięta świeca 1H
+                # Jeśli cena jest trwale pod EMA 50/89 na interwale godzinnym, rynek osuwa się (brak paliwa).
+                if c1h['close'] < c1h['ema50'] and c1h['close'] < c1h['ema89']:
+                    macro_ok = False
+
+            if daily_loss_hit or not macro_ok:
+                continue # Omijamy analizę 15M dla tej monety
 
             # ----------------------------------------------------------
             # 1. BLOKADA SIECZKI / KONSOLIDACJI (CHOP FILTER)
@@ -663,7 +687,6 @@ def run_bottom_sniper_strategy():
                     free_usdc -= target_allocation
             else:
                 chop_str = "KONSOLIDACJA (CHOP)" if is_flat_chop else "CZYSTY RYNEK"
-                # logging co minutę w pętli
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
@@ -907,3 +930,4 @@ if __name__ == "__main__":
     t_ping = threading.Thread(target=self_ping_loop, daemon=True)
     t_ping.start()
     run_health_server()
+```[cite: 18]
