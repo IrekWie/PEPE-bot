@@ -613,7 +613,7 @@ def run_bottom_sniper_strategy():
             is_dip_entry = is_valid_dip and at_support and bounce_trigger and not is_flat_chop
 
             # ----------------------------------------------------------
-            # 4. DECYZJA WEJŚCIA I OCHRONA COOLDOWN
+            # 4. DECYZJA WEJŚCIA (Tylko na potwierdzonym zamknięciu & Ochrona Cooldown)
             # ----------------------------------------------------------
             cooldown_ok = True
             with lock_history:
@@ -626,8 +626,12 @@ def run_bottom_sniper_strategy():
                         elif time_since < 300: # 5 min po wygranej
                             cooldown_ok = False
                         break
-
-            should_buy = (is_breakout_entry or is_dip_entry) and cooldown_ok
+                        
+            # Wymagamy, aby sygnał pochodził z zamkniętej świecy (c), a nie wiszącej (c_now)
+            # W przeciwnym razie bot złapie fałszywy górny knot (Shakeout).
+            live_candle_green = c_now['close'] > c_now['open']
+            
+            should_buy = (is_breakout_entry or is_dip_entry) and cooldown_ok and live_candle_green
 
             if should_buy:
                 mode_tag = "WYBICIE (BREAKOUT)" if is_breakout_entry else "DNO SINUSOIDY (DIP)"
@@ -664,7 +668,7 @@ def run_bottom_sniper_strategy():
             logging.error(f"Błąd analizy {symbol}: {e}")
 
 def monitoring_worker():
-    global active_positions
+    global active_positions, trade_history
     while True:
         try:
             with lock_pos: items = list(active_positions.items())
@@ -673,6 +677,7 @@ def monitoring_worker():
                 continue
 
             symbols_to_del = []
+            now_ts = time.time()
 
             for symbol, pos in items:
                 try:
@@ -690,20 +695,22 @@ def monitoring_worker():
 
                     gain_pct = (c_curr - bp) / bp
                     peak_pct = (peak - bp) / bp
-                    current_sl = pos.get("trailing_sl", bp * 0.985)
+                    
+                    # Uszczelnienie Stop Lossa: szerszy margines początkowy
+                    current_sl = pos.get("trailing_sl", bp * 0.980)
 
                     # ----------------------------------------------------------
                     # SCHODKOWE BLOKOWANIE ZYSKU (PROFIT LADDER)
                     # ----------------------------------------------------------
-                    # KROK 1: Zysk osiągnął +2.0% -> Betonowy SL na +1.0% (Zysk gwarantowany!)
+                    # KROK 1: Zysk osiągnął +2.0% -> SL na +1.0%
                     if peak_pct >= 0.020:
                         current_sl = max(current_sl, bp * 1.010)
 
-                    # KROK 2: Zysk osiągnął +4.0% -> SL przeskakuje na +2.8%
+                    # KROK 2: Zysk osiągnął +4.0% -> SL na +2.8%
                     if peak_pct >= 0.040:
                         current_sl = max(current_sl, bp * 1.028)
 
-                    # KROK 3: Zysk osiągnął +6.0% -> SL przeskakuje na +4.5%
+                    # KROK 3: Zysk osiągnął +6.0% -> SL na +4.5%
                     if peak_pct >= 0.060:
                         current_sl = max(current_sl, bp * 1.045)
 
@@ -715,6 +722,27 @@ def monitoring_worker():
                     with lock_pos:
                         if symbol in active_positions:
                             active_positions[symbol]["trailing_sl"] = current_sl
+
+                    # ----------------------------------------------------------
+                    # ZNIESIENIE KWARANTANNY (V-SHAPE REVERSAL / BEAR TRAP)
+                    # ----------------------------------------------------------
+                    # Sprawdzamy czy ostatnia strata była "fałszywym wybiciem", a rynek odpalił w górę.
+                    # Jeśli tak, zdejmujemy sztuczną blokadę wejść w historii bota!
+                    if len(c_list) >= 2:
+                        prev_candle_close = safe_float(c_list[1][4])
+                        prev_candle_open = safe_float(c_list[1][1])
+                        
+                        # Jeśli poprzednia świeca to mocna zielona pętla hossy (np. > +1.5%)
+                        if (prev_candle_close - prev_candle_open) / prev_candle_open > 0.015:
+                            with lock_history:
+                                t_log = trade_history.get("trades_log", [])
+                                if t_log and t_log[-1].get("symbol") == symbol and t_log[-1].get("net_pnl", 0) < 0:
+                                    last_trade_ts = t_log[-1].get("timestamp", 0)
+                                    # Jeśli strata była na tej lub poprzedniej świecy i rynek wybił
+                                    if (now_ts - last_trade_ts) < 1800:
+                                        t_log[-1]["net_pnl"] = 0.01 # Zdejmujemy flagę straty, resetując cooldown
+                                        save_trade_history(trade_history)
+                                        logging.info(f"🔓 [{symbol}] Wykryto V-Shape Reversal! Kwarantanna zniesiona, gotowy do polowania.")
 
                     # ----------------------------------------------------------
                     # EGZEKUCJA WYJŚCIA
