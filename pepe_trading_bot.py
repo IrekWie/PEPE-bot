@@ -667,7 +667,7 @@ def run_bottom_sniper_strategy():
             logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
-# ASYNCHRONICZNY MONITOR Z ULTRA-SZYBKIM TRAILINGIEM OD SZCZYTU (ŁAPACZ KNOTÓW)
+# ASYNCHRONICZNY MONITOR Z DYNAMICZNYM TRAILINGIEM OD SZCZYTU (BUFOR ODDECHU)
 # ==============================================================================
 def monitoring_worker():
     global active_positions, trade_history
@@ -700,14 +700,23 @@ def monitoring_worker():
                     current_sl = pos.get("trailing_sl", bp * 0.980)
 
                     # ----------------------------------------------------------
-                    # ULTRA-SZYBKI TRAILING OD SZCZYTU (ŁAPACZ KNOTÓW)
+                    # DYNAMICZNY TRAILING OD SZCZYTU (BUFOR ODDECHU W RAJDZIE)
                     # ----------------------------------------------------------
-                    # Gdy rajd przekroczy +2.0%, aktywujemy natychmiast ciasny trailing od wierzchołka:
-                    # Cofnięcie o zaledwie 0.8% - 1.2% od szczytu natychmiast ucina zysk na górce.
                     if peak_pct >= 0.020:
-                        pullback_buffer = 0.008 if peak_pct < 0.050 else 0.012
+                        if peak_pct >= 0.080:
+                            # ETAP 3: Rajd paraboliczny (> +8.0%) -> szeroki oddech na duże świece
+                            pullback_buffer = 0.022
+                            min_guaranteed_sl = bp * 1.055  # Bezpieczna podłoga: min. +5.5%
+                        elif peak_pct >= 0.040:
+                            # ETAP 2: Rozwinięty trend (+4.0% do +8.0%) -> umiarkowany bufor
+                            pullback_buffer = 0.015
+                            min_guaranteed_sl = bp * 1.025  # Bezpieczna podłoga: min. +2.5%
+                        else:
+                            # ETAP 1: Wczesna faza (+2.0% do +4.0%) -> ciasne cięcie knotów
+                            pullback_buffer = 0.008
+                            min_guaranteed_sl = bp * 1.010  # Bezpieczna podłoga: min. +1.0%
+
                         trail_from_peak = peak * (1.0 - pullback_buffer)
-                        min_guaranteed_sl = bp * 1.010  # Gwarancja min. +1.0% czystego zysku
                         current_sl = max(current_sl, trail_from_peak, min_guaranteed_sl)
 
                     with lock_pos:
@@ -772,7 +781,7 @@ def auto_liquidate_stables_to_btc():
                 qs = format_qty_with_step(bal, step, mq)
                 sold_ok = True
                 if qs and safe_float(qs) > 0:
-                    r = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qs)
+                    r = session.place_order(category=CATEGORY, symbol=sym, side="Sell", orderType="Market", qty=qs)
                     sold_ok = (r.get("retCode") == 0)
 
                 if sold_ok:
