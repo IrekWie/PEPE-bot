@@ -64,8 +64,8 @@ CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
 # --- KOSZYK STRATEGII (OPCJA A: PEPE + WIF, POLOWANIE NA PIERWSZĄ OKAZJĘ) ---
-CAPITAL_PER_TRADE_PCT = 0.80         # 80% kapitału na transakcję[cite: 14]
-MAX_TOTAL_POSITIONS = 1              # Maksymalnie 1 otwarta pozycja[cite: 14]
+CAPITAL_PER_TRADE_PCT = 0.80         # 80% kapitału na transakcję
+MAX_TOTAL_POSITIONS = 1              # Maksymalnie 1 otwarta pozycja
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -73,7 +73,7 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 def get_dynamic_top_coins():
-    return ["PEPEUSDC", "WIFUSDC"][cite: 14]
+    return ["PEPEUSDC", "WIFUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
 STANDARD_MIN_ORDER_VALUE = 20.0
@@ -565,7 +565,7 @@ def run_bottom_sniper_strategy():
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             is_green = c['close'] > c['open']
             
-            # Wykrycie V-Shape Reversal (potężne objęcie popytowe z wolumenem)[cite: 10, 14]
+            # Wykrycie V-Shape Reversal (potężne objęcie popytowe z wolumenem)
             is_v_shape = is_green and (c['close'] > p['high']) and (vol_ratio >= 1.35)
 
             macro_ok = True
@@ -575,7 +575,7 @@ def run_bottom_sniper_strategy():
                 if c1h['close'] < c1h['ema50'] and c1h['close'] < c1h['ema89']:
                     macro_ok = False
 
-            # Jeśli moneta ma zaliczoną stratę dziś LUB brak trendu 1H (i nie jest to V-Shape), pomijamy[cite: 14]
+            # Jeśli moneta ma zaliczoną stratę dziś LUB brak trendu 1H (i nie jest to V-Shape), pomijamy
             if daily_loss_hit or (not macro_ok and not is_v_shape):
                 continue
 
@@ -583,7 +583,7 @@ def run_bottom_sniper_strategy():
             # 1. BLOKADA SIECZKI / KONSOLIDACJI (CHOP FILTER)
             # ----------------------------------------------------------
             ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
-            is_flat_chop = ema_spread < 0.0035  # Średnie rozjechane o mniej niż 0.35% = konsolidacja[cite: 14]
+            is_flat_chop = ema_spread < 0.0035  # Średnie rozjechane o mniej niż 0.35% = konsolidacja
 
             # ----------------------------------------------------------
             # 2. WYBICIE LOKALNEJ BAZY (8 ŚWIEC = 2 GODZINY ZAMIAST 5H)
@@ -700,21 +700,21 @@ def monitoring_worker():
                     current_sl = pos.get("trailing_sl", bp * 0.980)
 
                     # ----------------------------------------------------------
-                    # SCHODKOWE BLOKOWANIE ZYSKU (PROFIT LADDER)[cite: 14]
+                    # SCHODKOWE BLOKOWANIE ZYSKU (PROFIT LADDER)
                     # ----------------------------------------------------------
-                    # KROK 1: Zysk osiągnął +2.0% -> SL na +1.0% (Gwarantowany zysk)[cite: 14]
+                    # KROK 1: Zysk osiągnął +2.0% -> SL na +1.0% (Gwarantowany zysk)
                     if peak_pct >= 0.020:
                         current_sl = max(current_sl, bp * 1.010)
 
-                    # KROK 2: Zysk osiągnął +4.0% -> SL na +2.8%[cite: 14]
+                    # KROK 2: Zysk osiągnął +4.0% -> SL na +2.8%
                     if peak_pct >= 0.040:
                         current_sl = max(current_sl, bp * 1.028)
 
-                    # KROK 3: Zysk osiągnął +6.0% -> SL na +4.5%[cite: 14]
+                    # KROK 3: Zysk osiągnął +6.0% -> SL na +4.5%
                     if peak_pct >= 0.060:
                         current_sl = max(current_sl, bp * 1.045)
 
-                    # KROK 4: Rajd powyżej +6.0% -> Ciasny trailing 1.2% ze szczytu[cite: 14]
+                    # KROK 4: Rajd powyżej +6.0% -> Ciasny trailing 1.2% ze szczytu
                     if peak_pct >= 0.060:
                         trail_from_peak = peak * (1.0 - 0.012)
                         current_sl = max(current_sl, trail_from_peak)
@@ -724,7 +724,7 @@ def monitoring_worker():
                             active_positions[symbol]["trailing_sl"] = current_sl
 
                     # ----------------------------------------------------------
-                    # ZNIESIENIE KWARANTANNY (BEAR TRAP RECOVERY)[cite: 14]
+                    # ZNIESIENIE KWARANTANNY (BEAR TRAP RECOVERY)
                     # ----------------------------------------------------------
                     if len(c_list) >= 2:
                         prev_candle_close = safe_float(c_list[1][4])
