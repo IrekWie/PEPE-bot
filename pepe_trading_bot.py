@@ -73,6 +73,7 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 def get_dynamic_top_coins():
+    # Ściśle określona lista par do handlu i synchronizacji
     return ["PEPEUSDC", "WIFUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
@@ -358,7 +359,14 @@ def sync_positions_from_bybit():
     global active_positions
     if not session: return
     try:
+        allowed_symbols = get_dynamic_top_coins()
         with lock_pos:
+            # 1. Automatyczne usuwanie z pamięci obcych monet (np. SOLUSDC)
+            to_remove = [s for s in active_positions if s not in allowed_symbols]
+            for s in to_remove:
+                del active_positions[s]
+
+            # 2. Synchronizacja z Bybit TYLKO dla PEPE i WIF
             res = session.get_wallet_balance(accountType="UNIFIED")
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
             for coin_info in res["result"]["list"][0].get("coin", []):
@@ -367,7 +375,10 @@ def sync_positions_from_bybit():
                 bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
                 if bal <= 0: continue
                 sym = f"{coin}USDC"
-                if sym in STABLE_PAIRS_BLACKLIST: continue
+                
+                # Odrzucamy wszystko co nie jest PEPEUSDC ani WIFUSDC
+                if sym not in allowed_symbols: 
+                    continue
 
                 if sym not in active_positions:
                     df = get_market_data_no_cache(sym, interval="15", limit=10)
@@ -396,7 +407,8 @@ def sync_positions_from_bybit():
                                     "sold_half": False,
                                     "trailing_sl": initial_sl
                                 }
-                                logging.info(f"🎯 [SYNC / RĘCZNY] Przejęto {sym} ({val_usd:.2f}$) pod BOTTOM_SNIPER | SL: {initial_sl:.4f}")
+                                sl_log = f"{initial_sl:.8f}" if "PEPE" in sym else f"{initial_sl:.4f}"
+                                logging.info(f"🎯 [SYNC] Przejęto {sym} ({val_usd:.2f}$) | SL: {sl_log}")
             save_positions(active_positions)
     except Exception as e:
         logging.error(f"Błąd synchronizacji: {e}")
@@ -659,7 +671,8 @@ def run_bottom_sniper_strategy():
                             "entry_type": mode_tag
                         }
                         save_positions(active_positions)
-                    logging.info(f"⚡🎯 [ZAKUP WYKONANY] {symbol} | Tryb: {mode_tag} | Cena: {curr_price:.8f} | SL: {initial_sl:.8f}")
+                    sl_print = f"{initial_sl:.8f}" if "PEPE" in symbol else f"{initial_sl:.4f}"
+                    logging.info(f"⚡🎯 [ZAKUP WYKONANY] {symbol} | Tryb: {mode_tag} | Cena: {curr_price} | SL: {sl_print}")
                     free_usdc -= target_allocation
             else:
                 pass
@@ -776,7 +789,7 @@ def auto_liquidate_stables_to_btc():
         try:
             bal = get_coin_available_balance(coin)
             if (bal * 1.0 >= MIN_EXCHANGE_NOTIONAL) or (sym in active_positions):
-                logging.info(f"🧹 [AUTO-WYMIANA] Wykryto {bal} {coin}. Wymieniam na USDC/BTC...")
+                logging.info(f"🧹 [AUTO-WYMIANA] Wykryto {bal} {coin}. Wymieniam na USDC...")
                 step, mq = get_symbol_lot_filter(sym)
                 qs = format_qty_with_step(bal, step, mq)
                 sold_ok = True
@@ -789,13 +802,6 @@ def auto_liquidate_stables_to_btc():
                         if sym in active_positions: 
                             del active_positions[sym]
                             save_positions(active_positions)
-                    time.sleep(1)
-                    _, fu = get_balances()
-                    if fu >= MIN_EXCHANGE_NOTIONAL:
-                        btc_val = round(fu * 0.99, 2)
-                        r2 = session.place_order(category=CATEGORY, symbol="BTCUSDC", side="Buy", orderType="Market", qty=f"{btc_val:.2f}")
-                        if r2.get("retCode") == 0:
-                            logging.info(f"💎🚀 [REINWESTYCJA] Za {btc_val} USDC zakupiono Bitcoina (BTCUSDC)!")
         except Exception:
             pass
 
@@ -852,8 +858,11 @@ def bot_loop():
                         df = get_market_data(symbol, interval="15", limit=2)
                         cp = df.iloc[-1]['close'] if df is not None else pos.get("peak_price", pos["buy_price"])
                         pnl_pct = ((cp - pos["buy_price"]) / pos["buy_price"]) * 100
-                        sl_info = f" | SL: {pos.get('trailing_sl'):.4f}" if 'trailing_sl' in pos else ""
-                        logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Szczyt: {pos.get('peak_price', cp)}{sl_info}")
+                        sl_val = pos.get('trailing_sl', pos.get('trailing_sl_low', 0.0))
+                        is_pepe = "PEPE" in symbol
+                        sl_fmt = f"{sl_val:.8f}" if is_pepe else f"{sl_val:.4f}"
+                        peak_fmt = f"{pos.get('peak_price', cp):.8f}" if is_pepe else f"{pos.get('peak_price', cp):.4f}"
+                        logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Szczyt: {peak_fmt} | SL: {sl_fmt}")
                     except Exception: pass
 
             # ==================================================================
