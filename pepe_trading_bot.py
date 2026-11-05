@@ -361,12 +361,12 @@ def sync_positions_from_bybit():
     try:
         allowed_symbols = get_dynamic_top_coins()
         with lock_pos:
-            # 1. Automatyczne usuwanie z pamięci obcych monet (np. SOLUSDC)
+            # 1. Usuwanie obcych monet z pamięci bota (np. SOLUSDC)
             to_remove = [s for s in active_positions if s not in allowed_symbols]
             for s in to_remove:
                 del active_positions[s]
 
-            # 2. Synchronizacja z Bybit TYLKO dla PEPE i WIF
+            # 2. Pobieranie pozycji z konta Bybit
             res = session.get_wallet_balance(accountType="UNIFIED")
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
             for coin_info in res["result"]["list"][0].get("coin", []):
@@ -376,22 +376,27 @@ def sync_positions_from_bybit():
                 if bal <= 0: continue
                 sym = f"{coin}USDC"
                 
-                # Odrzucamy wszystko co nie jest PEPEUSDC ani WIFUSDC
+                # Ignorujemy monety spoza PEPE i WIF
                 if sym not in allowed_symbols: 
                     continue
 
                 if sym not in active_positions:
-                    df = get_market_data_no_cache(sym, interval="15", limit=10)
+                    df = get_market_data_no_cache(sym, interval="15", limit=30)
                     if df is not None and len(df) > 0:
                         cp = df.iloc[-1]['close']
                         val_usd = bal * cp
                         if val_usd >= MIN_SYNC_POSITION_VALUE:
                             buy_p = cp
+                            buy_time = time.time()
                             try:
                                 ex = session.get_executions(category=CATEGORY, symbol=sym, limit=5)
                                 if ex.get("retCode") == 0:
                                     buys = [e for e in ex.get("result", {}).get("list", []) if e.get("side") == "Buy"]
-                                    if buys: buy_p = safe_float(buys[0].get("execPrice"), cp)
+                                    if buys:
+                                        buy_p = safe_float(buys[0].get("execPrice"), cp)
+                                        exec_ts = safe_float(buys[0].get("execTime"))
+                                        if exec_ts > 0:
+                                            buy_time = exec_ts / 1000.0
                             except Exception: pass
 
                             step, minq = get_symbol_lot_filter(sym)
@@ -399,13 +404,18 @@ def sync_positions_from_bybit():
                             if q_str:
                                 recent_low = df['low'].iloc[-4:-1].min() if len(df) >= 4 else buy_p * 0.98
                                 initial_sl = recent_low * 0.980
+                                recent_peak = max(cp, buy_p)
+                                if len(df) >= 8:
+                                    recent_peak = max(recent_peak, df['high'].iloc[-8:].max())
+                                
                                 active_positions[sym] = {
                                     "strategy": "BOTTOM_SNIPER",
                                     "buy_price": buy_p,
-                                    "peak_price": max(cp, buy_p),
+                                    "peak_price": recent_peak,
                                     "qty": q_str,
                                     "sold_half": False,
-                                    "trailing_sl": initial_sl
+                                    "trailing_sl": initial_sl,
+                                    "entry_time": buy_time
                                 }
                                 sl_log = f"{initial_sl:.8f}" if "PEPE" in sym else f"{initial_sl:.4f}"
                                 logging.info(f"🎯 [SYNC] Przejęto {sym} ({val_usd:.2f}$) | SL: {sl_log}")
@@ -668,7 +678,8 @@ def run_bottom_sniper_strategy():
                             "peak_price": curr_price, 
                             "qty": q_str or "1", 
                             "trailing_sl": initial_sl,
-                            "entry_type": mode_tag
+                            "entry_type": mode_tag,
+                            "entry_time": now_ts
                         }
                         save_positions(active_positions)
                     sl_print = f"{initial_sl:.8f}" if "PEPE" in symbol else f"{initial_sl:.4f}"
@@ -680,7 +691,7 @@ def run_bottom_sniper_strategy():
             logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
-# ASYNCHRONICZNY MONITOR Z DYNAMICZNYM TRAILINGIEM OD SZCZYTU (BUFOR ODDECHU)
+# ASYNCHRONICZNY MONITOR Z DYNAMICZNYM TRAILINGIEM, STAGNATION & BREAKDOWN EXIT
 # ==============================================================================
 def monitoring_worker():
     global active_positions, trade_history
@@ -696,17 +707,21 @@ def monitoring_worker():
 
             for symbol, pos in items:
                 try:
-                    res = session.get_kline(category=CATEGORY, symbol=symbol, interval="15", limit=5)
-                    c_list = res.get("result", {}).get("list", [])
-                    if not c_list: continue
+                    df_mon = get_market_data_no_cache(symbol, interval="15", limit=60)
+                    if df_mon is None or len(df_mon) < 20: 
+                        continue
 
-                    c_curr = safe_float(c_list[0][4])
+                    c_curr = df_mon.iloc[-1]['close']
                     bp = pos["buy_price"]
                     peak = max(pos.get("peak_price", bp), c_curr)
+                    entry_time = pos.get("entry_time", now_ts)
+                    time_in_pos = now_ts - entry_time
 
                     with lock_pos:
                         if symbol in active_positions:
                             active_positions[symbol]["peak_price"] = peak
+                            if "entry_time" not in active_positions[symbol]:
+                                active_positions[symbol]["entry_time"] = entry_time
 
                     gain_pct = (c_curr - bp) / bp
                     peak_pct = (peak - bp) / bp
@@ -739,11 +754,9 @@ def monitoring_worker():
                     # ----------------------------------------------------------
                     # ZNIESIENIE KWARANTANNY (BEAR TRAP RECOVERY)
                     # ----------------------------------------------------------
-                    if len(c_list) >= 2:
-                        prev_candle_close = safe_float(c_list[1][4])
-                        prev_candle_open = safe_float(c_list[1][1])
-                        
-                        if (prev_candle_close - prev_candle_open) / prev_candle_open > 0.015:
+                    if len(df_mon) >= 3:
+                        prev_c = df_mon.iloc[-2]
+                        if (prev_c['close'] - prev_c['open']) / prev_c['open'] > 0.015:
                             with lock_history:
                                 t_log = trade_history.get("trades_log", [])
                                 if t_log and t_log[-1].get("symbol") == symbol and t_log[-1].get("net_pnl", 0) < 0:
@@ -754,11 +767,36 @@ def monitoring_worker():
                                         logging.info(f"🔓 [{symbol}] Wykryto V-Shape Reversal! Kwarantanna zniesiona.")
 
                     # ----------------------------------------------------------
+                    # MECHANIZMY EWAKUACJI Z MARTWYCH POZYCJI
+                    # ----------------------------------------------------------
+                    trigger_exit = False
+                    exit_reason = ""
+
+                    # 1. Zwykły Stop Loss / Trailing Stop
+                    if c_curr <= current_sl:
+                        trigger_exit = True
+                        exit_reason = f"Zabezpieczenie Zysku / Stop Loss ({((c_curr - bp) / bp) * 100:+.2f}%)"
+
+                    # 2. Stagnation Exit (Brak dynamiki > 2.5 godziny przy zysku < +0.8%)
+                    elif time_in_pos >= 9000 and gain_pct < 0.008:
+                        trigger_exit = True
+                        exit_reason = f"Stagnation Exit (Brak ruchu przez {time_in_pos/3600:.1f}h | {gain_pct*100:+.2f}%)"
+
+                    # 3. Breakdown Exit (Cena zjechała i utknęła pod EMA 21 i EMA 50 po min. 1h)
+                    elif time_in_pos >= 3600 and gain_pct <= 0.005:
+                        c1 = df_mon.iloc[-2]
+                        c2 = df_mon.iloc[-3]
+                        under_emas = (c1['close'] < c1['ema21'] and c1['close'] < c1['ema50'] and
+                                      c2['close'] < c2['ema21'] and c2['close'] < c2['ema50'])
+                        if under_emas:
+                            trigger_exit = True
+                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA 21/50 | {gain_pct*100:+.2f}%)"
+
+                    # ----------------------------------------------------------
                     # EGZEKUCJA WYJŚCIA
                     # ----------------------------------------------------------
-                    if c_curr <= current_sl:
+                    if trigger_exit:
                         net_result = ((c_curr - bp) / bp) * 100
-                        reason = f"Zabezpieczenie Zysku / Stop Loss ({net_result:+.2f}%)"
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
                         if rb > 0:
                             st, mq = get_symbol_lot_filter(symbol)
@@ -766,9 +804,9 @@ def monitoring_worker():
                             if qs:
                                 res_s = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qs)
                                 if res_s.get("retCode") == 0:
-                                    record_closed_trade(symbol, "WAVE_SNIPER", bp, c_curr, safe_float(qs), reason, is_maker=False)
+                                    record_closed_trade(symbol, "WAVE_SNIPER", bp, c_curr, safe_float(qs), exit_reason, is_maker=False)
                                     symbols_to_del.append(symbol)
-                                    logging.info(f"💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {net_result:+.2f}% | Powód: {reason}")
+                                    logging.info(f"💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {net_result:+.2f}% | Powód: {exit_reason}")
                         else:
                             symbols_to_del.append(symbol)
                 except Exception as e:
@@ -861,8 +899,11 @@ def bot_loop():
                         sl_val = pos.get('trailing_sl', pos.get('trailing_sl_low', 0.0))
                         is_pepe = "PEPE" in symbol
                         sl_fmt = f"{sl_val:.8f}" if is_pepe else f"{sl_val:.4f}"
-                        peak_fmt = f"{pos.get('peak_price', cp):.8f}" if is_pepe else f"{pos.get('peak_price', cp):.4f}"
-                        logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Szczyt: {peak_fmt} | SL: {sl_fmt}")
+                        peak_val = pos.get("peak_price", cp)
+                        peak_fmt = f"{peak_val:.8f}" if is_pepe else f"{peak_val:.4f}"
+                        entry_time = pos.get("entry_time", now_ts)
+                        elapsed_min = int((now_ts - entry_time) / 60)
+                        logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Czas: {elapsed_min}m | Szczyt: {peak_fmt} | SL: {sl_fmt}")
                     except Exception: pass
 
             # ==================================================================
