@@ -64,8 +64,8 @@ CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
 # --- KOSZYK 6 LIDERÓW ZMIENNOŚCI I PŁYNNOŚCI ---
-CAPITAL_PER_TRADE_PCT = 0.45         # 45% kapitału na pozycję (pozwala na 2 jednoczesne wejścia)
-MAX_TOTAL_POSITIONS = 2              # Maksymalnie 2 otwarte pozycje naraz
+CAPITAL_PER_TRADE_PCT = 0.45         # 45% kapitału na pozycję (pozwala na 2 jednoczesne wejścia)[cite: 8]
+MAX_TOTAL_POSITIONS = 2              # Maksymalnie 2 otwarte pozycje naraz[cite: 8]
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -73,7 +73,7 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 def get_dynamic_top_coins():
-    # 6 par do ciągłego polowania i rotacji kapitału
+    # 6 par liderów do ciągłego polowania i rotacji kapitału[cite: 8]
     return ["PEPEUSDC", "WIFUSDC", "BONKUSDC", "DOGEUSDC", "SUIUSDC", "SOLUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
@@ -367,7 +367,6 @@ def sync_positions_from_bybit():
             res = session.get_wallet_balance(accountType="UNIFIED")
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
             
-            # Pobieramy fizyczne salda z Bybit
             real_holdings = {}
             for coin_info in res["result"]["list"][0].get("coin", []):
                 coin = coin_info.get("coin")
@@ -558,7 +557,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# STRATEGIA BOTTOM SNIPER Z ROTACJĄ RELATYWNEJ SIŁY
+# STRATEGIA BOTTOM SNIPER Z OCHRONĄ PRZED EMA200 I ZAKUPEM PO ODBICIU
 # ==============================================================================
 def run_bottom_sniper_strategy():
     target_coins = get_dynamic_top_coins()
@@ -596,6 +595,7 @@ def run_bottom_sniper_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
+            # 0. Daily Loss Cap & Filtr Makro 1H
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             daily_loss_hit = False
             with lock_history:
@@ -606,7 +606,11 @@ def run_bottom_sniper_strategy():
 
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             is_green = c['close'] > c['open']
-            is_v_shape = is_green and (c['close'] > p['high']) and (vol_ratio >= 1.35)
+
+            # 1. POTWIERDZENIE FAZY WZROSTU (ZAKAZ KUPOWANIA W TRENDZIE SPADKOWYM)
+            # Na sinusoidzie: BEZWZGLĘDNY ZAKAZ kupowania na styku EMA 200 lub pod nią![cite: 10, 11]
+            # Cena MUSI znajdować się trwale powyżej EMA 50 i EMA 200, a średnie układać się prowzrostowo.
+            in_uptrend_structure = (c['close'] > c['ema50']) and (c['close'] > c['ema200']) and (c['ema21'] >= c['ema50'] * 0.998)
 
             macro_ok = True
             df_1h = get_market_data(symbol, interval="60", limit=50)
@@ -615,31 +619,50 @@ def run_bottom_sniper_strategy():
                 if c1h['close'] < c1h['ema50'] and c1h['close'] < c1h['ema89']:
                     macro_ok = False
 
+            # V-Shape z dna musi wybić nad EMA 21 z potężnym wolumenem (nie Dead Cat Bounce pod oporem)
+            is_v_shape = is_green and (c['close'] > p['high']) and (c['close'] > c['ema21']) and (vol_ratio >= 1.45)
+
             if daily_loss_hit or (not macro_ok and not is_v_shape):
                 continue
 
+            # 2. Blokada sieczki (Chop Filter)
             ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
             is_flat_chop = ema_spread < 0.0035
 
+            # 3. Wybicie lokalnej bazy (2 godziny) - wyłącznie w potwierdzonej fazie wzrostu
             highest_8 = df['high'].iloc[-11:-3].max()
-            breakout_confirmed = (c['close'] > highest_8) and is_green and (vol_ratio >= 1.20)
+            breakout_confirmed = (c['close'] > highest_8) and is_green and (vol_ratio >= 1.20) and in_uptrend_structure
             is_breakout_entry = breakout_confirmed and not is_flat_chop
 
+            # 4. Anty-FOMO (zakaz wchodzenia na szczycie rozciągniętej świecy)
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
             not_overextended = dist_from_ema9 <= 0.022
 
+            # 5. KUPUJEMY PO POTWIERDZONYM ODBICIU (STOP ŁAPANIU SPADAJĄCYCH NOŻY NA EMA 200!)[cite: 10, 11]
             lookback_peak = min(len(df) - 3, 96)
             local_peak = df['high'].iloc[-lookback_peak:-2].max()
             drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
             is_valid_dip = drop_from_peak >= 0.025
 
+            # Wsparcie w trendzie: dolny Bollinger LUB EMA 89, ale ZAWSZE W STRUKTURZE WZROSTOWEJ
+            # Całkowity zakaz wejść na styku lub przebiciu EMA 200 w dół![cite: 10, 11]
             curr_low = min(p['low'], c['low'], c_now['low'])
-            at_support = (curr_low <= c['bb_lower'] * 1.005) or \
-                         ((curr_low <= c['ema89'] * 1.008) and (c['close'] >= c['ema89'] * 0.995)) or \
-                         ((curr_low <= c['ema200'] * 1.008) and (c['close'] >= c['ema200'] * 0.995))
+            at_support = in_uptrend_structure and (
+                (curr_low <= c['bb_lower'] * 1.005 and c['close'] >= c['bb_lower']) or
+                ((curr_low <= c['ema89'] * 1.008) and (c['close'] >= c['ema89'] * 0.998))
+            )
 
-            bounce_trigger = is_green and (c['close'] > p['high']) and (vol_ratio >= 1.15)
-            is_dip_entry = is_valid_dip and at_support and bounce_trigger and not is_flat_chop
+            # Potwierdzenie odbicia (KUPUJEMY PO ODBICIU):
+            # - Świeca zamyka się nad EMA 21 i EMA 9 (popyt przejął kontrolę nad podażą)
+            # - Szybka średnia EMA 9 zakręca w górę
+            # - Wyższy dołek (Higher Low) i wyższy szczyt (Higher High)
+            reclaimed_momentum = (c['close'] > c['ema21']) and (c['close'] > c['ema9'])
+            ema9_curling_up = c['ema9'] > p['ema9']
+            higher_low = c['low'] >= p['low']
+            higher_high = c['close'] > p['high']
+
+            confirmed_bounce = is_green and reclaimed_momentum and ema9_curling_up and higher_low and higher_high and (vol_ratio >= 1.25)
+            is_dip_entry = is_valid_dip and at_support and confirmed_bounce and not is_flat_chop
 
             cooldown_ok = True
             with lock_history:
