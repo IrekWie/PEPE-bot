@@ -376,7 +376,7 @@ def sync_positions_from_bybit():
                 if bal > 0:
                     real_holdings[f"{coin}USDC"] = bal
 
-            # KROK 1: Usuwanie pozycji sprzedanych z ręki lub o wartości śmieciowej (< 8$)
+            # Usuwanie pozycji nieistniejących lub o wartości śmieciowej (< 8$)
             to_remove = []
             for sym, pos in list(active_positions.items()):
                 if sym not in allowed_symbols:
@@ -396,7 +396,7 @@ def sync_positions_from_bybit():
                     del active_positions[sym]
                     logging.info(f"🧹 [SYNC] Usunięto {sym} z monitora ({reason}).")
 
-            # KROK 2: Przejmowanie realnych pozycji istniejących na Bybit (>= 8$)
+            # Przejmowanie realnych pozycji istniejących na Bybit (>= 8$)
             for sym, bal in real_holdings.items():
                 if sym not in allowed_symbols: 
                     continue
@@ -557,7 +557,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# STRATEGIA BOTTOM SNIPER Z OCHRONĄ PRZED EMA200 I ZAKUPEM PO ODBICIU
+# STRATEGIA Z POTWIERDZENIEM ODBICIA (RECLAIM EMA 9/21 BEZ BLOKADY EMA200)
 # ==============================================================================
 def run_bottom_sniper_strategy():
     target_coins = get_dynamic_top_coins()
@@ -595,93 +595,79 @@ def run_bottom_sniper_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # 0. Daily Loss Cap & Filtr Makro 1H
-            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            daily_loss_hit = False
-            with lock_history:
-                t_log = trade_history.get("trades_log", [])
-                losses_today = sum(1 for t in t_log if t.get("symbol") == symbol and t.get("net_pnl", 0) < 0 and datetime.fromtimestamp(t.get("timestamp", 0), timezone.utc).strftime("%Y-%m-%d") == today_str)
-                if losses_today >= 1:
-                    daily_loss_hit = True
-
-            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-            is_green = c['close'] > c['open']
-
-            # 1. POTWIERDZENIE FAZY WZROSTU (ZAKAZ KUPOWANIA W TRENDZIE SPADKOWYM)
-            # Na sinusoidzie: BEZWZGLĘDNY ZAKAZ kupowania na styku EMA 200 lub pod nią![cite: 10, 11]
-            # Cena MUSI znajdować się trwale powyżej EMA 50 i EMA 200, a średnie układać się prowzrostowo.
-            in_uptrend_structure = (c['close'] > c['ema50']) and (c['close'] > c['ema200']) and (c['ema21'] >= c['ema50'] * 0.998)
-
-            macro_ok = True
-            df_1h = get_market_data(symbol, interval="60", limit=50)
-            if df_1h is not None and len(df_1h) >= 20:
-                c1h = df_1h.iloc[-2]
-                if c1h['close'] < c1h['ema50'] and c1h['close'] < c1h['ema89']:
-                    macro_ok = False
-
-            # V-Shape z dna musi wybić nad EMA 21 z potężnym wolumenem (nie Dead Cat Bounce pod oporem)
-            is_v_shape = is_green and (c['close'] > p['high']) and (c['close'] > c['ema21']) and (vol_ratio >= 1.45)
-
-            if daily_loss_hit or (not macro_ok and not is_v_shape):
-                continue
-
-            # 2. Blokada sieczki (Chop Filter)
-            ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
-            is_flat_chop = ema_spread < 0.0035
-
-            # 3. Wybicie lokalnej bazy (2 godziny) - wyłącznie w potwierdzonej fazie wzrostu
-            highest_8 = df['high'].iloc[-11:-3].max()
-            breakout_confirmed = (c['close'] > highest_8) and is_green and (vol_ratio >= 1.20) and in_uptrend_structure
-            is_breakout_entry = breakout_confirmed and not is_flat_chop
-
-            # 4. Anty-FOMO (zakaz wchodzenia na szczycie rozciągniętej świecy)
-            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
-            not_overextended = dist_from_ema9 <= 0.022
-
-            # 5. KUPUJEMY PO POTWIERDZONYM ODBICIU (STOP ŁAPANIU SPADAJĄCYCH NOŻY NA EMA 200!)[cite: 10, 11]
-            lookback_peak = min(len(df) - 3, 96)
-            local_peak = df['high'].iloc[-lookback_peak:-2].max()
-            drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
-            is_valid_dip = drop_from_peak >= 0.025
-
-            # Wsparcie w trendzie: dolny Bollinger LUB EMA 89, ale ZAWSZE W STRUKTURZE WZROSTOWEJ
-            # Całkowity zakaz wejść na styku lub przebiciu EMA 200 w dół![cite: 10, 11]
-            curr_low = min(p['low'], c['low'], c_now['low'])
-            at_support = in_uptrend_structure and (
-                (curr_low <= c['bb_lower'] * 1.005 and c['close'] >= c['bb_lower']) or
-                ((curr_low <= c['ema89'] * 1.008) and (c['close'] >= c['ema89'] * 0.998))
-            )
-
-            # Potwierdzenie odbicia (KUPUJEMY PO ODBICIU):
-            # - Świeca zamyka się nad EMA 21 i EMA 9 (popyt przejął kontrolę nad podażą)
-            # - Szybka średnia EMA 9 zakręca w górę
-            # - Wyższy dołek (Higher Low) i wyższy szczyt (Higher High)
-            reclaimed_momentum = (c['close'] > c['ema21']) and (c['close'] > c['ema9'])
-            ema9_curling_up = c['ema9'] > p['ema9']
-            higher_low = c['low'] >= p['low']
-            higher_high = c['close'] > p['high']
-
-            confirmed_bounce = is_green and reclaimed_momentum and ema9_curling_up and higher_low and higher_high and (vol_ratio >= 1.25)
-            is_dip_entry = is_valid_dip and at_support and confirmed_bounce and not is_flat_chop
-
+            # 0. Inteligentny Cooldown po stracie (zamiast blokady na 24h)
             cooldown_ok = True
             with lock_history:
                 trades_log = trade_history.get("trades_log", [])
                 for t in reversed(trades_log):
                     if t.get("symbol") == symbol:
                         time_since = now_ts - t.get("timestamp", 0)
-                        if t.get("net_pnl", 0) < 0 and time_since < 1800:
+                        # Po stracie dajemy 45 minut oddechu, by rynek ubił dno[cite: 11]
+                        if t.get("net_pnl", 0) < 0 and time_since < 2700:
                             cooldown_ok = False
                         elif time_since < 300:
                             cooldown_ok = False
                         break
-                        
+
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
+            is_green = c['close'] > c['open']
+
+            # 1. Sprawdzenie przestrzeni do oporu EMA 200
+            # EMA 200 to nasz SUFIT / CEL, a nie zakaz wejścia![cite: 11]
+            # Jeśli EMA 200 wisi nad nami, sprawdzamy jedynie czy jest min. 1.5% miejsca na rajd[cite: 11].
+            space_to_resistance = True
+            if c['close'] < c['ema200']:
+                dist_to_ema200 = (c['ema200'] - c['close']) / c['close']
+                if dist_to_ema200 < 0.015:
+                    space_to_resistance = False
+
+            # 2. Blokada sieczki (Chop Filter)
+            ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
+            is_flat_chop = ema_spread < 0.0035
+
+            # 3. Filtr Anty-FOMO (zakaz wchodzenia na szczycie rozciągniętej świecy)
+            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
+            not_overextended = dist_from_ema9 <= 0.022
+
+            # ----------------------------------------------------------
+            # SYGNAŁ A: POTWIERDZONE ODBICIE Z DNA (KUPUJEMY PO ODBICIU!)
+            # ----------------------------------------------------------
+            # Wykrywamy czy rynek zaliczył zrzut o min. 2.5% od lokalnego szczytu
+            lookback_peak = min(len(df) - 3, 96)
+            local_peak = df['high'].iloc[-lookback_peak:-2].max()
+            drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
+            is_valid_dip = drop_from_peak >= 0.025
+
+            # Dno zostało ustalone: najniższy knot zrzutu z ostatnich świec
+            lowest_recent_wick = df['low'].iloc[-8:-2].min() if len(df) >= 8 else c['low']
+            higher_than_bottom = c['low'] > lowest_recent_wick  # Koniec zrzutu, dno uformowane![cite: 11]
+
+            # KLUCZ: Odzyskanie pędu (Reclaim EMA 9 i EMA 21)
+            # Świeca zamknęła się PONAD EMA 9 i PONAD EMA 21![cite: 11]
+            reclaimed_momentum = (c['close'] > c['ema9']) and (c['close'] > c['ema21'])
+            upward_close = c['close'] > p['close']
+
+            is_dip_bounce_entry = is_valid_dip and higher_than_bottom and reclaimed_momentum and upward_close and is_green and (vol_ratio >= 1.15) and space_to_resistance and not is_flat_chop
+
+            # ----------------------------------------------------------
+            # SYGNAŁ B: V-SHAPE REVERSAL (Potężne objęcie popytowe)
+            # ----------------------------------------------------------
+            is_v_shape = is_green and (c['close'] > p['high']) and (c['close'] > c['ema21']) and (vol_ratio >= 1.35) and space_to_resistance
+
+            # ----------------------------------------------------------
+            # SYGNAŁ C: WYBICIE LOKALNEJ BAZY (Trend Continuation)
+            # ----------------------------------------------------------
+            highest_8 = df['high'].iloc[-11:-3].max()
+            in_trend = c['close'] > c['ema50']
+            is_breakout_entry = (c['close'] > highest_8) and is_green and (vol_ratio >= 1.20) and in_trend and not is_flat_chop
+
+            # Potwierdzenie na świecy na żywo
             live_candle_green = c_now['close'] > c_now['open']
 
-            should_buy = (is_breakout_entry or is_dip_entry or is_v_shape) and not_overextended and cooldown_ok and live_candle_green
+            should_buy = (is_dip_bounce_entry or is_v_shape or is_breakout_entry) and not_overextended and cooldown_ok and live_candle_green
 
             if should_buy:
-                mode_tag = "V-SHAPE REVERSAL" if is_v_shape else ("WYBICIE 2H" if is_breakout_entry else "DIP W TRENDZIE")
+                mode_tag = "V-SHAPE REVERSAL" if is_v_shape else ("POTWIERDZONE ODBICIE (RECLAIM)" if is_dip_bounce_entry else "WYBICIE 2H")
                 candidate_score = vol_ratio * (1.5 if is_v_shape else 1.0)
                 if best_candidate is None or candidate_score > best_candidate['score']:
                     best_candidate = {
@@ -702,7 +688,7 @@ def run_bottom_sniper_strategy():
     cand_mode = best_candidate["mode_tag"]
     cand_df = best_candidate["df"]
 
-    # PRZYPADEK A: Mamy wolne sloty na pozycje
+    # PRZYPADEK A: Wolne sloty w portfelu
     if current_count < MAX_TOTAL_POSITIONS:
         if free_usdc < (target_allocation * 0.99):
             logging.warning(f"⏳ [{cand_sym}] Sygnał {cand_mode}, brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
@@ -903,17 +889,12 @@ def monitoring_worker():
                     trigger_exit = False
                     exit_reason = ""
 
-                    # Warunek A: Trafienie w Stop Loss / Trailing Stop / Profit Lock
                     if c_curr <= current_sl:
                         trigger_exit = True
                         exit_reason = f"Profit Lock / Trailing Stop ({gain_pct*100:+.2f}%)"
-
-                    # Warunek B: Stagnation Exit (Brak dynamiki > 2.5 godziny przy zysku < +0.8%)
                     elif time_in_pos >= 9000 and gain_pct < 0.008:
                         trigger_exit = True
                         exit_reason = f"Stagnation Exit ({time_in_pos/3600:.1f}h bez ruchu | {gain_pct*100:+.2f}%)"
-
-                    # Warunek C: Breakdown Exit (Cena zjechała i utknęła pod EMA 21 i EMA 50 po min. 1h)
                     elif time_in_pos >= 3600 and gain_pct <= 0.005:
                         c1 = df_mon.iloc[-2]
                         c2 = df_mon.iloc[-3]
