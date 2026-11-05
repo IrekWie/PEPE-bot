@@ -56,16 +56,13 @@ FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
-print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
-print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
-
 TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# --- KOSZYK STRATEGII (OPCJA A: PEPE + WIF, POLOWANIE NA PIERWSZĄ OKAZJĘ) ---
-CAPITAL_PER_TRADE_PCT = 0.80         # 80% kapitału na transakcję
-MAX_TOTAL_POSITIONS = 1              # Maksymalnie 1 otwarta pozycja
+# --- KOSZYK STRATEGII (PEPE + WIF) ---
+CAPITAL_PER_TRADE_PCT = 0.80         # 80% kapitału na wejście
+MAX_TOTAL_POSITIONS = 1              # Maksymalnie 1 aktywna pozycja naraz
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -73,20 +70,19 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 def get_dynamic_top_coins():
-    # Ściśle określona lista par do handlu i synchronizacji
     return ["PEPEUSDC", "WIFUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
 STANDARD_MIN_ORDER_VALUE = 20.0
 MIN_SYNC_POSITION_VALUE = 8.0     
 MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02         # 2% rezerwy na fee giełdowe
+MIN_CASH_RESERVE_PCT = 0.02
 
 # --- BEZPIECZNIKI RYNKOWE ---
-USDC_MAX_SPREAD_PCT = 0.0010        # Max spread rynkowy 0.10%
-USDC_1M_DUMP_THRESHOLD = -0.005     # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012# Zrzut BTC 5M > -1.2% blokuje zakupy
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015# Paniczny zrzut BTC 15M > -1.5%
+USDC_MAX_SPREAD_PCT = 0.0010        
+USDC_1M_DUMP_THRESHOLD = -0.005     
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015
 
 CURRENT_SENTIMENT = "NEUTRAL 🟡"
 
@@ -361,12 +357,10 @@ def sync_positions_from_bybit():
     try:
         allowed_symbols = get_dynamic_top_coins()
         with lock_pos:
-            # 1. Usuwanie obcych monet z pamięci bota (np. SOLUSDC)
             to_remove = [s for s in active_positions if s not in allowed_symbols]
             for s in to_remove:
                 del active_positions[s]
 
-            # 2. Pobieranie pozycji z konta Bybit
             res = session.get_wallet_balance(accountType="UNIFIED")
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
             for coin_info in res["result"]["list"][0].get("coin", []):
@@ -376,7 +370,6 @@ def sync_positions_from_bybit():
                 if bal <= 0: continue
                 sym = f"{coin}USDC"
                 
-                # Ignorujemy monety spoza PEPE i WIF
                 if sym not in allowed_symbols: 
                     continue
 
@@ -535,7 +528,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# ZOPTYMALIZOWANA STRATEGIA SNIPER (PEPE + WIF, WYBICIE 8 ŚWIEC, ANTY-FOMO, PROFIT LADDER)
+# STRATEGIA BOTTOM SNIPER (PEPE + WIF, WYBICIE 8 ŚWIEC, ANTY-FOMO)
 # ==============================================================================
 def run_bottom_sniper_strategy():
     target_coins = get_dynamic_top_coins()
@@ -547,7 +540,6 @@ def run_bottom_sniper_strategy():
     if current_count >= MAX_TOTAL_POSITIONS:
         return
 
-    # Pobieranie świec
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in target_coins}
@@ -568,14 +560,11 @@ def run_bottom_sniper_strategy():
             continue
 
         try:
-            c_now = df.iloc[-1]   # Bieżąca świeca 15M
-            c = df.iloc[-2]       # Ostatnia zamknięta 15M
+            c_now = df.iloc[-1]
+            c = df.iloc[-2]
             p = df.iloc[-3]
-            p2 = df.iloc[-4]
 
-            # ----------------------------------------------------------
-            # 0. DAILY LOSS CAP & FILTR 1H Z WYJĄTKIEM NA V-SHAPE
-            # ----------------------------------------------------------
+            # 0. Daily Loss Cap & Filtr 1H
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             daily_loss_hit = False
             with lock_history:
@@ -586,8 +575,6 @@ def run_bottom_sniper_strategy():
 
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             is_green = c['close'] > c['open']
-            
-            # Wykrycie V-Shape Reversal (potężne objęcie popytowe z wolumenem)
             is_v_shape = is_green and (c['close'] > p['high']) and (vol_ratio >= 1.35)
 
             macro_ok = True
@@ -597,32 +584,23 @@ def run_bottom_sniper_strategy():
                 if c1h['close'] < c1h['ema50'] and c1h['close'] < c1h['ema89']:
                     macro_ok = False
 
-            # Jeśli moneta ma zaliczoną stratę dziś LUB brak trendu 1H (i nie jest to V-Shape), pomijamy
             if daily_loss_hit or (not macro_ok and not is_v_shape):
                 continue
 
-            # ----------------------------------------------------------
-            # 1. BLOKADA SIECZKI / KONSOLIDACJI (CHOP FILTER)
-            # ----------------------------------------------------------
+            # 1. Chop Filter
             ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
-            is_flat_chop = ema_spread < 0.0035  # Średnie rozjechane o mniej niż 0.35% = konsolidacja
+            is_flat_chop = ema_spread < 0.0035
 
-            # ----------------------------------------------------------
-            # 2. WYBICIE LOKALNEJ BAZY (8 ŚWIEC = 2 GODZINY ZAMIAST 5H)
-            # ----------------------------------------------------------
+            # 2. Wybicie 8 świec (2 godziny)
             highest_8 = df['high'].iloc[-11:-3].max()
             breakout_confirmed = (c['close'] > highest_8) and is_green and (vol_ratio >= 1.20)
             is_breakout_entry = breakout_confirmed and not is_flat_chop
 
-            # ----------------------------------------------------------
-            # 3. FILTR ANTY-FOMO (ZAKAZ KUPOWANIA PO ODJECHANIU OD EMA 9)
-            # ----------------------------------------------------------
+            # 3. Anty-FOMO
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
-            not_overextended = dist_from_ema9 <= 0.022  # Max 2.2% odległości od EMA 9
+            not_overextended = dist_from_ema9 <= 0.022
 
-            # ----------------------------------------------------------
-            # 4. ODBICIE OD DNA / WSPARCIA W TRENDZIE (DIP)
-            # ----------------------------------------------------------
+            # 4. Dip w trendzie
             lookback_peak = min(len(df) - 3, 96)
             local_peak = df['high'].iloc[-lookback_peak:-2].max()
             drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
@@ -636,9 +614,7 @@ def run_bottom_sniper_strategy():
             bounce_trigger = is_green and (c['close'] > p['high']) and (vol_ratio >= 1.15)
             is_dip_entry = is_valid_dip and at_support and bounce_trigger and not is_flat_chop
 
-            # ----------------------------------------------------------
-            # 5. COOLDOWN & POTWIERDZENIE WEJŚCIA
-            # ----------------------------------------------------------
+            # 5. Cooldown
             cooldown_ok = True
             with lock_history:
                 trades_log = trade_history.get("trades_log", [])
@@ -664,7 +640,7 @@ def run_bottom_sniper_strategy():
                     continue
 
                 swing_low = min(c['low'], p['low'], c_now['low'])
-                initial_sl = swing_low * 0.980  # Bezpieczny 2% bufor na zmienność memecoina
+                initial_sl = swing_low * 0.980
 
                 res = session.place_order(category=CATEGORY, symbol=symbol, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
                 if res.get("retCode") == 0:
@@ -685,13 +661,11 @@ def run_bottom_sniper_strategy():
                     sl_print = f"{initial_sl:.8f}" if "PEPE" in symbol else f"{initial_sl:.4f}"
                     logging.info(f"⚡🎯 [ZAKUP WYKONANY] {symbol} | Tryb: {mode_tag} | Cena: {curr_price} | SL: {sl_print}")
                     free_usdc -= target_allocation
-            else:
-                pass
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
 # ==============================================================================
-# ASYNCHRONICZNY MONITOR Z DYNAMICZNYM TRAILINGIEM, STAGNATION & BREAKDOWN EXIT
+# MONITORING Z ŻELAZNYM BREAK-EVEN I AGRESYWNĄ BLOKADĄ ZYSKU Z WYSTRZAŁU
 # ==============================================================================
 def monitoring_worker():
     global active_positions, trade_history
@@ -728,21 +702,27 @@ def monitoring_worker():
                     current_sl = pos.get("trailing_sl", bp * 0.980)
 
                     # ----------------------------------------------------------
-                    # DYNAMICZNY TRAILING OD SZCZYTU (BUFOR ODDECHU W RAJDZIE)
+                    # 1. ŻELAZNY BREAK-EVEN (Gwarancja 0 ryzyka przy zysku >= +1.5%)
+                    # ----------------------------------------------------------
+                    if peak_pct >= 0.015:
+                        current_sl = max(current_sl, bp * 1.004) # Pokrywa fee, brak straty!
+
+                    # ----------------------------------------------------------
+                    # 2. AGRESYWNY PROFIT LOCK (Scenariusz z godz. 4:00 rano)
                     # ----------------------------------------------------------
                     if peak_pct >= 0.020:
-                        if peak_pct >= 0.080:
-                            # ETAP 3: Rajd paraboliczny (> +8.0%) -> szeroki oddech na duże świece
-                            pullback_buffer = 0.022
-                            min_guaranteed_sl = bp * 1.055  # Bezpieczna podłoga: min. +5.5%
-                        elif peak_pct >= 0.040:
-                            # ETAP 2: Rozwinięty trend (+4.0% do +8.0%) -> umiarkowany bufor
-                            pullback_buffer = 0.015
-                            min_guaranteed_sl = bp * 1.025  # Bezpieczna podłoga: min. +2.5%
+                        if peak_pct >= 0.050:
+                            # Rajd +5.0% lub więcej (jak o 4:00 rano): betonujemy min. +3.5%
+                            pullback_buffer = 0.010  # Max 1.0% zjazdu od wierzchołka
+                            min_guaranteed_sl = bp * 1.035
+                        elif peak_pct >= 0.035:
+                            # Rajd +3.5% do +5.0%: betonujemy min. +2.2%
+                            pullback_buffer = 0.009
+                            min_guaranteed_sl = bp * 1.022
                         else:
-                            # ETAP 1: Wczesna faza (+2.0% do +4.0%) -> ciasne cięcie knotów
+                            # Rajd +2.0% do +3.5%: betonujemy min. +1.0%
                             pullback_buffer = 0.008
-                            min_guaranteed_sl = bp * 1.010  # Bezpieczna podłoga: min. +1.0%
+                            min_guaranteed_sl = bp * 1.010
 
                         trail_from_peak = peak * (1.0 - pullback_buffer)
                         current_sl = max(current_sl, trail_from_peak, min_guaranteed_sl)
@@ -752,37 +732,22 @@ def monitoring_worker():
                             active_positions[symbol]["trailing_sl"] = current_sl
 
                     # ----------------------------------------------------------
-                    # ZNIESIENIE KWARANTANNY (BEAR TRAP RECOVERY)
-                    # ----------------------------------------------------------
-                    if len(df_mon) >= 3:
-                        prev_c = df_mon.iloc[-2]
-                        if (prev_c['close'] - prev_c['open']) / prev_c['open'] > 0.015:
-                            with lock_history:
-                                t_log = trade_history.get("trades_log", [])
-                                if t_log and t_log[-1].get("symbol") == symbol and t_log[-1].get("net_pnl", 0) < 0:
-                                    last_trade_ts = t_log[-1].get("timestamp", 0)
-                                    if (now_ts - last_trade_ts) < 1800:
-                                        t_log[-1]["net_pnl"] = 0.01
-                                        save_trade_history(trade_history)
-                                        logging.info(f"🔓 [{symbol}] Wykryto V-Shape Reversal! Kwarantanna zniesiona.")
-
-                    # ----------------------------------------------------------
-                    # MECHANIZMY EWAKUACJI Z MARTWYCH POZYCJI
+                    # 3. WARUNKI WYJŚCIA (TRIGGER EXIT)
                     # ----------------------------------------------------------
                     trigger_exit = False
                     exit_reason = ""
 
-                    # 1. Zwykły Stop Loss / Trailing Stop
+                    # Warunek A: Trafienie w Stop Loss / Profit Lock / Trailing
                     if c_curr <= current_sl:
                         trigger_exit = True
-                        exit_reason = f"Zabezpieczenie Zysku / Stop Loss ({((c_curr - bp) / bp) * 100:+.2f}%)"
+                        exit_reason = f"Profit Lock / Trailing Stop ({gain_pct*100:+.2f}%)"
 
-                    # 2. Stagnation Exit (Brak dynamiki > 2.5 godziny przy zysku < +0.8%)
+                    # Warunek B: Stagnacja powyżej 2.5h przy zysku < +0.8%
                     elif time_in_pos >= 9000 and gain_pct < 0.008:
                         trigger_exit = True
-                        exit_reason = f"Stagnation Exit (Brak ruchu przez {time_in_pos/3600:.1f}h | {gain_pct*100:+.2f}%)"
+                        exit_reason = f"Stagnation Exit ({time_in_pos/3600:.1f}h bez ruchu | {gain_pct*100:+.2f}%)"
 
-                    # 3. Breakdown Exit (Cena zjechała i utknęła pod EMA 21 i EMA 50 po min. 1h)
+                    # Warunek C: Breakdown pod EMA 21 i EMA 50 po min. 1h
                     elif time_in_pos >= 3600 and gain_pct <= 0.005:
                         c1 = df_mon.iloc[-2]
                         c2 = df_mon.iloc[-3]
@@ -790,10 +755,10 @@ def monitoring_worker():
                                       c2['close'] < c2['ema21'] and c2['close'] < c2['ema50'])
                         if under_emas:
                             trigger_exit = True
-                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA 21/50 | {gain_pct*100:+.2f}%)"
+                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA | {gain_pct*100:+.2f}%)"
 
                     # ----------------------------------------------------------
-                    # EGZEKUCJA WYJŚCIA
+                    # 4. EGZEKUCJA WYJŚCIA
                     # ----------------------------------------------------------
                     if trigger_exit:
                         net_result = ((c_curr - bp) / bp) * 100
@@ -906,9 +871,7 @@ def bot_loop():
                         logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Czas: {elapsed_min}m | Szczyt: {peak_fmt} | SL: {sl_fmt}")
                     except Exception: pass
 
-            # ==================================================================
-            # SKANOWANIE I ZAKUPY
-            # ==================================================================
+            # Zakupy
             if is_btc_market_healthy() and usdc_ok:
                 run_bottom_sniper_strategy()
             else:
