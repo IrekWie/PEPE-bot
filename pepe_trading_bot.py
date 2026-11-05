@@ -56,6 +56,9 @@ FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
 
+print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
+print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
+
 TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
@@ -70,7 +73,7 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 def get_dynamic_top_coins():
-    # 6 par liderów do ciągłego polowania i rotacji kapitału
+    # 6 par do ciągłego polowania i rotacji kapitału
     return ["PEPEUSDC", "WIFUSDC", "BONKUSDC", "DOGEUSDC", "SUIUSDC", "SOLUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
@@ -352,25 +355,50 @@ def get_coin_available_balance(coin_name):
     except Exception: pass
     return 0.0
 
+# ==============================================================================
+# DWUKIERUNKOWA SYNCHRONIZACJA PORTFELA Z BYBIT
+# ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
     if not session: return
     try:
         allowed_symbols = get_dynamic_top_coins()
         with lock_pos:
-            to_remove = [s for s in active_positions if s not in allowed_symbols]
-            for s in to_remove:
-                del active_positions[s]
-
             res = session.get_wallet_balance(accountType="UNIFIED")
             if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
+            
+            # Pobieramy fizyczne salda z Bybit
+            real_holdings = {}
             for coin_info in res["result"]["list"][0].get("coin", []):
                 coin = coin_info.get("coin")
-                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: continue
+                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
+                    continue
                 bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
-                if bal <= 0: continue
-                sym = f"{coin}USDC"
+                if bal > 0:
+                    real_holdings[f"{coin}USDC"] = bal
+
+            # KROK 1: Usuwanie pozycji sprzedanych z ręki lub o wartości śmieciowej (< 8$)
+            to_remove = []
+            for sym, pos in list(active_positions.items()):
+                if sym not in allowed_symbols:
+                    to_remove.append((sym, "niedozwolony symbol"))
+                    continue
                 
+                bal = real_holdings.get(sym, 0.0)
+                df = get_market_data_no_cache(sym, interval="15", limit=2)
+                cp = df.iloc[-1]['close'] if (df is not None and len(df) > 0) else pos.get("buy_price", 1.0)
+                val_usd = bal * cp
+                
+                if bal <= 0 or val_usd < MIN_SYNC_POSITION_VALUE:
+                    to_remove.append((sym, f"brak na koncie Bybit lub resztki ({val_usd:.2f}$ < {MIN_SYNC_POSITION_VALUE:.0f}$)"))
+
+            for sym, reason in to_remove:
+                if sym in active_positions:
+                    del active_positions[sym]
+                    logging.info(f"🧹 [SYNC] Usunięto {sym} z monitora ({reason}).")
+
+            # KROK 2: Przejmowanie realnych pozycji istniejących na Bybit (>= 8$)
+            for sym, bal in real_holdings.items():
                 if sym not in allowed_symbols: 
                     continue
 
@@ -447,7 +475,6 @@ def get_market_data_no_cache(symbol, interval="15", limit=350):
         df['bb_std'] = df['close'].rolling(window=20).std()
         df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
         
-        # Obliczenie ATR (Average True Range) do pomiaru rozmiaru świec
         df['tr0'] = abs(df['high'] - df['low'])
         df['tr1'] = abs(df['high'] - df['close'].shift())
         df['tr2'] = abs(df['low'] - df['close'].shift())
@@ -531,7 +558,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# STRATEGIA BOTTOM SNIPER Z MODUŁEM ROTACJI RELATYWNEJ SIŁY
+# STRATEGIA BOTTOM SNIPER Z ROTACJĄ RELATYWNEJ SIŁY
 # ==============================================================================
 def run_bottom_sniper_strategy():
     target_coins = get_dynamic_top_coins()
@@ -540,9 +567,8 @@ def run_bottom_sniper_strategy():
     target_allocation = total_equity * CAPITAL_PER_TRADE_PCT
     now_ts = time.time()
 
-    # Pobieranie świec dla wszystkich monet równolegle
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in target_coins}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
@@ -554,7 +580,6 @@ def run_bottom_sniper_strategy():
         current_items = list(active_positions.items())
         current_count = len(current_items)
 
-    # Szukamy czy którakolwiek wolna moneta generuje silny sygnał wejścia
     best_candidate = None
 
     for symbol in target_coins:
@@ -571,7 +596,6 @@ def run_bottom_sniper_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # 0. Daily Loss Cap & Filtr 1H
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             daily_loss_hit = False
             with lock_history:
@@ -594,20 +618,16 @@ def run_bottom_sniper_strategy():
             if daily_loss_hit or (not macro_ok and not is_v_shape):
                 continue
 
-            # 1. Chop Filter
             ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
             is_flat_chop = ema_spread < 0.0035
 
-            # 2. Wybicie 8 świec (2 godziny)
             highest_8 = df['high'].iloc[-11:-3].max()
             breakout_confirmed = (c['close'] > highest_8) and is_green and (vol_ratio >= 1.20)
             is_breakout_entry = breakout_confirmed and not is_flat_chop
 
-            # 3. Anty-FOMO
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
             not_overextended = dist_from_ema9 <= 0.022
 
-            # 4. Dip w trendzie
             lookback_peak = min(len(df) - 3, 96)
             local_peak = df['high'].iloc[-lookback_peak:-2].max()
             drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
@@ -621,7 +641,6 @@ def run_bottom_sniper_strategy():
             bounce_trigger = is_green and (c['close'] > p['high']) and (vol_ratio >= 1.15)
             is_dip_entry = is_valid_dip and at_support and bounce_trigger and not is_flat_chop
 
-            # 5. Cooldown
             cooldown_ok = True
             with lock_history:
                 trades_log = trade_history.get("trades_log", [])
@@ -660,9 +679,7 @@ def run_bottom_sniper_strategy():
     cand_mode = best_candidate["mode_tag"]
     cand_df = best_candidate["df"]
 
-    # ==============================================================================
-    # PRZYPADEK A: Mamy wolne sloty na pozycje -> Standardowy zakup
-    # ==============================================================================
+    # PRZYPADEK A: Mamy wolne sloty na pozycje
     if current_count < MAX_TOTAL_POSITIONS:
         if free_usdc < (target_allocation * 0.99):
             logging.warning(f"⏳ [{cand_sym}] Sygnał {cand_mode}, brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
@@ -695,9 +712,7 @@ def run_bottom_sniper_strategy():
             logging.info(f"⚡🎯 [ZAKUP WYKONANY] {cand_sym} | Tryb: {cand_mode} | Cena: {curr_price} | SL: {sl_print}")
         return
 
-    # ==============================================================================
-    # PRZYPADEK B: Brak wolnych slotów -> ROTACJA KAPITAŁU (OPPORTUNITY SWITCH)
-    # ==============================================================================
+    # PRZYPADEK B: Brak wolnych slotów -> ROTACJA KAPITAŁU
     for def_sym, def_pos in current_items:
         def_df = results.get(def_sym)
         if def_df is None or len(def_df) < 20:
@@ -709,15 +724,12 @@ def run_bottom_sniper_strategy():
         def_entry_time = def_pos.get("entry_time", now_ts)
         def_time_in_pos = now_ts - def_entry_time
 
-        # Bezpiecznik 1: Moneta mocno zyskowna (>= +1.5%) nie podlega wymianie
         if def_gain >= 0.015:
             continue
 
-        # Bezpiecznik 2: Minimalny wiek pozycji (30 minut = 2 świece 15M)
         if def_time_in_pos < 1800:
             continue
 
-        # Wskaźniki utraty impetu trzymanej monety
         c_def = def_df.iloc[-2]
         c_now_def = def_df.iloc[-1]
         under_ema21 = (c_def['close'] < c_def['ema21']) and (c_now_def['close'] < c_now_def['ema21'])
@@ -781,7 +793,7 @@ def run_bottom_sniper_strategy():
             break
 
 # ==============================================================================
-# MONITORING Z ŻELAZNYM BREAK-EVEN I AGRESYWNĄ BLOKADĄ ZYSKU Z WYSTRZAŁU
+# MONITORING Z OCHRONĄ ZYSKU I EWAKUACJĄ
 # ==============================================================================
 def monitoring_worker():
     global active_positions, trade_history
@@ -859,11 +871,12 @@ def monitoring_worker():
                             trigger_exit = True
                             exit_reason = f"Breakdown Exit (Utrata pędu pod EMA | {gain_pct*100:+.2f}%)"
 
-                    # 4. Egzekucja wyjścia
+                    # 4. Egzekucja wyjścia (weryfikacja realnego salda)
                     if trigger_exit:
                         net_result = ((c_curr - bp) / bp) * 100
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
-                        if rb > 0:
+                        val_rb = rb * c_curr
+                        if rb > 0 and val_rb >= MIN_EXCHANGE_NOTIONAL:
                             st, mq = get_symbol_lot_filter(symbol)
                             qs = format_qty_with_step(rb, st, mq)
                             if qs:
@@ -872,7 +885,14 @@ def monitoring_worker():
                                     record_closed_trade(symbol, "WAVE_SNIPER", bp, c_curr, safe_float(qs), exit_reason, is_maker=False)
                                     symbols_to_del.append(symbol)
                                     logging.info(f"💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {net_result:+.2f}% | Powód: {exit_reason}")
+                                else:
+                                    err_msg = res_s.get("retMsg", "")
+                                    logging.warning(f"⚠️ [BYBIT ORDER] {symbol}: {err_msg}. Usuwam pozycję.")
+                                    symbols_to_del.append(symbol)
+                            else:
+                                symbols_to_del.append(symbol)
                         else:
+                            logging.info(f"ℹ️ [{symbol}] Pozycja już nie istnieje na koncie Bybit. Usuwam z monitora.")
                             symbols_to_del.append(symbol)
                 except Exception as e:
                     pass
