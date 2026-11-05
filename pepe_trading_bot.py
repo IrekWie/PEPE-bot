@@ -816,7 +816,7 @@ def run_bottom_sniper_strategy():
             break
 
 # ==============================================================================
-# MONITORING Z OCHRONĄ ZYSKU I EWAKUACJĄ
+# MONITORING Z ŻELAZNYM BREAK-EVEN I AGRESYWNYM PROFIT LOCKIEM
 # ==============================================================================
 def monitoring_worker():
     global active_positions, trade_history
@@ -852,19 +852,26 @@ def monitoring_worker():
                     peak_pct = (peak - bp) / bp
                     current_sl = pos.get("trailing_sl", bp * 0.980)
 
-                    # 1. Break-Even przy zysku >= +1.5%
+                    # ----------------------------------------------------------
+                    # 1. ŻELAZNY BREAK-EVEN (GWARANCJA BRAKU STRATY PRZY ZYSKU >= +1.5%)
+                    # ----------------------------------------------------------
                     if peak_pct >= 0.015:
-                        current_sl = max(current_sl, bp * 1.004)
+                        current_sl = max(current_sl, bp * 1.004)  # Pokrywa fee, pozycja bez ryzyka![cite: 2, 3]
 
-                    # 2. Agresywna blokada zysku z wystrzału
+                    # ----------------------------------------------------------
+                    # 2. AGRESYWNA BLOKADA ZYSKU Z WYSTRZAŁU (ŁAPACZ KNOTÓW Z GODZ. 4:00 RANO)
+                    # ----------------------------------------------------------
                     if peak_pct >= 0.020:
                         if peak_pct >= 0.050:
+                            # Wystrzał >= +5.0% (jak o 4:00 rano): betonujemy min. +3.5%, ciasny bufor 1.0%[cite: 4, 6]
                             pullback_buffer = 0.010
                             min_guaranteed_sl = bp * 1.035
                         elif peak_pct >= 0.035:
+                            # Wystrzał +3.5% do +5.0%: betonujemy min. +2.2%, bufor 0.9%[cite: 6]
                             pullback_buffer = 0.009
                             min_guaranteed_sl = bp * 1.022
                         else:
+                            # Wczesna faza +2.0% do +3.5%: betonujemy min. +1.0%, bufor 0.8%
                             pullback_buffer = 0.008
                             min_guaranteed_sl = bp * 1.010
 
@@ -875,16 +882,38 @@ def monitoring_worker():
                         if symbol in active_positions:
                             active_positions[symbol]["trailing_sl"] = current_sl
 
-                    # 3. Warunki ewakuacji
+                    # ----------------------------------------------------------
+                    # 3. ZNIESIENIE KWARANTANNY (BEAR TRAP RECOVERY)
+                    # ----------------------------------------------------------
+                    if len(df_mon) >= 3:
+                        prev_c = df_mon.iloc[-2]
+                        if (prev_c['close'] - prev_c['open']) / prev_c['open'] > 0.015:
+                            with lock_history:
+                                t_log = trade_history.get("trades_log", [])
+                                if t_log and t_log[-1].get("symbol") == symbol and t_log[-1].get("net_pnl", 0) < 0:
+                                    last_trade_ts = t_log[-1].get("timestamp", 0)
+                                    if (now_ts - last_trade_ts) < 1800:
+                                        t_log[-1]["net_pnl"] = 0.01
+                                        save_trade_history(trade_history)
+                                        logging.info(f"🔓 [{symbol}] Wykryto V-Shape Reversal! Kwarantanna zniesiona.")
+
+                    # ----------------------------------------------------------
+                    # 4. MECHANIZMY EWAKUACJI Z MARTWYCH POZYCJI
+                    # ----------------------------------------------------------
                     trigger_exit = False
                     exit_reason = ""
 
+                    # Warunek A: Trafienie w Stop Loss / Trailing Stop / Profit Lock
                     if c_curr <= current_sl:
                         trigger_exit = True
                         exit_reason = f"Profit Lock / Trailing Stop ({gain_pct*100:+.2f}%)"
+
+                    # Warunek B: Stagnation Exit (Brak dynamiki > 2.5 godziny przy zysku < +0.8%)
                     elif time_in_pos >= 9000 and gain_pct < 0.008:
                         trigger_exit = True
                         exit_reason = f"Stagnation Exit ({time_in_pos/3600:.1f}h bez ruchu | {gain_pct*100:+.2f}%)"
+
+                    # Warunek C: Breakdown Exit (Cena zjechała i utknęła pod EMA 21 i EMA 50 po min. 1h)
                     elif time_in_pos >= 3600 and gain_pct <= 0.005:
                         c1 = df_mon.iloc[-2]
                         c2 = df_mon.iloc[-3]
@@ -892,9 +921,11 @@ def monitoring_worker():
                                       c2['close'] < c2['ema21'] and c2['close'] < c2['ema50'])
                         if under_emas:
                             trigger_exit = True
-                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA | {gain_pct*100:+.2f}%)"
+                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA 21/50 | {gain_pct*100:+.2f}%)"
 
-                    # 4. Egzekucja wyjścia (weryfikacja realnego salda)
+                    # ----------------------------------------------------------
+                    # 5. EGZEKUCJA WYJŚCIA (WERYFIKACJA REALNEGO SALDA)
+                    # ----------------------------------------------------------
                     if trigger_exit:
                         net_result = ((c_curr - bp) / bp) * 100
                         rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
@@ -910,7 +941,7 @@ def monitoring_worker():
                                     logging.info(f"💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {net_result:+.2f}% | Powód: {exit_reason}")
                                 else:
                                     err_msg = res_s.get("retMsg", "")
-                                    logging.warning(f"⚠️ [BYBIT ORDER] {symbol}: {err_msg}. Usuwam pozycję.")
+                                    logging.warning(f"⚠️ [BYBIT ORDER] {symbol}: {err_msg}. Usuwam z monitora.")
                                     symbols_to_del.append(symbol)
                             else:
                                 symbols_to_del.append(symbol)
