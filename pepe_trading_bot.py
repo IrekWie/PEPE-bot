@@ -71,6 +71,13 @@ MAX_TOTAL_POSITIONS = 2            # Maksymalnie 2 aktywne transakcje jednocześ
 STANDARD_MIN_ORDER_VALUE = 15.0    # Minimalna wartość wejścia w USDC
 MIN_EXCHANGE_NOTIONAL = 5.2        # Minimalna wartość zlecenia na Bybit (z marginesem)
 
+# ==============================================================================
+# DOLAROWY TRAILING PROFIT DLA PORTFELA (BASKET PROFIT LOCK)
+# ==============================================================================
+USD_PROFIT_TRIGGER = 20.0          # Próg aktywacji dolarowej ochrony (+20 USD)
+USD_TRAILING_DROP = 5.0            # Dozwolone osunięcie od szczytu w dół (5 USD)
+basket_peak_profit_usd = 0.0       # Dynamiczny rejestr szczytu zysku koszyka
+
 # PARAMETRY OCHRONY KAPITAŁU (MINIMALIZACJA STRAT)
 MAX_INITIAL_STOP_LOSS_PCT = 0.012  # Sztywny maksymalny początkowy SL = 1.20%
 FAST_INVALIDATION_PCT = -0.0065    # Szybkie ucięcie braku impetu (-0.65% w pierwsze 10 min)
@@ -123,7 +130,6 @@ if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
 
-# Zwiększenie puli połączeń HTTP do 30 socketów
 adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
 if hasattr(session, "client") and isinstance(session.client, requests.Session):
     session.client.mount("https://", adapter)
@@ -447,7 +453,6 @@ def run_sniper_strategy():
     target_allocation = total_equity * CAPITAL_PER_TRADE_PCT
     now_ts = time.time()
 
-    # Równoległe pobieranie świec dla 13 par przy użyciu 8 workerów
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in TARGET_COINS}
@@ -472,7 +477,6 @@ def run_sniper_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # Cooldown po stracie (30 min po SL)
             cooldown_ok = True
             with lock_history:
                 for t in reversed(trade_history.get("trades_log", [])):
@@ -487,7 +491,6 @@ def run_sniper_strategy():
             is_green = c['close'] > c['open']
             rsi_val = c.get('rsi', 50.0)
 
-            # Filtr anty-szczytowy: odrzucenie długich knotów podażowych
             candle_range = c['high'] - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
             wick_rejection = (upper_wick / candle_range > 0.28) if candle_range > 0 else False
@@ -495,16 +498,13 @@ def run_sniper_strategy():
             if rsi_val >= 68.0 or wick_rejection or not is_green:
                 continue
 
-            # SYGNAŁ 1: Odbicie dna (Reclaim EMA9 & EMA21)
             reclaimed_emas = (c['close'] > c['ema9']) and (c['close'] > c['ema21']) and (p['close'] <= p['ema21'])
             is_rebound = reclaimed_emas and (vol_ratio >= 1.15)
 
-            # SYGNAŁ 2: Wybicie z retestu wsparcia
             in_trend = (c['close'] > c['ema50']) and (c['ema21'] > c['ema50'])
             tested_ema21 = (p['low'] <= p['ema21'] * 1.003) or (c['low'] <= c['ema21'] * 1.003)
             bounce_trend = in_trend and tested_ema21 and (c['close'] > p['high']) and (vol_ratio >= 1.15)
 
-            # SYGNAŁ 3: V-Shape Reversal (potężne objęcie hossy)
             is_v_shape = (c['close'] > p['high']) and (c['close'] > c['ema21']) and (vol_ratio >= 1.40)
 
             live_green = c_now['close'] >= c_now['open']
@@ -531,9 +531,7 @@ def run_sniper_strategy():
         current_count = len(active_positions)
         current_items = list(active_positions.items())
 
-    # ==========================================================================
-    # SCENARIUSZ 1: SĄ WOLNE SLOTY W PORTFELU (< MAX_TOTAL_POSITIONS)
-    # ==========================================================================
+    # SCENARIUSZ 1: SĄ WOLNE SLOTY W PORTFELU
     if current_count < MAX_TOTAL_POSITIONS:
         if free_usdc >= (target_allocation * 0.98):
             c_now = cand_df.iloc[-1]
@@ -565,9 +563,7 @@ def run_sniper_strategy():
                     logging.info(f"⚡🎯 [ZAKUP STANDARDOWY] {cand_sym} ({cand_tag}) | Cena: {curr_price} | Ilość: {q_str} | SL: {sl_fmt}")
         return
 
-    # ==========================================================================
-    # SCENARIUSZ 2: PORTFEL PEŁNY (2/2) -> SPRAWDZAMY OSPAŁE POZYCJE I ROTUJEMY
-    # ==========================================================================
+    # SCENARIUSZ 2: PORTFEL PEŁNY -> ROTACJA KAPITAŁU
     strong_challenger = (best_candidate["vol_ratio"] >= ROTATION_MIN_CHALLENGER_VOL) or best_candidate["is_v_shape"]
     if not strong_challenger:
         return
@@ -583,11 +579,9 @@ def run_sniper_strategy():
         entry_time = def_pos.get("entry_time", now_ts)
         time_in_pos = now_ts - entry_time
 
-        # Jeśli pozycja zrealizowała TP1 lub dynamicznie rośnie (>= +0.8%), nie dotykamy jej
         if def_pos.get("tp1_executed", False) or gain_pct >= 0.008:
             continue
 
-        # Warunki ospałości (stagnacji)
         is_flat_and_old = (time_in_pos >= STAGNATION_MIN_TIME_SEC) and (gain_pct <= STAGNATION_MAX_GAIN_PCT)
         
         under_emas = False
@@ -671,28 +665,87 @@ def run_sniper_strategy():
 
 # ==============================================================================
 # MONITORING W CZASIE RZECZYWISTYM (REAL-TIME TICKER CO 1.5s)
+# Z OBSŁUGĄ DOLAROWEGO TRAILING PROFIT LOCK DLA CAŁEGO PORTFELA
 # ==============================================================================
 def monitoring_worker():
-    global active_positions
+    global active_positions, basket_peak_profit_usd
     logging.info("🚀 [SYSTEM] Uruchomiono wątek monitoringu w czasie rzeczywistym (1.5s).")
     while True:
         try:
             with lock_pos:
                 items = list(active_positions.items())
             if not items:
+                basket_peak_profit_usd = 0.0
                 time.sleep(1.5)
                 continue
 
             tickers = get_all_spot_tickers()
             now_ts = time.time()
-            to_delete = []
+
+            # ------------------------------------------------------------------
+            # 1. KALKULACJA SUMARYCZNEGO NIEZREALIZOWANEGO ZYSKU W USD
+            # ------------------------------------------------------------------
+            total_unrealized_usd = 0.0
+            position_prices = {}
 
             for symbol, pos in items:
                 ticker = tickers.get(symbol)
-                if not ticker:
+                c_curr = safe_float(ticker.get("lastPrice")) if ticker else 0.0
+                if c_curr <= 0:
+                    c_curr = pos["buy_price"]
+                position_prices[symbol] = c_curr
+
+                bp = pos["buy_price"]
+                q = safe_float(pos.get("qty", 0.0))
+                pnl_usd = (c_curr - bp) * q
+                total_unrealized_usd += pnl_usd
+
+            # Aktualizacja szczytu zysku w USD
+            if total_unrealized_usd > basket_peak_profit_usd:
+                basket_peak_profit_usd = total_unrealized_usd
+
+            # ------------------------------------------------------------------
+            # 2. MECHANIZM TRAILING PROFIT LOCK W USD (np. 20$ szczyt -> stop 15$, 40$ -> stop 35$)
+            # ------------------------------------------------------------------
+            if basket_peak_profit_usd >= USD_PROFIT_TRIGGER:
+                basket_sl_target = basket_peak_profit_usd - USD_TRAILING_DROP
+                if total_unrealized_usd <= basket_sl_target:
+                    logging.info("================================================================================")
+                    logging.info(f"🏆💰 [BASKET TRAILING PROFIT LOCK] Aktywowano zamknięcie portfela!")
+                    logging.info(f"📈 Szczyt zysku osiągnął: +{basket_peak_profit_usd:.2f} USD")
+                    logging.info(f"📉 Osunięcie o {USD_TRAILING_DROP:.2f} USD -> Realizacja zysku przy: +{total_unrealized_usd:.2f} USD")
+                    logging.info("🚨 Zamykam wszystkie aktywne pozycje i czekam na nowe wejścia...")
+                    logging.info("================================================================================")
+
+                    for symbol, pos in items:
+                        c_curr = position_prices.get(symbol, pos["buy_price"])
+                        base_c = get_base_coin(symbol)
+                        bal_coin = get_coin_available_balance(base_c)
+                        val_usd = bal_coin * c_curr
+
+                        if bal_coin > 0 and val_usd >= MIN_EXCHANGE_NOTIONAL:
+                            step, minq = get_symbol_lot_filter(symbol)
+                            sell_q_str = format_qty_with_step(bal_coin, step, minq)
+                            if sell_q_str:
+                                res_s = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=sell_q_str)
+                                if res_s.get("retCode") == 0:
+                                    reason = f"Basket Dollar Lock (Realizacja +{total_unrealized_usd:.2f}$ / szczyt +{basket_peak_profit_usd:.2f}$)"
+                                    record_closed_trade(symbol, pos.get("strategy"), pos["buy_price"], c_curr, safe_float(sell_q_str), reason, is_maker=False)
+                                    logging.info(f"💰 [BASKET EXIT] {symbol} sprzedany po cenie {c_curr}!")
+
+                    with lock_pos:
+                        active_positions.clear()
+                        save_positions(active_positions)
+                    basket_peak_profit_usd = 0.0
+                    time.sleep(2.0)
                     continue
 
-                c_curr = safe_float(ticker.get("lastPrice"))
+            # ------------------------------------------------------------------
+            # 3. INDYWIDUALNY MONITORING KAŻDEJ POZYCJI (TP1, KNOTY, PROCENTOWY SL)
+            # ------------------------------------------------------------------
+            to_delete = []
+            for symbol, pos in items:
+                c_curr = position_prices.get(symbol, 0.0)
                 if c_curr <= 0:
                     continue
 
@@ -701,7 +754,6 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
-                # 1. Śledzenie szczytu w czasie rzeczywistym
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
@@ -754,7 +806,7 @@ def monitoring_worker():
 
                 pos["trailing_sl"] = current_sl
 
-                # WARUNKI WYJŚCIA
+                # WARUNKI WYJŚCIA Z INDYWIDUALNEJ POZYCJI
                 trigger_exit = False
                 exit_reason = ""
 
@@ -824,19 +876,28 @@ def bot_loop():
             if now - last_print >= 30:
                 total_eq, free_usdc = get_balances()
                 usdc_ok, usdc_stat = check_usdc_market_dependencies()
-                logging.info("--------------------------------------------------------------------------------")
-                logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS} | Status USDC: {usdc_stat}")
+                
+                # Obliczenie łącznego niezrealizowanego zysku dla raportu
+                tickers = get_all_spot_tickers()
+                total_unrealized_usd = 0.0
                 for s, p in current_items:
-                    tickers = get_all_spot_tickers()
+                    c_p = safe_float(tickers.get(s, {}).get("lastPrice"), p["buy_price"])
+                    total_unrealized_usd += (c_p - p["buy_price"]) * safe_float(p.get("qty", 0.0))
+
+                logging.info("--------------------------------------------------------------------------------")
+                status_profit_lock = f"Szczyt: +{basket_peak_profit_usd:.2f}$" if basket_peak_profit_usd >= USD_PROFIT_TRIGGER else "Nieaktywny (< 20$)"
+                logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Niezrealizowany PnL: {total_unrealized_usd:+.2f}$ ({status_profit_lock}) | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS}")
+                for s, p in current_items:
                     curr = safe_float(tickers.get(s, {}).get("lastPrice"), p["buy_price"])
                     pnl = ((curr - p["buy_price"]) / p["buy_price"]) * 100
+                    pnl_usd = (curr - p["buy_price"]) * safe_float(p.get("qty", 0.0))
                     sl = p.get("trailing_sl", 0.0)
                     is_micro = any(m in s for m in ["PEPE", "BONK", "SHIB"])
                     sl_fmt = f"{sl:.8f}" if is_micro else f"{sl:.4f}"
                     peak_fmt = f"{p.get('peak_price', curr):.8f}" if is_micro else f"{p.get('peak_price', curr):.4f}"
                     entry_t = p.get("entry_time", now)
                     min_elapsed = int((now - entry_t) / 60)
-                    logging.info(f"📈 [{s}] PnL: {pnl:+.2f}% ({min_elapsed}m) | Szczyt: {peak_fmt} | Aktywny SL: {sl_fmt}")
+                    logging.info(f"📈 [{s}] PnL: {pnl:+.2f}% ({pnl_usd:+.2f}$) | Czas: {min_elapsed}m | Szczyt: {peak_fmt} | Aktywny SL: {sl_fmt}")
                 logging.info("--------------------------------------------------------------------------------")
                 last_print = now
 
@@ -863,7 +924,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Smart Rotation & Pooled Sockets")
+        self.wfile.write(b"Bybit Spot Bot Active - Smart Rotation & Basket Profit Lock")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
