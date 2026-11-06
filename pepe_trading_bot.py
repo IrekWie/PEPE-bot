@@ -6,11 +6,18 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 import pandas as pd
 from pybit.unified_trading import HTTP
 import requests
+
+# Wymuszenie natychmiastowego wypychania logów na Renderze (brak buforowania stdout)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # ==============================================================================
 # BEZPIECZEŃSTWO SIECI I SYNCHRONIZACJA CZASU BYBIT
@@ -52,16 +59,16 @@ QUOTE_COIN = "USDC"
 # KOSZYK 6 LIDERÓW ZMIENNOŚCI
 TARGET_COINS = ["PEPEUSDC", "SOLUSDC", "DOGEUSDC", "WIFUSDC", "SUIUSDC", "BONKUSDC"]
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (pozwala na 2 jednoczesne wejścia)
-MAX_TOTAL_POSITIONS = 2            # Maksymalnie 2 aktywne transakcje
-STANDARD_MIN_ORDER_VALUE = 15.0    # Minimalna wartość wejścia (USDC)
-MIN_EXCHANGE_NOTIONAL = 5.2        # Minimalna wartość zlecenia na Bybit (z zapasem)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na transakcję (pozwala na 2 pozycje)
+MAX_TOTAL_POSITIONS = 2            # Maksymalnie 2 aktywne transakcje jednocześnie
+STANDARD_MIN_ORDER_VALUE = 15.0    # Minimalna wartość wejścia w USDC
+MIN_EXCHANGE_NOTIONAL = 5.2        # Minimalna wartość zlecenia na Bybit (z marginesem)
 
 # PARAMETRY OCHRONY KAPITAŁU (MINIMALIZACJA STRAT)
-MAX_INITIAL_STOP_LOSS_PCT = 0.012  # Sztywny max SL = 1.20% (cięcie ryzyka przy wejściu)
-FAST_INVALIDATION_PCT = -0.0065    # Szybkie cięcie fałszywego wybicia (-0.65% w pierwsze 10 min)
-BREAK_EVEN_TRIGGER_PCT = 0.014     # Próg aktywacji Break-Even (+1.40%)
-BREAK_EVEN_LOCK_PCT = 0.0035       # Poziom Break-Even (+0.35% ponad cenę wejścia na pokrycie opłat)
+MAX_INITIAL_STOP_LOSS_PCT = 0.012  # Sztywny maksymalny początkowy SL = 1.20%
+FAST_INVALIDATION_PCT = -0.0065    # Szybkie ucięcie braku impetu (-0.65% w pierwsze 10 min)
+BREAK_EVEN_TRIGGER_PCT = 0.014     # Próg przestawienia na Break-Even (+1.40%)
+BREAK_EVEN_LOCK_PCT = 0.0035       # Poziom Break-Even (+0.35% na pokrycie opłat)
 
 # BEZPIECZNIKI RYNKOWE
 USDC_MAX_SPREAD_PCT = 0.0080
@@ -74,14 +81,22 @@ TRADE_HISTORY_FILE = "trade_history.json"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 # ==============================================================================
-# SESJA BYBIT I POMOCNIKI
+# BLOKADY WIELOWĄTKOWE (RLock ZAPOBIEGA DEADLOCKOM)
 # ==============================================================================
+lock_pos = threading.RLock()
+lock_history = threading.RLock()
+kline_cache_lock = threading.Lock()
+kline_cache_15m = {}
+instrument_filters = {}
+
+# Inicjalizacja czasu
 sync_bybit_clock()
 
+# Inicjalizacja sesji Bybit
 endpoints = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
 session = None
 for name, url in endpoints:
@@ -99,12 +114,6 @@ for name, url in endpoints:
 if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
-
-lock_pos = threading.Lock()
-lock_history = threading.Lock()
-kline_cache_lock = threading.Lock()
-kline_cache_15m = {}
-instrument_filters = {}
 
 def safe_float(val, default=0.0):
     try:
@@ -421,7 +430,7 @@ def sync_positions_from_bybit():
 # STRATEGIA ZAKUPÓW: BREAKOUT & PULLBACK SNIPER
 # ==============================================================================
 def run_sniper_strategy():
-    global active_positions, kline_cache_15m
+    global active_positions
     total_equity, free_usdc = get_balances()
     target_allocation = total_equity * CAPITAL_PER_TRADE_PCT
     now_ts = time.time()
@@ -541,11 +550,11 @@ def run_sniper_strategy():
             logging.info(f"⚡🎯 [ZAKUP] {sym} ({tag}) | Cena: {curr_price} | Ilość: {q_str} | Ciasny SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
 
 # ==============================================================================
-# MONITORING W CZASIE RZECZYWISTYM (REAL-TIME TICKER LOOP)
-# REALIZACJA ZYSKÓW W ZALEŻNOŚCI OD WYBICIA + OCHRONA PRZED STRATĄ
+# MONITORING W CZASIE RZECZYWISTYM (REAL-TIME TICKER CO 1.5s)
 # ==============================================================================
 def monitoring_worker():
     global active_positions
+    logging.info("🚀 [SYSTEM] Uruchomiono wątek monitoringu w czasie rzeczywistym (1.5s).")
     while True:
         try:
             with lock_pos:
@@ -572,22 +581,18 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
-                # 1. Śledzenie absolutnego szczytu w czasie rzeczywistym
+                # 1. Śledzenie szczytu w czasie rzeczywistym
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
 
                 current_sl = pos.get("trailing_sl", bp * (1.0 - MAX_INITIAL_STOP_LOSS_PCT))
 
-                # ------------------------------------------------------------------
-                # A. REALIZACJA ZYSKÓW W ZALEŻNOŚCI OD STOPNIA WYBICIA
-                # ------------------------------------------------------------------
-                
-                # KROK 1: Wybicie wczesne (+1.4%): natychmiastowy Break-Even (Zero ryzyka straty)
+                # KROK 1: Wybicie wczesne (+1.4%): natychmiastowy Break-Even
                 if peak_pct >= BREAK_EVEN_TRIGGER_PCT:
                     current_sl = max(current_sl, bp * (1.0 + BREAK_EVEN_LOCK_PCT))
 
-                # KROK 2: Wybicie TP1 (+2.8% do +3.2%): Sprzedaż 50% pozycji i lock zysku
+                # KROK 2: TP1 (+2.8%): Sprzedaż 50% pozycji
                 if peak_pct >= 0.028 and not pos.get("tp1_executed", False):
                     full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
                     half_qty = full_qty / Decimal("2")
@@ -606,23 +611,21 @@ def monitoring_worker():
                             logging.info(f"💎💰 [CZĘŚCIOWY TAKE PROFIT] {symbol} | Sprzedano 50% ({half_qty_str}) przy +{gain_pct*100:.2f}%! Pozycja zabezpieczona.")
 
                     if not sold_half_success:
-                        # Jeśli wolumen za mały na podział, oznacz TP1 i mocno podciągnij SL
                         pos["tp1_executed"] = True
                     
-                    current_sl = max(current_sl, bp * 1.018)  # Gwarancja min. +1.8% na reszcie
+                    current_sl = max(current_sl, bp * 1.018)
 
                 # KROK 3: Wybicie średnie (+4.0% do +6.0%): Ciasny trailing 0.9% od szczytu
                 if peak_pct >= 0.040:
                     trail_sl = peak * (1.0 - 0.009)
                     current_sl = max(current_sl, trail_sl, bp * 1.025)
 
-                # KROK 4: Paraboliczny wystrzał (> +6.5%): Agresywny trailing 1.2% od szczytu
+                # KROK 4: Paraboliczny wystrzał (> +6.5%): Trailing 1.2% od szczytu
                 if peak_pct >= 0.065:
                     trail_sl = peak * (1.0 - 0.012)
                     current_sl = max(current_sl, trail_sl, bp * 1.045)
 
                 # KROK 5: Ochrona przed cofnięciem z knota (Wick Rejection Guard)
-                # Jeśli szczyt był mocny (>= +2.2%), a cena oddała już 35% zysku ze szczytu -> natychmiastowe cięcie
                 wick_drop_exit = False
                 if peak_pct >= 0.022:
                     retracement = (peak - c_curr) / (peak - bp) if (peak - bp) > 0 else 0.0
@@ -631,9 +634,7 @@ def monitoring_worker():
 
                 pos["trailing_sl"] = current_sl
 
-                # ------------------------------------------------------------------
-                # B. MINIMALIZACJA STRAT: SZYBKIE CIĘCIE PRZED PEŁNYM SL
-                # ------------------------------------------------------------------
+                # WARUNKI WYJŚCIA
                 trigger_exit = False
                 exit_reason = ""
 
@@ -642,19 +643,15 @@ def monitoring_worker():
                     exit_reason = f"Trailing Stop / Profit Lock ({gain_pct*100:+.2f}%)"
                 elif wick_drop_exit:
                     trigger_exit = True
-                    exit_reason = f"Wick Rejection Guard (Odrzucenie knota z poziomu {peak_pct*100:+.2f}%)"
+                    exit_reason = f"Wick Rejection Guard (Odrzucenie z {peak_pct*100:+.2f}%)"
                 elif time_in_pos >= 600 and gain_pct <= FAST_INVALIDATION_PCT:
-                    # Fast Invalidation: brak reakcji w 10 min i zjazd o -0.65% -> ucinamy na małej stracie
                     trigger_exit = True
                     exit_reason = f"Fast Invalidation (Ucięcie straty: {gain_pct*100:+.2f}% w {int(time_in_pos/60)}m)"
                 elif time_in_pos >= 2700 and gain_pct < 0.004:
-                    # Stagnation: brak dynamiki po 45 minutach
                     trigger_exit = True
                     exit_reason = f"Stagnation Exit (45m bez impetu | {gain_pct*100:+.2f}%)"
 
-                # ------------------------------------------------------------------
-                # EGZEKUCJA WYJŚCIA Z CAŁOŚCI POZYCJI
-                # ------------------------------------------------------------------
+                # EGZEKUCJA WYJŚCIA
                 if trigger_exit:
                     base_c = get_base_coin(symbol)
                     bal_coin = get_coin_available_balance(base_c)
@@ -704,7 +701,7 @@ def bot_loop():
             with lock_pos:
                 current_items = list(active_positions.items())
 
-            if now - last_print >= 45:
+            if now - last_print >= 30:
                 total_eq, free_usdc = get_balances()
                 usdc_ok, usdc_stat = check_usdc_market_dependencies()
                 logging.info("--------------------------------------------------------------------------------")
