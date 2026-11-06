@@ -64,8 +64,8 @@ CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
 # --- KOSZYK 6 LIDERÓW ZMIENNOŚCI I PŁYNNOŚCI ---
-CAPITAL_PER_TRADE_PCT = 0.45         # 45% kapitału na pozycję (pozwala na 2 jednoczesne wejścia)[cite: 8]
-MAX_TOTAL_POSITIONS = 2              # Maksymalnie 2 otwarte pozycje naraz[cite: 8]
+CAPITAL_PER_TRADE_PCT = 0.45         # 45% kapitału na pozycję (pozwala na 2 jednoczesne wejścia)
+MAX_TOTAL_POSITIONS = 2              # Maksymalnie 2 otwarte pozycje naraz
 
 STABLE_PAIRS_BLACKLIST = [
     "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
@@ -73,7 +73,7 @@ STABLE_PAIRS_BLACKLIST = [
 ]
 
 def get_dynamic_top_coins():
-    return ["PEPEUSDC", "WIFUSDC", "BONKUSDC", "DOGEUSDC", "SUIUSDC", "SOLUSDC"][cite: 8]
+    return ["PEPEUSDC", "WIFUSDC", "BONKUSDC", "DOGEUSDC", "SUIUSDC", "SOLUSDC"]
 
 # --- LIMITY FINANSOWE I REZERWY ---
 STANDARD_MIN_ORDER_VALUE = 20.0
@@ -82,10 +82,10 @@ MIN_EXCHANGE_NOTIONAL = 5.0
 MIN_CASH_RESERVE_PCT = 0.02
 
 # --- BEZPIECZNIKI RYNKOWE ---
-USDC_MAX_SPREAD_PCT = 0.0010        
-USDC_1M_DUMP_THRESHOLD = -0.005     
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015
+USDC_MAX_SPREAD_PCT = 0.0080        # Max spread 0.80% (dostosowany do Bybit EU / MiCA)
+USDC_1M_DUMP_THRESHOLD = -0.005     # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012# Zrzut BTC 5M > -1.2% blokuje zakupy
+BTC_FLASH_CRASH_EXIT_PCT    = -0.015# Paniczny zrzut BTC 15M > -1.5%
 
 CURRENT_SENTIMENT = "NEUTRAL 🟡"
 
@@ -611,11 +611,9 @@ def run_bottom_sniper_strategy():
             is_green = c['close'] > c['open']
 
             # 1. FILTR ANTY-SZCZYTOWY: RSI ORAZ GÓRNY KNOT
-            # Zakaz kupowania gdy rynek jest wykupiony (RSI >= 65)
             rsi_val = c.get('rsi', 50.0)
             rsi_ok = rsi_val < 65.0
 
-            # Zakaz kupowania gdy świeca zostawia długi górny knot (odrzucenie przez podaż)
             candle_range = c['high'] - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
             wick_rejection = (upper_wick / candle_range > 0.28) if candle_range > 0 else False
@@ -640,9 +638,8 @@ def run_bottom_sniper_strategy():
             is_valid_dip = drop_from_peak >= 0.025
 
             lowest_recent_wick = df['low'].iloc[-8:-2].min() if len(df) >= 8 else c['low']
-            higher_than_bottom = c['low'] > lowest_recent_wick  # Dno zostało ustalone
+            higher_than_bottom = c['low'] > lowest_recent_wick
 
-            # Świeca zamknęła się PONAD EMA 9 i EMA 21
             reclaimed_momentum = (c['close'] > c['ema9']) and (c['close'] > c['ema21'])
             upward_close = c['close'] > p['close']
 
@@ -654,9 +651,8 @@ def run_bottom_sniper_strategy():
             )
 
             # ----------------------------------------------------------
-            # SYGNAŁ 2: PULLBACK RETEST W TRENDZIE (Kupujemy retest wsparcia, a NIE szczyt!)
+            # SYGNAŁ 2: PULLBACK RETEST W TRENDZIE (Kupujemy retest wsparcia)
             # ----------------------------------------------------------
-            # Kurs jest w trendzie powyżej EMA 50, cofnął się w strefę EMA 9 - EMA 21 i odbija zieloną świecą
             in_trend = (c['close'] > c['ema50']) and (c['ema21'] > c['ema50'])
             tested_support = (p['low'] <= p['ema21'] * 1.004) or (c['low'] <= c['ema21'] * 1.004)
             pullback_bounce = is_green and (c['close'] > c['ema9']) and (c['close'] > p['high'])
@@ -675,7 +671,6 @@ def run_bottom_sniper_strategy():
                 and (vol_ratio >= 1.40) and space_to_resistance and rsi_ok and not wick_rejection
             )
 
-            # Ostateczny filtr: odległość od EMA 9 nie większa niż 1.5% (zakaz wchodzenia na rozciągniętych świecach)
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
             not_overextended = dist_from_ema9 <= 0.015
 
@@ -857,19 +852,19 @@ def monitoring_worker():
 
                     # 1. Break-Even przy zysku >= +1.5%
                     if peak_pct >= 0.015:
-                        current_sl = max(current_sl, bp * 1.004)[cite: 12]
+                        current_sl = max(current_sl, bp * 1.004)
 
                     # 2. Agresywna blokada zysku z wystrzału (drabinka)
                     if peak_pct >= 0.020:
                         if peak_pct >= 0.050:
                             pullback_buffer = 0.010
-                            min_guaranteed_sl = bp * 1.035[cite: 12]
+                            min_guaranteed_sl = bp * 1.035
                         elif peak_pct >= 0.035:
                             pullback_buffer = 0.009
-                            min_guaranteed_sl = bp * 1.022[cite: 12]
+                            min_guaranteed_sl = bp * 1.022
                         else:
                             pullback_buffer = 0.008
-                            min_guaranteed_sl = bp * 1.010[cite: 12]
+                            min_guaranteed_sl = bp * 1.010
 
                         trail_from_peak = peak * (1.0 - pullback_buffer)
                         current_sl = max(current_sl, trail_from_peak, min_guaranteed_sl)
@@ -887,7 +882,7 @@ def monitoring_worker():
                         exit_reason = f"Profit Lock / Trailing Stop ({gain_pct*100:+.2f}%)"
                     elif time_in_pos >= 9000 and gain_pct < 0.008:
                         trigger_exit = True
-                        exit_reason = f"Stagnation Exit ({time_in_pos/3600:.1f}h bez ruchu | {gain_pct*100:+.2f}%)"[cite: 12]
+                        exit_reason = f"Stagnation Exit ({time_in_pos/3600:.1f}h bez ruchu | {gain_pct*100:+.2f}%)"
                     elif time_in_pos >= 3600 and gain_pct <= 0.005:
                         c1 = df_mon.iloc[-2]
                         c2 = df_mon.iloc[-3]
@@ -895,7 +890,7 @@ def monitoring_worker():
                                       c2['close'] < c2['ema21'] and c2['close'] < c2['ema50'])
                         if under_emas:
                             trigger_exit = True
-                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA 21/50 | {gain_pct*100:+.2f}%)"[cite: 12]
+                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA 21/50 | {gain_pct*100:+.2f}%)"
 
                     # 4. Egzekucja wyjścia
                     if trigger_exit:
