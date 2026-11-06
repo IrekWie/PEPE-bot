@@ -4,7 +4,6 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
-import math
 import os
 import socket
 import threading
@@ -14,22 +13,17 @@ from pybit.unified_trading import HTTP
 import requests
 
 # ==============================================================================
-# OCHRONA PRZED ZAWIESZENIEM POŁĄCZEŃ SIECIOWYCH
+# BEZPIECZEŃSTWO SIECI I SYNCHRONIZACJA CZASU BYBIT
 # ==============================================================================
 socket.setdefaulttimeout(15)
 
-# ==============================================================================
-# SYNCHRONIZACJA ZEGARA Z BYBIT (ZAPOBIEGA BŁĘDOWI 10002)
-# ==============================================================================
-time_offset_sec = 0.0
+server_time_offset_sec = 0.0
 
-def synced_time():
-    return (time.time_ns() / 1_000_000_000.0) + time_offset_sec
-
-time.time = synced_time
+def get_synced_timestamp_ms() -> int:
+    return int((time.time() + server_time_offset_sec) * 1000)
 
 def sync_bybit_clock():
-    global time_offset_sec
+    global server_time_offset_sec
     for url in ["https://api.bybit.eu/v5/market/time", "https://api.bybit.com/v5/market/time"]:
         try:
             r = requests.get(url, timeout=5)
@@ -37,59 +31,43 @@ def sync_bybit_clock():
                 data = r.json()
                 if data.get("retCode") == 0:
                     server_ms = int(data["result"]["timeNano"]) // 1_000_000
-                    local_ms = int(time.time_ns() / 1_000_000)
-                    time_offset_sec = (server_ms - local_ms) / 1000.0
-                    print(f"⏱️ Zsynchronizowano zegar z Bybit (Offset: {time_offset_sec*1000:+.1f} ms)", flush=True)
+                    local_ms = int(time.time() * 1000)
+                    server_time_offset_sec = (server_ms - local_ms) / 1000.0
+                    logging.info(f"⏱️ Zegar Bybit zsynchronizowany (Offset: {server_time_offset_sec*1000:+.1f} ms)")
                     return True
         except Exception:
             pass
     return False
 
-sync_bybit_clock()
-
 # ==============================================================================
-# KONFIGURACJA BOTA SPOT (RYNEK USDC)
+# KONFIGURACJA GŁÓWNA
 # ==============================================================================
-FALLBACK_KEY = "TUTAJ_TWÓJ_KEY"
-FALLBACK_SECRET = "TUTAJ_TWÓJ_SECRET"
-
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", FALLBACK_KEY).strip()
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", FALLBACK_SECRET).strip()
-
-print(f"🔑 DEBUG KEY: [{BYBIT_API_KEY[:5]}...] (Długość: {len(BYBIT_API_KEY)})", flush=True)
-print(f"🔑 DEBUG SEC: [{BYBIT_API_SECRET[:5]}...] (Długość: {len(BYBIT_API_SECRET)})", flush=True)
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "TUTAJ_TWÓJ_KEY").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "TUTAJ_TWÓJ_SECRET").strip()
 
 TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# --- KOSZYK 6 LIDERÓW ZMIENNOŚCI I PŁYNNOŚCI ---
-CAPITAL_PER_TRADE_PCT = 0.45         # 45% kapitału na pozycję (pozwala na 2 jednoczesne wejścia)
-MAX_TOTAL_POSITIONS = 2              # Maksymalnie 2 otwarte pozycje naraz
+# KOSZYK 6 LIDERÓW ZMIENNOŚCI
+TARGET_COINS = ["PEPEUSDC", "SOLUSDC", "DOGEUSDC", "WIFUSDC", "SUIUSDC", "BONKUSDC"]
 
-STABLE_PAIRS_BLACKLIST = [
-    "USDTUSDC", "USDCUSDT", "EURCUSDC", "USDTEUR", "EURCUSDT", 
-    "USDEUSDC", "DAIUSDC", "FDUSDUSDC", "TUSDUSDC", "USDT", "USDC"
-]
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (pozwala na 2 jednoczesne wejścia)
+MAX_TOTAL_POSITIONS = 2            # Maksymalnie 2 aktywne transakcje
+STANDARD_MIN_ORDER_VALUE = 15.0    # Minimalna wartość wejścia (USDC)
+MIN_EXCHANGE_NOTIONAL = 5.2        # Minimalna wartość zlecenia na Bybit (z zapasem)
 
-def get_dynamic_top_coins():
-    return ["PEPEUSDC", "WIFUSDC", "BONKUSDC", "DOGEUSDC", "SUIUSDC", "SOLUSDC"]
+# PARAMETRY OCHRONY KAPITAŁU (MINIMALIZACJA STRAT)
+MAX_INITIAL_STOP_LOSS_PCT = 0.012  # Sztywny max SL = 1.20% (cięcie ryzyka przy wejściu)
+FAST_INVALIDATION_PCT = -0.0065    # Szybkie cięcie fałszywego wybicia (-0.65% w pierwsze 10 min)
+BREAK_EVEN_TRIGGER_PCT = 0.014     # Próg aktywacji Break-Even (+1.40%)
+BREAK_EVEN_LOCK_PCT = 0.0035       # Poziom Break-Even (+0.35% ponad cenę wejścia na pokrycie opłat)
 
-# --- LIMITY FINANSOWE I REZERWY ---
-STANDARD_MIN_ORDER_VALUE = 20.0
-MIN_SYNC_POSITION_VALUE = 8.0     
-MIN_EXCHANGE_NOTIONAL = 5.0       
-MIN_CASH_RESERVE_PCT = 0.02
+# BEZPIECZNIKI RYNKOWE
+USDC_MAX_SPREAD_PCT = 0.0080
+BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012
 
-# --- BEZPIECZNIKI RYNKOWE ---
-USDC_MAX_SPREAD_PCT = 0.0080        # Max spread 0.80% (dostosowany do Bybit EU / MiCA)
-USDC_1M_DUMP_THRESHOLD = -0.005     # Szybki zrzut BTCUSDC 1M (-0.5%) blokuje zakupy
-BTC_FAST_DROP_BUY_BLOCK_PCT = -0.012# Zrzut BTC 5M > -1.2% blokuje zakupy
-BTC_FLASH_CRASH_EXIT_PCT    = -0.015# Paniczny zrzut BTC 15M > -1.5%
-
-CURRENT_SENTIMENT = "NEUTRAL 🟡"
-
-APP_URL = "https://bybit-bot-i1lw.onrender.com"
+APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 
@@ -99,8 +77,34 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-kline_cache_15m = {}
+# ==============================================================================
+# SESJA BYBIT I POMOCNIKI
+# ==============================================================================
+sync_bybit_clock()
+
+endpoints = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
+session = None
+for name, url in endpoints:
+    try:
+        s = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
+        s.endpoint = url
+        res = s.get_wallet_balance(accountType="UNIFIED")
+        if res.get("retCode") == 0:
+            session = s
+            logging.info(f"✅ POŁĄCZONO: {name}")
+            break
+    except Exception:
+        pass
+
+if not session:
+    session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
+    session.endpoint = "https://api.bybit.eu"
+
+lock_pos = threading.Lock()
+lock_history = threading.Lock()
 kline_cache_lock = threading.Lock()
+kline_cache_15m = {}
+instrument_filters = {}
 
 def safe_float(val, default=0.0):
     try:
@@ -110,29 +114,83 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def get_base_coin(symbol: str) -> str:
+    if symbol.endswith(QUOTE_COIN):
+        return symbol[:-len(QUOTE_COIN)]
+    return symbol
+
+def get_symbol_lot_filter(symbol):
+    if symbol in instrument_filters:
+        return instrument_filters[symbol]
+    try:
+        res = session.get_instruments_info(category=CATEGORY, symbol=symbol)
+        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
+            lot = res["result"]["list"][0].get("lotSizeFilter", {})
+            step = lot.get("basePrecision") or lot.get("qtyStep") or "0.000001"
+            min_q = lot.get("minOrderQty", "0.000001")
+            instrument_filters[symbol] = (step, min_q)
+            return instrument_filters[symbol]
+    except Exception as e:
+        logging.error(f"Błąd lot filter dla {symbol}: {e}")
+    return "0.0001", "0.0001"
+
+def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
+    try:
+        qty_dec = Decimal(str(raw_qty))
+        step_dec = Decimal(str(qty_step_str))
+        min_dec = Decimal(str(min_qty_str))
+        floored = (qty_dec // step_dec) * step_dec if step_dec > 0 else qty_dec
+        if floored < min_dec:
+            return None
+        norm = step_dec.normalize()
+        exp = norm.as_tuple().exponent
+        return f"{floored:.{abs(exp)}f}" if exp < 0 else f"{int(floored)}"
+    except Exception:
+        return None
+
 # ==============================================================================
-# MODUŁ HISTORII TRANSAKCJI
+# MODUŁ ZAPISU I HISTORII
 # ==============================================================================
+def load_positions():
+    if os.path.exists(POSITIONS_FILE):
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_positions(positions):
+    with lock_pos:
+        try:
+            with open(POSITIONS_FILE, "w") as f:
+                json.dump(positions, f, indent=4)
+        except Exception as e:
+            logging.error(f"Błąd zapisu pozycji: {e}")
+
+active_positions = load_positions()
+
 def load_trade_history():
     if os.path.exists(TRADE_HISTORY_FILE):
         try:
             with open(TRADE_HISTORY_FILE, "r") as f:
                 data = json.load(f)
-                if "trades_log" not in data: data["trades_log"] = []
+                if "trades_log" not in data:
+                    data["trades_log"] = []
                 return data
         except Exception:
             pass
     return {"total_realized_usd": 0.0, "total_trades": 0, "wins": 0, "losses": 0, "trades_log": [], "daily": {}}
 
 def save_trade_history(history):
-    try:
-        with open(TRADE_HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=4)
-    except Exception as e:
-        logging.error(f"Błąd zapisu historii: {e}")
+    with lock_history:
+        try:
+            with open(TRADE_HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=4)
+        except Exception as e:
+            logging.error(f"Błąd zapisu historii: {e}")
 
 trade_history = load_trade_history()
-lock_history = threading.Lock()
 
 def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_maker=False):
     global trade_history
@@ -150,19 +208,24 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
         trade_history["total_realized_usd"] = round(trade_history.get("total_realized_usd", 0.0) + pnl_usd, 2)
         trade_history["total_trades"] = trade_history.get("total_trades", 0) + 1
 
-        if pnl_usd >= 0: trade_history["wins"] = trade_history.get("wins", 0) + 1
-        else: trade_history["losses"] = trade_history.get("losses", 0) + 1
+        if pnl_usd >= 0:
+            trade_history["wins"] = trade_history.get("wins", 0) + 1
+        else:
+            trade_history["losses"] = trade_history.get("losses", 0) + 1
 
-        if "trades_log" not in trade_history: trade_history["trades_log"] = []
+        if "trades_log" not in trade_history:
+            trade_history["trades_log"] = []
         trade_history["trades_log"].append({
             "timestamp": now_ts, "symbol": symbol, "turnover": round((buy_price + sell_price) * qty, 2),
-            "fee": round(estimated_fee, 4), "gross_pnl": round(raw_pnl_usd, 2), "net_pnl": pnl_usd
+            "fee": round(estimated_fee, 4), "gross_pnl": round(raw_pnl_usd, 2), "net_pnl": pnl_usd,
+            "reason": reason
         })
 
-        if len(trade_history["trades_log"]) > 200:
-            trade_history["trades_log"] = trade_history["trades_log"][-200:]
+        if len(trade_history["trades_log"]) > 250:
+            trade_history["trades_log"] = trade_history["trades_log"][-250:]
 
-        if "daily" not in trade_history: trade_history["daily"] = {}
+        if "daily" not in trade_history:
+            trade_history["daily"] = {}
         if today_str not in trade_history["daily"]:
             trade_history["daily"][today_str] = {"pnl_usd": 0.0, "trades": 0, "wins": 0, "losses": 0, "total_fees": 0.0, "total_turnover": 0.0}
 
@@ -174,159 +237,24 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
 
         save_trade_history(trade_history)
         sign = "+" if pnl_usd >= 0 else ""
-        ord_type = "LIMIT (POST-ONLY)" if is_maker else "MARKET"
-        logging.info(f"📊 [BILANS ZAMKNIĘCIA ({ord_type})] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Fee: -{estimated_fee:.2f}$ | Powód: {reason}")
+        logging.info(f"📊 [BILANS TRANSAKCJI] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | Fee: -{estimated_fee:.2f}$ | {reason}")
 
 # ==============================================================================
-# MODUŁ GODZINOWEJ ANALIZY KOSZTÓW I PROWIZJI
+# POBIERANIE DANYCH RYNKOWYCH
 # ==============================================================================
-last_hourly_cost_report = 0.0
-
-def report_hourly_costs(total_equity):
-    global last_hourly_cost_report, trade_history
-    now_ts = time.time()
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    with lock_history:
-        trades_log = trade_history.get("trades_log", [])
-        recent_trades = [t for t in trades_log if t.get("timestamp", 0) >= now_ts - 3600]
-
-        h_trades_count = len(recent_trades)
-        h_turnover = sum(t.get("turnover", 0.0) for t in recent_trades)
-        h_fees = sum(t.get("fee", 0.0) for t in recent_trades)
-        h_gross = sum(t.get("gross_pnl", 0.0) for t in recent_trades)
-        h_net = sum(t.get("net_pnl", 0.0) for t in recent_trades)
-
-        today_stats = trade_history.get("daily", {}).get(today_str, {})
-        d_fees = today_stats.get("total_fees", 0.0)
-        d_turnover = today_stats.get("total_turnover", 0.0)
-        d_trades = today_stats.get("trades", 0)
-        avg_fee_per_trade = (d_fees / d_trades) if d_trades > 0 else 0.0
-        fee_drag_pct = ((d_fees / total_equity) * 100) if total_equity > 0 else 0.0
-
-    sign_gross = "+" if h_gross >= 0 else ""
-    sign_net = "+" if h_net >= 0 else ""
-
-    logging.info("================================================================================")
-    logging.info("💸 [GODZINNY RAPORT KOSZTÓW I PROWIZJI GIEŁDOWYCH]")
-    logging.info("--------------------------------------------------------------------------------")
-    logging.info(f"⏱️ Ostatnie 60 minut: Transakcje: {h_trades_count} | Obrót: {h_turnover:.2f}$ | Fee Bybit: -{h_fees:.2f}$ | Netto: {sign_net}{h_net:.2f}$")
-    logging.info(f"📅 Dzisiaj (od 00:00 UTC): Prowizje: -{d_fees:.2f}$ ({fee_drag_pct:.2f}% konta) | Obrót: {d_turnover:.2f}$ | Śr. prowizja: -{avg_fee_per_trade:.2f}$")
-    logging.info("================================================================================")
-
-    last_hourly_cost_report = now_ts
-
-# ==============================================================================
-# MODUŁ ZALEŻNOŚCI I PŁYNNOŚCI RYNKU USDC
-# ==============================================================================
-def check_usdc_market_dependencies():
+def get_all_spot_tickers():
     try:
-        res = session.get_tickers(category=CATEGORY, symbol="BTCUSDC")
+        res = session.get_tickers(category=CATEGORY)
         if res.get("retCode") == 0:
-            ticker_list = res.get("result", {}).get("list", [])
-            if ticker_list:
-                t = ticker_list[0]
-                bid = safe_float(t.get("bid1Price"))
-                ask = safe_float(t.get("ask1Price"))
-                if bid > 0 and ask > 0:
-                    spread_pct = (ask - bid) / bid
-                    if spread_pct > USDC_MAX_SPREAD_PCT:
-                        logging.warning(f"⚠️ [USDC SPREAD GUARD] Zbyt szeroki spread na BTCUSDC ({spread_pct*100:.3f}%).")
-                        return False, f"WIDE_SPREAD_{spread_pct*100:.2f}%"
-
-        df_usdc_1m = get_market_data_no_cache("BTCUSDC", interval="1", limit=3)
-        if df_usdc_1m is not None and len(df_usdc_1m) >= 2:
-            c1m = df_usdc_1m.iloc[-1]
-            chg_1m = (c1m['close'] - c1m['open']) / c1m['open']
-            if chg_1m <= USDC_1M_DUMP_THRESHOLD:
-                logging.warning(f"⚠️ [USDC MICRO-DUMP GUARD] Nagły spadek BTCUSDC 1M ({chg_1m*100:.2f}%).")
-                return False, f"USDC_DUMP_{chg_1m*100:.2f}%"
-
-        try:
-            r = requests.get("https://api.bybit.com/v5/market/tickers?category=spot&symbol=USDCUSDT", timeout=2)
-            if r.status_code == 200:
-                d = r.json()
-                t_list = d.get("result", {}).get("list", [])
-                if t_list:
-                    peg_price = safe_float(t_list[0].get("lastPrice"), 1.0)
-                    if abs(peg_price - 1.0) >= 0.003:
-                        logging.warning(f"⚠️ [GLOBAL USDC PEG ALERT] Odchylenie kursu USDC: {peg_price:.4f}!")
-                        return False, f"GLOBAL_DEPEG_{peg_price:.4f}"
-        except Exception:
-            pass
-
-        return True, "USDC_HEALTHY"
+            items = res.get("result", {}).get("list", [])
+            return {item["symbol"]: item for item in items}
     except Exception as e:
-        logging.warning(f"Błąd analizy zależności USDC: {e}")
-        return True, "BYPASS"
-
-# ==============================================================================
-# INICJALIZACJA SESJI BYBIT
-# ==============================================================================
-endpoints = [("EU Region / MiCA", "https://api.bybit.eu"), ("Global Mainnet", "https://api.bybit.com")]
-session = None
-for name, url in endpoints:
-    try:
-        s = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
-        s.endpoint = url
-        res = s.get_wallet_balance(accountType="UNIFIED")
-        if res.get("retCode") == 0:
-            session = s
-            print(f"✅ POŁĄCZONO: {name}", flush=True)
-            break
-    except Exception:
-        pass
-
-if not session:
-    session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
-    session.endpoint = "https://api.bybit.eu"
-
-instrument_filters = {}
-def get_symbol_lot_filter(symbol):
-    if symbol in instrument_filters: return instrument_filters[symbol]
-    try:
-        res = session.get_instruments_info(category=CATEGORY, symbol=symbol)
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            lot = res["result"]["list"][0].get("lotSizeFilter", {})
-            step = lot.get("basePrecision") or lot.get("qtyStep") or "0.000001"
-            instrument_filters[symbol] = (step, lot.get("minOrderQty", "0.000001"))
-            return instrument_filters[symbol]
-    except Exception:
-        pass
-    return "0.0001", "0.0001"
-
-def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
-    try:
-        qty_dec = Decimal(str(raw_qty))
-        step_dec = Decimal(str(qty_step_str))
-        min_dec = Decimal(str(min_qty_str))
-        floored = (qty_dec // step_dec) * step_dec if step_dec > 0 else qty_dec
-        if floored < min_dec and floored <= 0: return None
-        norm = step_dec.normalize()
-        exp = norm.as_tuple().exponent
-        return f"{floored:.{abs(exp)}f}" if exp < 0 else f"{int(floored)}"
-    except Exception:
-        return str(raw_qty)
-
-active_positions = {}
-lock_pos = threading.Lock()
-
-def load_positions():
-    if os.path.exists(POSITIONS_FILE):
-        try:
-            with open(POSITIONS_FILE, "r") as f: return json.load(f)
-        except Exception: pass
+        logging.warning(f"Błąd pobierania tickerów: {e}")
     return {}
 
-def save_positions(positions):
-    try:
-        with open(POSITIONS_FILE, "w") as f: json.dump(positions, f, indent=4)
-    except Exception as e: logging.error(f"Błąd zapisu pozycji: {e}")
-
-active_positions = load_positions()
-
 def get_balances():
-    if not session: return 0.0, 0.0
+    if not session:
+        return 0.0, 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED")
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -344,249 +272,182 @@ def get_balances():
     return 0.0, 0.0
 
 def get_coin_available_balance(coin_name):
-    if not session: return 0.0
+    if not session:
+        return 0.0
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin_name)
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             for c in res["result"]["list"][0].get("coin", []):
                 if c.get("coin") == coin_name:
                     return max(safe_float(c.get("walletBalance")), safe_float(c.get("availableToWithdraw")))
-    except Exception: pass
+    except Exception:
+        pass
     return 0.0
 
-# ==============================================================================
-# DWUKIERUNKOWA SYNCHRONIZACJA PORTFELA Z BYBIT
-# ==============================================================================
-def sync_positions_from_bybit():
-    global active_positions
-    if not session: return
-    try:
-        allowed_symbols = get_dynamic_top_coins()
-        with lock_pos:
-            res = session.get_wallet_balance(accountType="UNIFIED")
-            if res.get("retCode") != 0 or not res.get("result", {}).get("list"): return
-            
-            real_holdings = {}
-            for coin_info in res["result"]["list"][0].get("coin", []):
-                coin = coin_info.get("coin")
-                if coin in ["USDC", "USDT", "EURC", "USD", "EUR", "PLN", "GBP", "TRY", "UAH", "RUB"]: 
-                    continue
-                bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
-                if bal > 0:
-                    real_holdings[f"{coin}USDC"] = bal
-
-            # Usuwanie pozycji nieistniejących lub o wartości śmieciowej (< 8$)
-            to_remove = []
-            for sym, pos in list(active_positions.items()):
-                if sym not in allowed_symbols:
-                    to_remove.append((sym, "niedozwolony symbol"))
-                    continue
-                
-                bal = real_holdings.get(sym, 0.0)
-                df = get_market_data_no_cache(sym, interval="15", limit=2)
-                cp = df.iloc[-1]['close'] if (df is not None and len(df) > 0) else pos.get("buy_price", 1.0)
-                val_usd = bal * cp
-                
-                if bal <= 0 or val_usd < MIN_SYNC_POSITION_VALUE:
-                    to_remove.append((sym, f"brak na koncie Bybit lub resztki ({val_usd:.2f}$ < {MIN_SYNC_POSITION_VALUE:.0f}$)"))
-
-            for sym, reason in to_remove:
-                if sym in active_positions:
-                    del active_positions[sym]
-                    logging.info(f"🧹 [SYNC] Usunięto {sym} z monitora ({reason}).")
-
-            # Przejmowanie realnych pozycji istniejących na Bybit (>= 8$)
-            for sym, bal in real_holdings.items():
-                if sym not in allowed_symbols: 
-                    continue
-
-                if sym not in active_positions:
-                    df = get_market_data_no_cache(sym, interval="15", limit=30)
-                    if df is not None and len(df) > 0:
-                        cp = df.iloc[-1]['close']
-                        val_usd = bal * cp
-                        if val_usd >= MIN_SYNC_POSITION_VALUE:
-                            buy_p = cp
-                            buy_time = time.time()
-                            try:
-                                ex = session.get_executions(category=CATEGORY, symbol=sym, limit=5)
-                                if ex.get("retCode") == 0:
-                                    buys = [e for e in ex.get("result", {}).get("list", []) if e.get("side") == "Buy"]
-                                    if buys:
-                                        buy_p = safe_float(buys[0].get("execPrice"), cp)
-                                        exec_ts = safe_float(buys[0].get("execTime"))
-                                        if exec_ts > 0:
-                                            buy_time = exec_ts / 1000.0
-                            except Exception: pass
-
-                            step, minq = get_symbol_lot_filter(sym)
-                            q_str = format_qty_with_step(bal, step, minq)
-                            if q_str:
-                                recent_low = df['low'].iloc[-4:-1].min() if len(df) >= 4 else buy_p * 0.98
-                                initial_sl = recent_low * 0.980
-                                recent_peak = max(cp, buy_p)
-                                if len(df) >= 8:
-                                    recent_peak = max(recent_peak, df['high'].iloc[-8:].max())
-                                
-                                active_positions[sym] = {
-                                    "strategy": "BOTTOM_SNIPER",
-                                    "buy_price": buy_p,
-                                    "peak_price": recent_peak,
-                                    "qty": q_str,
-                                    "sold_half": False,
-                                    "trailing_sl": initial_sl,
-                                    "entry_time": buy_time
-                                }
-                                is_micro = ("PEPE" in sym or "BONK" in sym)
-                                sl_log = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-                                logging.info(f"🎯 [SYNC] Przejęto {sym} ({val_usd:.2f}$) | SL: {sl_log}")
-            save_positions(active_positions)
-    except Exception as e:
-        logging.error(f"Błąd synchronizacji: {e}")
-
-# ==============================================================================
-# POBIERANIE ŚWIEC I WSKAŹNIKÓW (15M)
-# ==============================================================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     return 100 - (100 / (1 + (gain / loss)))
 
-def get_market_data_no_cache(symbol, interval="15", limit=350):
+def get_market_data_no_cache(symbol, interval="15", limit=200):
     try:
         res = session.get_kline(category=CATEGORY, symbol=symbol, interval=interval, limit=limit)
         candles = res.get("result", {}).get("list", [])
-        if not candles: return None
+        if not candles:
+            return None
         df = pd.DataFrame(candles, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
         df = df.iloc[::-1].reset_index(drop=True)
-        for col in ["open", "high", "low", "close", "volume"]: df[col] = df[col].astype(float)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
         
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-        df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
         df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
         df['rsi'] = calculate_rsi(df['close'], period=14)
         df['vol_ma20'] = df['volume'].rolling(window=20).mean()
-        df['bb_mid'] = df['close'].rolling(window=20).mean()
-        df['bb_std'] = df['close'].rolling(window=20).std()
-        df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
-        
-        df['tr0'] = abs(df['high'] - df['low'])
-        df['tr1'] = abs(df['high'] - df['close'].shift())
-        df['tr2'] = abs(df['low'] - df['close'].shift())
-        df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
-        df['atr'] = df['tr'].rolling(14).mean()
         
         return df
     except Exception:
         return None
 
 def fetch_data_worker(symbol):
-    return symbol, get_market_data_no_cache(symbol, interval="15", limit=350)
-
-def get_market_data(symbol, interval="15", limit=350):
-    global kline_cache_15m
-    with kline_cache_lock:
-        if interval == "15" and symbol in kline_cache_15m:
-            return kline_cache_15m[symbol]
-    
-    df = get_market_data_no_cache(symbol, interval, limit)
-    if interval == "15" and df is not None:
-        with kline_cache_lock:
-            kline_cache_15m[symbol] = df
-    return df
+    return symbol, get_market_data_no_cache(symbol, interval="15", limit=200)
 
 # ==============================================================================
-# FILTRY MAKROEKONOMICZNE BTC + ETH
+# FILTRY BEZPIECZEŃSTWA (BTC & USDC)
 # ==============================================================================
-def update_market_sentiment():
-    global CURRENT_SENTIMENT
+def check_usdc_market_dependencies():
     try:
-        df_btc = get_market_data("BTCUSDC", interval="240", limit=100)
-        df_eth = get_market_data("ETHUSDC", interval="240", limit=100)
+        res = session.get_tickers(category=CATEGORY, symbol="BTCUSDC")
+        if res.get("retCode") == 0:
+            ticker_list = res.get("result", {}).get("list", [])
+            if ticker_list:
+                t = ticker_list[0]
+                bid = safe_float(t.get("bid1Price"))
+                ask = safe_float(t.get("ask1Price"))
+                if bid > 0 and ask > 0:
+                    spread_pct = (ask - bid) / bid
+                    if spread_pct > USDC_MAX_SPREAD_PCT:
+                        return False, f"WIDE_SPREAD_{spread_pct*100:.2f}%"
 
-        if df_btc is None or len(df_btc) < 50:
-            return "NEUTRAL"
+        df_usdc_1m = get_market_data_no_cache("BTCUSDC", interval="1", limit=3)
+        if df_usdc_1m is not None and len(df_usdc_1m) >= 2:
+            c1m = df_usdc_1m.iloc[-1]
+            chg_1m = (c1m['close'] - c1m['open']) / c1m['open']
+            if chg_1m <= -0.005:
+                return False, f"USDC_DUMP_{chg_1m*100:.2f}%"
 
-        btc_candle = df_btc.iloc[-1]
-        btc_close = btc_candle['close']
-        btc_ema21 = btc_candle['ema21']
-        btc_ema50 = btc_candle['ema50']
-
-        if btc_close > btc_ema50 and btc_ema21 > btc_ema50: btc_sentiment = "BULLISH 🟢"
-        elif btc_close < btc_ema50 or btc_ema21 < btc_ema50: btc_sentiment = "BEARISH 🔴"
-        else: btc_sentiment = "NEUTRAL 🟡"
-
-        eth_sentiment = "NEUTRAL"
-        if df_eth is not None and len(df_eth) >= 50:
-            eth_candle = df_eth.iloc[-1]
-            if eth_candle['close'] > eth_candle['ema50'] and eth_candle['ema21'] > eth_candle['ema50']: eth_sentiment = "BULLISH 🟢"
-            else: eth_sentiment = "BEARISH 🔴"
-
-        logging.info(f"📊 [MAKRO TREND 4H] BTC: {btc_sentiment} | ETH: {eth_sentiment}")
-        CURRENT_SENTIMENT = btc_sentiment
-        return btc_sentiment
-    except Exception as e:
-        logging.error(f"Błąd sentymentu: {e}")
-        return "UNKNOWN"
+        return True, "USDC_OK"
+    except Exception:
+        return True, "BYPASS"
 
 def is_btc_market_healthy():
     try:
-        df_btc = get_market_data_no_cache("BTCUSDC", interval="5", limit=6)
-        if df_btc is not None and len(df_btc) >= 4:
+        df_btc = get_market_data_no_cache("BTCUSDC", interval="5", limit=5)
+        if df_btc is not None and len(df_btc) >= 3:
             c = df_btc.iloc[-1]
             candle_change = (c['close'] - c['open']) / c['open']
-            recent_high = df_btc['high'].iloc[-3:].max()
-            drop_from_high = (c['close'] - recent_high) / recent_high
-            if candle_change <= BTC_FAST_DROP_BUY_BLOCK_PCT or drop_from_high <= BTC_FAST_DROP_BUY_BLOCK_PCT:
+            if candle_change <= BTC_FAST_DROP_BUY_BLOCK_PCT:
                 logging.warning(f"⚠️ [BTC GUARD] Tąpnięcie 5M na BTC: {candle_change*100:.2f}%. Wstrzymuję zakupy.")
-                return False
-
-        df_btc_15 = get_market_data_no_cache("BTCUSDC", interval="15", limit=3)
-        if df_btc_15 is not None and len(df_btc_15) > 1:
-            c15 = df_btc_15.iloc[-1]
-            chg15 = (c15['close'] - c15['open']) / c15['open']
-            if chg15 <= -0.006:
-                logging.warning(f"⚠️ [BTC 15M GUARD] Silny spadek BTC 15M ({chg15*100:.2f}%). Zakaz zakupów!")
                 return False
     except Exception:
         pass
     return True
 
 # ==============================================================================
-# STRATEGIA ZAKUPU NA PULLBACKU / ODBICIU (ZAKAZ KUPOWANIA SZCZYTÓW I FOMO)
+# SYNCHRONIZACJA PORTFELA
 # ==============================================================================
-def run_bottom_sniper_strategy():
-    target_coins = get_dynamic_top_coins()
-    global active_positions, kline_cache_15m, trade_history
+def sync_positions_from_bybit():
+    global active_positions
+    if not session:
+        return
+    try:
+        with lock_pos:
+            res = session.get_wallet_balance(accountType="UNIFIED")
+            if res.get("retCode") != 0 or not res.get("result", {}).get("list"):
+                return
+            
+            real_holdings = {}
+            for coin_info in res["result"]["list"][0].get("coin", []):
+                coin = coin_info.get("coin")
+                if coin in ["USDC", "USDT", "EURC", "USD", "EUR"]:
+                    continue
+                bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
+                if bal > 0:
+                    real_holdings[f"{coin}USDC"] = bal
+
+            to_remove = []
+            for sym, pos in list(active_positions.items()):
+                if sym not in TARGET_COINS:
+                    to_remove.append((sym, "symbol spoza listy 6 par"))
+                    continue
+                bal = real_holdings.get(sym, 0.0)
+                if bal <= 0:
+                    to_remove.append((sym, "brak salda na koncie Bybit"))
+
+            for sym, reason in to_remove:
+                if sym in active_positions:
+                    del active_positions[sym]
+                    logging.info(f"🧹 [SYNC] Usunięto {sym} ({reason}).")
+
+            # Przejęcie pozycji z Bybit jeśli nie są w słowniku
+            for sym, bal in real_holdings.items():
+                if sym in TARGET_COINS and sym not in active_positions:
+                    tickers = get_all_spot_tickers()
+                    curr_p = safe_float(tickers.get(sym, {}).get("lastPrice"), 0.0)
+                    if (bal * curr_p) >= MIN_EXCHANGE_NOTIONAL:
+                        step, minq = get_symbol_lot_filter(sym)
+                        q_str = format_qty_with_step(bal, step, minq)
+                        if q_str:
+                            initial_sl = curr_p * (1.0 - MAX_INITIAL_STOP_LOSS_PCT)
+                            active_positions[sym] = {
+                                "strategy": "SYNCED",
+                                "buy_price": curr_p,
+                                "peak_price": curr_p,
+                                "qty": q_str,
+                                "initial_qty": q_str,
+                                "tp1_executed": False,
+                                "trailing_sl": initial_sl,
+                                "entry_time": time.time()
+                            }
+                            logging.info(f"🎯 [SYNC] Zaimportowano pozycję {sym} | Ilość: {q_str} | SL: {initial_sl:.6f}")
+            save_positions(active_positions)
+    except Exception as e:
+        logging.error(f"Błąd synchronizacji Bybit: {e}")
+
+# ==============================================================================
+# STRATEGIA ZAKUPÓW: BREAKOUT & PULLBACK SNIPER
+# ==============================================================================
+def run_sniper_strategy():
+    global active_positions, kline_cache_15m
     total_equity, free_usdc = get_balances()
     target_allocation = total_equity * CAPITAL_PER_TRADE_PCT
     now_ts = time.time()
 
+    with lock_pos:
+        current_count = len(active_positions)
+    if current_count >= MAX_TOTAL_POSITIONS:
+        return
+
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in target_coins}
+        futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in TARGET_COINS}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
             if df is not None:
                 results[sym] = df
-                with kline_cache_lock: kline_cache_15m[sym] = df
-
-    with lock_pos: 
-        current_items = list(active_positions.items())
-        current_count = len(current_items)
 
     best_candidate = None
 
-    for symbol in target_coins:
-        with lock_pos: 
-            if symbol in active_positions: 
+    for symbol in TARGET_COINS:
+        with lock_pos:
+            if symbol in active_positions:
                 continue
 
         df = results.get(symbol)
-        if df is None or len(df) < 60:
+        if df is None or len(df) < 50:
             continue
 
         try:
@@ -594,461 +455,303 @@ def run_bottom_sniper_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # 0. Inteligentny Cooldown po stracie (45 minut po SL, 5 minut po TP)
+            # Cooldown po stracie (30 min po SL)
             cooldown_ok = True
             with lock_history:
-                trades_log = trade_history.get("trades_log", [])
-                for t in reversed(trades_log):
+                for t in reversed(trade_history.get("trades_log", [])):
                     if t.get("symbol") == symbol:
-                        time_since = now_ts - t.get("timestamp", 0)
-                        if t.get("net_pnl", 0) < 0 and time_since < 2700:
-                            cooldown_ok = False
-                        elif time_since < 300:
+                        if t.get("net_pnl", 0) < 0 and (now_ts - t.get("timestamp", 0)) < 1800:
                             cooldown_ok = False
                         break
+            if not cooldown_ok:
+                continue
 
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             is_green = c['close'] > c['open']
-
-            # 1. FILTR ANTY-SZCZYTOWY: RSI ORAZ GÓRNY KNOT
             rsi_val = c.get('rsi', 50.0)
-            rsi_ok = rsi_val < 65.0
 
+            # Filtr anty-szczytowy: odrzucenie świec z długim górnym knotem
             candle_range = c['high'] - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
             wick_rejection = (upper_wick / candle_range > 0.28) if candle_range > 0 else False
 
-            # Sprawdzenie przestrzeni do oporu EMA 200 (musi być min. 1.5% miejsca na ruch)
-            space_to_resistance = True
-            if c['close'] < c['ema200']:
-                dist_to_ema200 = (c['ema200'] - c['close']) / c['close']
-                if dist_to_ema200 < 0.015:
-                    space_to_resistance = False
+            if rsi_val >= 68.0 or wick_rejection or not is_green:
+                continue
 
-            # Blokada sieczki (Chop Filter)
-            ema_spread = abs(c['ema21'] - c['ema50']) / c['ema50']
-            is_flat_chop = ema_spread < 0.0035
+            # SYGNAŁ 1: Odbicie po zrzucie (Reclaim EMA9 & EMA21)
+            reclaimed_emas = (c['close'] > c['ema9']) and (c['close'] > c['ema21']) and (p['close'] <= p['ema21'])
+            is_rebound = reclaimed_emas and (vol_ratio >= 1.15)
 
-            # ----------------------------------------------------------
-            # SYGNAŁ 1: ODBICIE Z DNA PO ZRZUCIE (RECLAIM EMA 9 & EMA 21)
-            # ----------------------------------------------------------
-            lookback_peak = min(len(df) - 3, 96)
-            local_peak = df['high'].iloc[-lookback_peak:-2].max()
-            drop_from_peak = (local_peak - c['close']) / local_peak if local_peak > 0 else 0.0
-            is_valid_dip = drop_from_peak >= 0.025
-
-            lowest_recent_wick = df['low'].iloc[-8:-2].min() if len(df) >= 8 else c['low']
-            higher_than_bottom = c['low'] > lowest_recent_wick
-
-            reclaimed_momentum = (c['close'] > c['ema9']) and (c['close'] > c['ema21'])
-            upward_close = c['close'] > p['close']
-
-            is_dip_bounce_entry = (
-                is_valid_dip and higher_than_bottom and reclaimed_momentum 
-                and upward_close and is_green and (vol_ratio >= 1.15) 
-                and space_to_resistance and not is_flat_chop 
-                and rsi_ok and not wick_rejection
-            )
-
-            # ----------------------------------------------------------
-            # SYGNAŁ 2: PULLBACK RETEST W TRENDZIE (Kupujemy retest wsparcia)
-            # ----------------------------------------------------------
+            # SYGNAŁ 2: Wybicie w trendzie (Pullback Retest)
             in_trend = (c['close'] > c['ema50']) and (c['ema21'] > c['ema50'])
-            tested_support = (p['low'] <= p['ema21'] * 1.004) or (c['low'] <= c['ema21'] * 1.004)
-            pullback_bounce = is_green and (c['close'] > c['ema9']) and (c['close'] > p['high'])
-            
-            is_pullback_entry = (
-                in_trend and tested_support and pullback_bounce 
-                and (vol_ratio >= 1.15) and rsi_ok and not wick_rejection 
-                and not is_flat_chop and space_to_resistance
-            )
+            tested_ema21 = (p['low'] <= p['ema21'] * 1.003) or (c['low'] <= c['ema21'] * 1.003)
+            bounce_trend = in_trend and tested_ema21 and (c['close'] > p['high']) and (vol_ratio >= 1.15)
 
-            # ----------------------------------------------------------
-            # SYGNAŁ 3: V-SHAPE REVERSAL (Potężne objęcie dna)
-            # ----------------------------------------------------------
-            is_v_shape = (
-                is_green and (c['close'] > p['high']) and (c['close'] > c['ema21']) 
-                and (vol_ratio >= 1.40) and space_to_resistance and rsi_ok and not wick_rejection
-            )
+            # SYGNAŁ 3: V-Shape Reversal (potężne objęcie)
+            is_v_shape = (c['close'] > p['high']) and (c['close'] > c['ema21']) and (vol_ratio >= 1.45)
 
-            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
-            not_overextended = dist_from_ema9 <= 0.015
+            live_green = c_now['close'] >= c_now['open']
 
-            live_candle_green = c_now['close'] > c_now['open']
-
-            should_buy = (is_dip_bounce_entry or is_pullback_entry or is_v_shape) and not_overextended and cooldown_ok and live_candle_green
-
-            if should_buy:
-                mode_tag = "V-SHAPE REVERSAL" if is_v_shape else ("PULLBACK RETEST (WSPARCIE)" if is_pullback_entry else "ODBICIE Z DNA (RECLAIM)")
-                candidate_score = vol_ratio * (1.5 if is_v_shape else 1.0)
-                if best_candidate is None or candidate_score > best_candidate['score']:
-                    best_candidate = {
-                        "symbol": symbol,
-                        "mode_tag": mode_tag,
-                        "df": df,
-                        "score": candidate_score,
-                        "vol_ratio": vol_ratio,
-                        "is_v_shape": is_v_shape
-                    }
+            if (is_rebound or bounce_trend or is_v_shape) and live_green:
+                score = vol_ratio * (1.4 if is_v_shape else 1.0)
+                tag = "V-SHAPE" if is_v_shape else ("RETEST_TREND" if bounce_trend else "REBOUND")
+                if best_candidate is None or score > best_candidate['score']:
+                    best_candidate = {"symbol": symbol, "score": score, "tag": tag, "df": df}
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
-    if best_candidate is None:
+    if not best_candidate:
         return
 
-    cand_sym = best_candidate["symbol"]
-    cand_mode = best_candidate["mode_tag"]
-    cand_df = best_candidate["df"]
+    sym = best_candidate["symbol"]
+    tag = best_candidate["tag"]
+    df_c = best_candidate["df"]
 
-    # PRZYPADEK A: Wolne sloty w portfelu
-    if current_count < MAX_TOTAL_POSITIONS:
-        if free_usdc < (target_allocation * 0.99):
-            logging.warning(f"⏳ [{cand_sym}] Sygnał {cand_mode}, brak wolnego USDC ({free_usdc:.2f}$ < {target_allocation:.2f}$).")
-            return
+    if free_usdc < (target_allocation * 0.98):
+        return
 
-        c_now = cand_df.iloc[-1]
-        c = cand_df.iloc[-2]
-        p = cand_df.iloc[-3]
-        swing_low = min(c['low'], p['low'], c_now['low'])
-        initial_sl = swing_low * 0.980
+    c_now = df_c.iloc[-1]
+    curr_price = c_now['close']
 
-        res = session.place_order(category=CATEGORY, symbol=cand_sym, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
-        if res.get("retCode") == 0:
-            curr_price = cand_df.iloc[-1]['close']
-            step, minq = get_symbol_lot_filter(cand_sym)
-            q_str = format_qty_with_step(target_allocation / curr_price, step, minq)
+    # CIASNY INITIAL STOP LOSS: pod dołkiem świecy, ale nie więcej niż 1.20%
+    recent_low = min(df_c['low'].iloc[-3:].min(), c_now['low'])
+    calculated_sl = recent_low * 0.997
+    hard_sl_cap = curr_price * (1.0 - MAX_INITIAL_STOP_LOSS_PCT)
+    initial_sl = max(calculated_sl, hard_sl_cap)
+
+    res = session.place_order(category=CATEGORY, symbol=sym, side="Buy", orderType="Market", qty=f"{target_allocation:.2f}")
+    if res.get("retCode") == 0:
+        step, minq = get_symbol_lot_filter(sym)
+        q_str = format_qty_with_step(target_allocation / curr_price, step, minq)
+        if q_str:
             with lock_pos:
-                active_positions[cand_sym] = {
-                    "strategy": "WAVE_SNIPER", 
-                    "buy_price": curr_price, 
-                    "peak_price": curr_price, 
-                    "qty": q_str or "1", 
+                active_positions[sym] = {
+                    "strategy": tag,
+                    "buy_price": curr_price,
+                    "peak_price": curr_price,
+                    "qty": q_str,
+                    "initial_qty": q_str,
+                    "tp1_executed": False,
                     "trailing_sl": initial_sl,
-                    "entry_type": cand_mode,
-                    "entry_time": now_ts
+                    "entry_time": time.time()
                 }
                 save_positions(active_positions)
-            is_micro = "PEPE" in cand_sym or "BONK" in cand_sym
-            sl_print = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-            logging.info(f"⚡🎯 [ZAKUP WYKONANY] {cand_sym} | Tryb: {cand_mode} | Cena: {curr_price} | SL: {sl_print}")
-        return
-
-    # PRZYPADEK B: Brak wolnych slotów -> ROTACJA KAPITAŁU
-    for def_sym, def_pos in current_items:
-        def_df = results.get(def_sym)
-        if def_df is None or len(def_df) < 20:
-            continue
-
-        def_curr = def_df.iloc[-1]['close']
-        def_bp = def_pos["buy_price"]
-        def_gain = (def_curr - def_bp) / def_bp
-        def_entry_time = def_pos.get("entry_time", now_ts)
-        def_time_in_pos = now_ts - def_entry_time
-
-        if def_gain >= 0.015:
-            continue
-
-        if def_time_in_pos < 1800:
-            continue
-
-        c_def = def_df.iloc[-2]
-        c_now_def = def_df.iloc[-1]
-        under_ema21 = (c_def['close'] < c_def['ema21']) and (c_now_def['close'] < c_now_def['ema21'])
-        is_stagnant = (def_time_in_pos >= 2700) and (def_gain < 0.004)
-        strong_challenger = (best_candidate["vol_ratio"] >= 1.25) or best_candidate["is_v_shape"]
-
-        if (under_ema21 or is_stagnant) and strong_challenger:
-            logging.info(f"🔄⚡ [ROTACJA KAPITAŁU] Ospały {def_sym} (PnL: {def_gain*100:+.2f}%, czas: {int(def_time_in_pos/60)}m) traci impet!")
-            logging.info(f"🚀 Odpala nowy lider: {cand_sym} ({cand_mode}, Wolumen: {best_candidate['vol_ratio']:.2f}x)! Przenoszę kapitał...")
-
-            rb = get_coin_available_balance(def_sym.replace(QUOTE_COIN, "").replace("USDT", ""))
-            sold_ok = False
-            if rb > 0:
-                st, mq = get_symbol_lot_filter(def_sym)
-                qs = format_qty_with_step(rb, st, mq)
-                if qs:
-                    res_s = session.place_order(category=CATEGORY, symbol=def_sym, side="Sell", orderType="Market", qty=qs)
-                    if res_s.get("retCode") == 0:
-                        sold_ok = True
-                        reason = f"Rotacja kapitału -> Skok na {cand_sym} ({def_gain*100:+.2f}%)"
-                        record_closed_trade(def_sym, "WAVE_SNIPER", def_bp, def_curr, safe_float(qs), reason, is_maker=False)
-                        with lock_pos:
-                            if def_sym in active_positions:
-                                del active_positions[def_sym]
-                                save_positions(active_positions)
-                        logging.info(f"💸 [ZAMKNIĘTO W ROTACJI] {def_sym} sprzedany po cenie {def_curr}!")
-
-            if sold_ok:
-                time.sleep(1.2)
-                _, free_usdc_now = get_balances()
-                total_eq_now, _ = get_balances()
-                alloc_now = total_eq_now * CAPITAL_PER_TRADE_PCT
-                alloc_buy = min(free_usdc_now * 0.99, alloc_now)
-
-                if alloc_buy >= STANDARD_MIN_ORDER_VALUE:
-                    c_now_c = cand_df.iloc[-1]
-                    c_c = cand_df.iloc[-2]
-                    p_c = cand_df.iloc[-3]
-                    swing_low_c = min(c_c['low'], p_c['low'], c_now_c['low'])
-                    initial_sl_c = swing_low_c * 0.980
-
-                    res_b = session.place_order(category=CATEGORY, symbol=cand_sym, side="Buy", orderType="Market", qty=f"{alloc_buy:.2f}")
-                    if res_b.get("retCode") == 0:
-                        curr_p_c = cand_df.iloc[-1]['close']
-                        step_c, minq_c = get_symbol_lot_filter(cand_sym)
-                        q_str_c = format_qty_with_step(alloc_buy / curr_p_c, step_c, minq_c)
-                        with lock_pos:
-                            active_positions[cand_sym] = {
-                                "strategy": "WAVE_SNIPER",
-                                "buy_price": curr_p_c,
-                                "peak_price": curr_p_c,
-                                "qty": q_str_c or "1",
-                                "trailing_sl": initial_sl_c,
-                                "entry_type": f"ROTACJA ({cand_mode})",
-                                "entry_time": time.time()
-                            }
-                            save_positions(active_positions)
-                        is_micro_c = "PEPE" in cand_sym or "BONK" in cand_sym
-                        sl_print_c = f"{initial_sl_c:.8f}" if is_micro_c else f"{initial_sl_c:.4f}"
-                        logging.info(f"🎉🚀 [ROTACJA ZAKOŃCZONA] Otwarto {cand_sym} za {alloc_buy:.2f}$ | SL: {sl_print_c}")
-            break
+            is_micro = ("PEPE" in sym or "BONK" in sym)
+            sl_fmt = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
+            logging.info(f"⚡🎯 [ZAKUP] {sym} ({tag}) | Cena: {curr_price} | Ilość: {q_str} | Ciasny SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
 
 # ==============================================================================
-# MONITORING Z ŻELAZNYM BREAK-EVEN I AGRESYWNYM PROFIT LOCKIEM
+# MONITORING W CZASIE RZECZYWISTYM (REAL-TIME TICKER LOOP)
+# REALIZACJA ZYSKÓW W ZALEŻNOŚCI OD WYBICIA + OCHRONA PRZED STRATĄ
 # ==============================================================================
 def monitoring_worker():
-    global active_positions, trade_history
+    global active_positions
     while True:
         try:
-            with lock_pos: items = list(active_positions.items())
+            with lock_pos:
+                items = list(active_positions.items())
             if not items:
-                time.sleep(3)
+                time.sleep(1.5)
                 continue
 
-            symbols_to_del = []
+            tickers = get_all_spot_tickers()
             now_ts = time.time()
+            to_delete = []
 
             for symbol, pos in items:
-                try:
-                    df_mon = get_market_data_no_cache(symbol, interval="15", limit=60)
-                    if df_mon is None or len(df_mon) < 20: 
-                        continue
+                ticker = tickers.get(symbol)
+                if not ticker:
+                    continue
 
-                    c_curr = df_mon.iloc[-1]['close']
-                    bp = pos["buy_price"]
-                    peak = max(pos.get("peak_price", bp), c_curr)
-                    entry_time = pos.get("entry_time", now_ts)
-                    time_in_pos = now_ts - entry_time
+                c_curr = safe_float(ticker.get("lastPrice"))
+                if c_curr <= 0:
+                    continue
 
-                    with lock_pos:
-                        if symbol in active_positions:
-                            active_positions[symbol]["peak_price"] = peak
-                            if "entry_time" not in active_positions[symbol]:
-                                active_positions[symbol]["entry_time"] = entry_time
+                bp = pos["buy_price"]
+                entry_time = pos.get("entry_time", now_ts)
+                time_in_pos = now_ts - entry_time
+                gain_pct = (c_curr - bp) / bp
 
-                    gain_pct = (c_curr - bp) / bp
-                    peak_pct = (peak - bp) / bp
-                    current_sl = pos.get("trailing_sl", bp * 0.980)
+                # 1. Śledzenie absolutnego szczytu w czasie rzeczywistym
+                peak = max(pos.get("peak_price", bp), c_curr)
+                pos["peak_price"] = peak
+                peak_pct = (peak - bp) / bp
 
-                    # 1. Break-Even przy zysku >= +1.5%
-                    if peak_pct >= 0.015:
-                        current_sl = max(current_sl, bp * 1.004)
+                current_sl = pos.get("trailing_sl", bp * (1.0 - MAX_INITIAL_STOP_LOSS_PCT))
 
-                    # 2. Agresywna blokada zysku z wystrzału (drabinka)
-                    if peak_pct >= 0.020:
-                        if peak_pct >= 0.050:
-                            pullback_buffer = 0.010
-                            min_guaranteed_sl = bp * 1.035
-                        elif peak_pct >= 0.035:
-                            pullback_buffer = 0.009
-                            min_guaranteed_sl = bp * 1.022
-                        else:
-                            pullback_buffer = 0.008
-                            min_guaranteed_sl = bp * 1.010
+                # ------------------------------------------------------------------
+                # A. REALIZACJA ZYSKÓW W ZALEŻNOŚCI OD STOPNIA WYBICIA
+                # ------------------------------------------------------------------
+                
+                # KROK 1: Wybicie wczesne (+1.4%): natychmiastowy Break-Even (Zero ryzyka straty)
+                if peak_pct >= BREAK_EVEN_TRIGGER_PCT:
+                    current_sl = max(current_sl, bp * (1.0 + BREAK_EVEN_LOCK_PCT))
 
-                        trail_from_peak = peak * (1.0 - pullback_buffer)
-                        current_sl = max(current_sl, trail_from_peak, min_guaranteed_sl)
+                # KROK 2: Wybicie TP1 (+2.8% do +3.2%): Sprzedaż 50% pozycji i lock zysku
+                if peak_pct >= 0.028 and not pos.get("tp1_executed", False):
+                    full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
+                    half_qty = full_qty / Decimal("2")
+                    step, minq = get_symbol_lot_filter(symbol)
+                    half_qty_str = format_qty_with_step(half_qty, step, minq)
 
-                    with lock_pos:
-                        if symbol in active_positions:
-                            active_positions[symbol]["trailing_sl"] = current_sl
+                    sold_half_success = False
+                    if half_qty_str and (safe_float(half_qty_str) * c_curr >= MIN_EXCHANGE_NOTIONAL):
+                        res_tp1 = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=half_qty_str)
+                        if res_tp1.get("retCode") == 0:
+                            sold_half_success = True
+                            remaining_qty = format_qty_with_step(full_qty - Decimal(half_qty_str), step, minq)
+                            pos["qty"] = remaining_qty or half_qty_str
+                            pos["tp1_executed"] = True
+                            record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(half_qty_str), "Częściowy TP1 (50% pozycji)", is_maker=False)
+                            logging.info(f"💎💰 [CZĘŚCIOWY TAKE PROFIT] {symbol} | Sprzedano 50% ({half_qty_str}) przy +{gain_pct*100:.2f}%! Pozycja zabezpieczona.")
 
-                    # 3. Warunki ewakuacji
-                    trigger_exit = False
-                    exit_reason = ""
+                    if not sold_half_success:
+                        # Jeśli wolumen za mały na podział, oznacz TP1 i mocno podciągnij SL
+                        pos["tp1_executed"] = True
+                    
+                    current_sl = max(current_sl, bp * 1.018)  # Gwarancja min. +1.8% na reszcie
 
-                    if c_curr <= current_sl:
-                        trigger_exit = True
-                        exit_reason = f"Profit Lock / Trailing Stop ({gain_pct*100:+.2f}%)"
-                    elif time_in_pos >= 9000 and gain_pct < 0.008:
-                        trigger_exit = True
-                        exit_reason = f"Stagnation Exit ({time_in_pos/3600:.1f}h bez ruchu | {gain_pct*100:+.2f}%)"
-                    elif time_in_pos >= 3600 and gain_pct <= 0.005:
-                        c1 = df_mon.iloc[-2]
-                        c2 = df_mon.iloc[-3]
-                        under_emas = (c1['close'] < c1['ema21'] and c1['close'] < c1['ema50'] and
-                                      c2['close'] < c2['ema21'] and c2['close'] < c2['ema50'])
-                        if under_emas:
-                            trigger_exit = True
-                            exit_reason = f"Breakdown Exit (Utrata pędu pod EMA 21/50 | {gain_pct*100:+.2f}%)"
+                # KROK 3: Wybicie średnie (+4.0% do +6.0%): Ciasny trailing 0.9% od szczytu
+                if peak_pct >= 0.040:
+                    trail_sl = peak * (1.0 - 0.009)
+                    current_sl = max(current_sl, trail_sl, bp * 1.025)
 
-                    # 4. Egzekucja wyjścia
-                    if trigger_exit:
-                        net_result = ((c_curr - bp) / bp) * 100
-                        rb = get_coin_available_balance(symbol.replace(QUOTE_COIN, "").replace("USDT", ""))
-                        val_rb = rb * c_curr
-                        if rb > 0 and val_rb >= MIN_EXCHANGE_NOTIONAL:
-                            st, mq = get_symbol_lot_filter(symbol)
-                            qs = format_qty_with_step(rb, st, mq)
-                            if qs:
-                                res_s = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=qs)
-                                if res_s.get("retCode") == 0:
-                                    record_closed_trade(symbol, "WAVE_SNIPER", bp, c_curr, safe_float(qs), exit_reason, is_maker=False)
-                                    symbols_to_del.append(symbol)
-                                    logging.info(f"💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {net_result:+.2f}% | Powód: {exit_reason}")
-                                else:
-                                    err_msg = res_s.get("retMsg", "")
-                                    logging.warning(f"⚠️ [BYBIT ORDER] {symbol}: {err_msg}. Usuwam z monitora.")
-                                    symbols_to_del.append(symbol)
+                # KROK 4: Paraboliczny wystrzał (> +6.5%): Agresywny trailing 1.2% od szczytu
+                if peak_pct >= 0.065:
+                    trail_sl = peak * (1.0 - 0.012)
+                    current_sl = max(current_sl, trail_sl, bp * 1.045)
+
+                # KROK 5: Ochrona przed cofnięciem z knota (Wick Rejection Guard)
+                # Jeśli szczyt był mocny (>= +2.2%), a cena oddała już 35% zysku ze szczytu -> natychmiastowe cięcie
+                wick_drop_exit = False
+                if peak_pct >= 0.022:
+                    retracement = (peak - c_curr) / (peak - bp) if (peak - bp) > 0 else 0.0
+                    if retracement >= 0.35:
+                        wick_drop_exit = True
+
+                pos["trailing_sl"] = current_sl
+
+                # ------------------------------------------------------------------
+                # B. MINIMALIZACJA STRAT: SZYBKIE CIĘCIE PRZED PEŁNYM SL
+                # ------------------------------------------------------------------
+                trigger_exit = False
+                exit_reason = ""
+
+                if c_curr <= current_sl:
+                    trigger_exit = True
+                    exit_reason = f"Trailing Stop / Profit Lock ({gain_pct*100:+.2f}%)"
+                elif wick_drop_exit:
+                    trigger_exit = True
+                    exit_reason = f"Wick Rejection Guard (Odrzucenie knota z poziomu {peak_pct*100:+.2f}%)"
+                elif time_in_pos >= 600 and gain_pct <= FAST_INVALIDATION_PCT:
+                    # Fast Invalidation: brak reakcji w 10 min i zjazd o -0.65% -> ucinamy na małej stracie
+                    trigger_exit = True
+                    exit_reason = f"Fast Invalidation (Ucięcie straty: {gain_pct*100:+.2f}% w {int(time_in_pos/60)}m)"
+                elif time_in_pos >= 2700 and gain_pct < 0.004:
+                    # Stagnation: brak dynamiki po 45 minutach
+                    trigger_exit = True
+                    exit_reason = f"Stagnation Exit (45m bez impetu | {gain_pct*100:+.2f}%)"
+
+                # ------------------------------------------------------------------
+                # EGZEKUCJA WYJŚCIA Z CAŁOŚCI POZYCJI
+                # ------------------------------------------------------------------
+                if trigger_exit:
+                    base_c = get_base_coin(symbol)
+                    bal_coin = get_coin_available_balance(base_c)
+                    val_usd = bal_coin * c_curr
+
+                    if bal_coin > 0 and val_usd >= MIN_EXCHANGE_NOTIONAL:
+                        step, minq = get_symbol_lot_filter(symbol)
+                        sell_q_str = format_qty_with_step(bal_coin, step, minq)
+                        if sell_q_str:
+                            res_sell = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=sell_q_str)
+                            if res_sell.get("retCode") == 0:
+                                record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(sell_q_str), exit_reason, is_maker=False)
+                                logging.info(f"🚨💰 [ZAMKNIĘTO POZYCJĘ] {symbol} | Wynik: {gain_pct*100:+.2f}% | Powód: {exit_reason}")
                             else:
-                                symbols_to_del.append(symbol)
-                        else:
-                            logging.info(f"ℹ️ [{symbol}] Pozycja już nie istnieje na koncie Bybit. Usuwam z monitora.")
-                            symbols_to_del.append(symbol)
-                except Exception as e:
-                    pass
+                                logging.warning(f"Błąd zlecenia sprzedaży {symbol}: {res_sell.get('retMsg')}")
+                    to_delete.append(symbol)
 
-            if symbols_to_del:
+            if to_delete:
                 with lock_pos:
-                    for s in symbols_to_del:
-                        if s in active_positions: del active_positions[s]
-                    save_positions(active_positions)
-        except Exception:
-            pass
-        time.sleep(3)
+                    for s in to_delete:
+                        if s in active_positions:
+                            del active_positions[s]
+                save_positions(active_positions)
 
-def auto_liquidate_stables_to_btc():
-    global active_positions
-    for coin, sym in [("USDT", "USDTUSDC"), ("EURC", "EURCUSDC")]:
-        try:
-            bal = get_coin_available_balance(coin)
-            if (bal * 1.0 >= MIN_EXCHANGE_NOTIONAL) or (sym in active_positions):
-                logging.info(f"🧹 [AUTO-WYMIANA] Wykryto {bal} {coin}. Wymieniam na USDC...")
-                step, mq = get_symbol_lot_filter(sym)
-                qs = format_qty_with_step(bal, step, mq)
-                sold_ok = True
-                if qs and safe_float(qs) > 0:
-                    r = session.place_order(category=CATEGORY, symbol=sym, side="Sell", orderType="Market", qty=qs)
-                    sold_ok = (r.get("retCode") == 0)
-
-                if sold_ok:
-                    with lock_pos:
-                        if sym in active_positions: 
-                            del active_positions[sym]
-                            save_positions(active_positions)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Błąd pętli monitoringu: {e}")
+        time.sleep(1.5)
 
 # ==============================================================================
-# PĘTLA GŁÓWNA SKANERA RYNKU (SKAN W TLE CO 10 SEKUND)
+# GŁÓWNA PĘTLA BOTA (SKANER CO 10 SEKUND)
 # ==============================================================================
 def bot_loop():
-    global last_hourly_cost_report, kline_cache_15m
     sync_positions_from_bybit()
-    auto_liquidate_stables_to_btc()
-    last_hourly_cost_report = time.time()
-    last_scan_print_time = 0
-
     t_mon = threading.Thread(target=monitoring_worker, daemon=True)
     t_mon.start()
 
+    last_print = 0
+    last_hourly_sync = time.time()
+
     while True:
         try:
-            with kline_cache_lock: kline_cache_15m.clear()
-            
-            now_ts = time.time()
-            if now_ts - last_scan_print_time >= 60:
-                logging.info("--------------------------------------------------------------------------------")
-                logging.info("🚀 NOWY CYKL SKANOWANIA RYNKU (Skan 6 par w tle co 10 sekund)...")
-                last_scan_print_time = now_ts
-
-            if now_ts - last_hourly_cost_report >= 3600:
+            now = time.time()
+            if now - last_hourly_sync >= 3600:
                 sync_bybit_clock()
-                total_equity, _ = get_balances()
-                report_hourly_costs(total_equity)
+                last_hourly_sync = now
 
-            if now_ts - last_scan_print_time <= 1:
-                update_market_sentiment()
+            with lock_pos:
+                current_items = list(active_positions.items())
 
-            total_equity, free_usdc = get_balances()
-            usdc_ok, usdc_stat = check_usdc_market_dependencies()
-
-            if now_ts - last_scan_print_time <= 1:
-                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                with lock_history:
-                    t_stats = trade_history.get("daily", {}).get(today_str, {"pnl_usd": 0.0, "trades": 0})
-                start_eq = safe_float(trade_history.get("equity_baseline", {}).get("starting_equity"), total_equity)
-                diff = total_equity - start_eq
-                logging.info(f"📈 [BILANS DNIA] Netto: {t_stats['pnl_usd']:+.2f}$ ({t_stats['trades']} trade) | Zmiana Bybit: {diff:+.2f}$")
-                
-                sync_positions_from_bybit()
-                auto_liquidate_stables_to_btc()
-
-                with lock_pos: current_items = list(active_positions.items())
-                logging.info(f"💰 [PORTFEL] Wartość: {total_equity:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS} | Płynność USDC: {usdc_stat}")
-                logging.info(f"=== [MONITOROWANIE POZYCJI: {len(current_items)} AKTYWNYCH] ===")
-                for symbol, pos in current_items:
-                    try:
-                        df = get_market_data(symbol, interval="15", limit=2)
-                        cp = df.iloc[-1]['close'] if df is not None else pos.get("peak_price", pos["buy_price"])
-                        pnl_pct = ((cp - pos["buy_price"]) / pos["buy_price"]) * 100
-                        sl_val = pos.get('trailing_sl', pos.get('trailing_sl_low', 0.0))
-                        is_micro = ("PEPE" in symbol or "BONK" in symbol)
-                        sl_fmt = f"{sl_val:.8f}" if is_micro else f"{sl_val:.4f}"
-                        peak_val = pos.get("peak_price", cp)
-                        peak_fmt = f"{peak_val:.8f}" if is_micro else f"{peak_val:.4f}"
-                        entry_time = pos.get("entry_time", now_ts)
-                        elapsed_min = int((now_ts - entry_time) / 60)
-                        logging.info(f"ℹ️ [{symbol}] PnL: {pnl_pct:+.2f}% | Czas: {elapsed_min}m | Szczyt: {peak_fmt} | SL: {sl_fmt}")
-                    except Exception: pass
-
-            # Zakupy i Rotacja Kapitału
-            if is_btc_market_healthy() and usdc_ok:
-                run_bottom_sniper_strategy()
-            else:
-                if now_ts - last_scan_print_time <= 1:
-                    if not usdc_ok: logging.info(f"⛔ [ZAKUPY ZABLOKOWANE] Ochrona płynności USDC: {usdc_stat}")
-                    else: logging.info("⛔ [ZAKUPY WSTRZYMANE] Czerwona flaga z BTC Guard (gwałtowny spadek).")
-
-            if now_ts - last_scan_print_time <= 1:
-                logging.info("💤 Skan zakończony. Radar wejść i rotacji czuwa (odpytywanie co 10s)...")
+            if now - last_print >= 45:
+                total_eq, free_usdc = get_balances()
+                usdc_ok, usdc_stat = check_usdc_market_dependencies()
                 logging.info("--------------------------------------------------------------------------------")
-                
+                logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS} | Status USDC: {usdc_stat}")
+                for s, p in current_items:
+                    tickers = get_all_spot_tickers()
+                    curr = safe_float(tickers.get(s, {}).get("lastPrice"), p["buy_price"])
+                    pnl = ((curr - p["buy_price"]) / p["buy_price"]) * 100
+                    sl = p.get("trailing_sl", 0.0)
+                    is_micro = "PEPE" in s or "BONK" in s
+                    sl_fmt = f"{sl:.8f}" if is_micro else f"{sl:.4f}"
+                    peak_fmt = f"{p.get('peak_price', curr):.8f}" if is_micro else f"{p.get('peak_price', curr):.4f}"
+                    logging.info(f"📈 [{s}] PnL: {pnl:+.2f}% | Szczyt: {peak_fmt} | Aktywny SL: {sl_fmt}")
+                logging.info("--------------------------------------------------------------------------------")
+                last_print = now
+
+            usdc_ok, _ = check_usdc_market_dependencies()
+            if is_btc_market_healthy() and usdc_ok:
+                run_sniper_strategy()
+
         except Exception as e:
             logging.error(f"Błąd głównej pętli: {e}")
-            
         time.sleep(10)
 
+# ==============================================================================
+# KEEP-ALIVE SERVER (RENDER)
+# ==============================================================================
 def self_ping_loop():
     while True:
         time.sleep(300)
         try:
             requests.get(APP_URL, timeout=10)
-            logging.info("PING: Serwer aktywny (Render Keep-Alive OK)")
-        except Exception: pass
+        except Exception:
+            pass
 
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Trading Bot 24/7 - Multi-Coin Momentum Rotation Active")
+        self.wfile.write(b"Bybit Spot Bot Active - 6 USDC Pairs")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    httpd = HTTPServer(('', port), SimpleHTTPRequestHandler)
+    httpd = HTTPServer(('', port), HealthHandler)
     httpd.serve_forever()
 
 if __name__ == "__main__":
