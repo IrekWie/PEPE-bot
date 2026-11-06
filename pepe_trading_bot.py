@@ -12,12 +12,16 @@ import time
 import pandas as pd
 from pybit.unified_trading import HTTP
 import requests
+from requests.adapters import HTTPAdapter
 
 # Wymuszenie natychmiastowego wypychania logów na Renderze
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
+
+# Wyciszenie ostrzeżeń o przepełnieniu puli połączeń urllib3
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 # ==============================================================================
 # BEZPIECZEŃSTWO SIECI I SYNCHRONIZACJA CZASU BYBIT
@@ -76,7 +80,7 @@ BREAK_EVEN_LOCK_PCT = 0.0035       # Poziom Break-Even (+0.35% na pokrycie opła
 # PARAMETRY ROTACJI I OSPAŁOŚCI
 STAGNATION_MIN_TIME_SEC = 900      # 15 minut minimalnego czasu na rozwinięcie ruchu
 STAGNATION_MAX_GAIN_PCT = 0.0065   # Poniżej +0.65% uznawana za brak pędu
-ROTATION_MIN_CHALLENGER_VOL = 1.30 # Minimalny wolumen nowego pretendenta do wymiany (1.3x średniej)
+ROTATION_MIN_CHALLENGER_VOL = 1.30 # Minimalny wolumen nowego pretendenta do wymiany (1.3x)
 
 # BEZPIECZNIKI RYNKOWE
 USDC_MAX_SPREAD_PCT = 0.0080
@@ -118,6 +122,12 @@ for name, url in endpoints:
 if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
+
+# Zwiększenie puli połączeń HTTP do 30 socketów
+adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
+if hasattr(session, "client") and isinstance(session.client, requests.Session):
+    session.client.mount("https://", adapter)
+    session.client.mount("http://", adapter)
 
 def safe_float(val, default=0.0):
     try:
@@ -437,9 +447,9 @@ def run_sniper_strategy():
     target_allocation = total_equity * CAPITAL_PER_TRADE_PCT
     now_ts = time.time()
 
-    # Równoległe pobieranie świec dla wszystkich monitorowanych par
+    # Równoległe pobieranie świec dla 13 par przy użyciu 8 workerów
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(TARGET_COINS)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in TARGET_COINS}
         for future in concurrent.futures.as_completed(futures):
             sym, df = future.result()
@@ -556,9 +566,8 @@ def run_sniper_strategy():
         return
 
     # ==========================================================================
-    # SCENARIUSZ 2: PORTFEL PEŁNY (2/2) -> SPRAWDZAMY OSPALE POZYCJE I ROTUJEMY
+    # SCENARIUSZ 2: PORTFEL PEŁNY (2/2) -> SPRAWDZAMY OSPAŁE POZYCJE I ROTUJEMY
     # ==========================================================================
-    # Pretendent musi mieć bardzo wysoki impet (wysoki wolumen lub V-Shape)
     strong_challenger = (best_candidate["vol_ratio"] >= ROTATION_MIN_CHALLENGER_VOL) or best_candidate["is_v_shape"]
     if not strong_challenger:
         return
@@ -574,13 +583,11 @@ def run_sniper_strategy():
         entry_time = def_pos.get("entry_time", now_ts)
         time_in_pos = now_ts - entry_time
 
-        # Jeśli pozycja zrealizowała TP1 lub dynamicznie rośnie (>= +0.8%), NIE DOTYKAMY JEJ
+        # Jeśli pozycja zrealizowała TP1 lub dynamicznie rośnie (>= +0.8%), nie dotykamy jej
         if def_pos.get("tp1_executed", False) or gain_pct >= 0.008:
             continue
 
-        # Warunki ospałości (stagnacji):
-        # 1. Trwa min. 15 minut i stoi w miejscu (zysk < +0.65%)
-        # 2. Utrata lokalnego impetu pod EMA 9 / EMA 21
+        # Warunki ospałości (stagnacji)
         is_flat_and_old = (time_in_pos >= STAGNATION_MIN_TIME_SEC) and (gain_pct <= STAGNATION_MAX_GAIN_PCT)
         
         under_emas = False
@@ -601,7 +608,6 @@ def run_sniper_strategy():
                     "time_min": int(time_in_pos / 60)
                 }
 
-    # Jeśli znaleziono ospałą monetę – wykonujemy rotację kapitału
     if stagnant_candidate:
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
@@ -629,7 +635,7 @@ def run_sniper_strategy():
                     logging.info(f"💸 [ZAMKNIĘTO W ROTACJI] {old_sym} sprzedany. Natychmiastowe wejście w {cand_sym}...")
 
         if sold_ok:
-            time.sleep(1.0)  # Krótka pauza na zaksięgowanie salda Bybit
+            time.sleep(1.0)
             _, free_usdc_now = get_balances()
             total_eq_now, _ = get_balances()
             alloc_now = total_eq_now * CAPITAL_PER_TRADE_PCT
@@ -762,7 +768,6 @@ def monitoring_worker():
                     trigger_exit = True
                     exit_reason = f"Fast Invalidation (Ucięcie straty: {gain_pct*100:+.2f}% w {int(time_in_pos/60)}m)"
                 elif time_in_pos >= 2400 and gain_pct < 0.003:
-                    # Stagnacja ogólna: po 40 minutach bez zysku zwalniamy slot
                     trigger_exit = True
                     exit_reason = f"Stagnation Exit (40m bez ruchu | {gain_pct*100:+.2f}%)"
 
@@ -858,7 +863,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Smart Rotation Enabled")
+        self.wfile.write(b"Bybit Spot Bot Active - Smart Rotation & Pooled Sockets")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
