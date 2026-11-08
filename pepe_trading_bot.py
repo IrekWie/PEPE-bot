@@ -45,7 +45,7 @@ def sync_bybit_clock():
     return False
 
 # ==============================================================================
-# KONFIGURACJA GŁÓWNA - ANTY-CHOPOWY OSCYLATOR SINUSOIDY
+# KONFIGURACJA GŁÓWNA
 # ==============================================================================
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "TUTAJ_TWÓJ_KEY").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "TUTAJ_TWÓJ_SECRET").strip()
@@ -67,10 +67,10 @@ MIN_EXCHANGE_NOTIONAL = 5.2
 MIN_24H_TURNOVER_USD = 60000.0     # Odrzucanie martwych par
 USDC_MAX_SPREAD_PCT = 0.0050       
 
-# FILTRY ZAPOBIEGAJĄCE WEJŚCIOM W CIASNYCH KONSOLIDACJACH (ANTY-SIECZKA)
-MIN_BB_BANDWIDTH_PCT = 0.022       # Kanał Bollingera musi mieć min. 2.2% szerokości (amplitudy)
-MIN_4H_RANGE_PCT = 0.020           # Rozpiętość ostatnich 4h (16 świec) musi wynosić min. 2.0%
-MIN_SPACE_TO_RESISTANCE_PCT = 0.018# Min. 1.8% wolnej przestrzeni do najbliższego oporu (EMA 89/200)
+# BEZPIECZNIKI ANTY-SIECZKOWE
+MIN_BB_BANDWIDTH_PCT = 0.022       # Kanał Bollingera musi mieć min. 2.2% szerokości
+MIN_4H_RANGE_PCT = 0.020           # Rozpiętość ostatnich 4h musi wynosić min. 2.0%
+MIN_SPACE_TO_RESISTANCE_PCT = 0.018# Min. 1.8% wolnej przestrzeni do oporów EMA 89/200
 
 # DOLAROWY TRAILING PORTFELA
 USD_PROFIT_TRIGGER = 20.0          
@@ -78,9 +78,9 @@ USD_TRAILING_DROP = 5.0
 basket_peak_profit_usd = 0.0       
 
 # PARAMETRY ROTACJI I OSPAŁOŚCI
-STAGNATION_ROTATION_TIME_SEC = 2100  # 35 minut bez zysku kwalifikuje do natychmiastowej wymiany
+STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez zysku kwalifikuje do wymiany
 STAGNATION_MAX_GAIN_PCT = 0.0040    # Poniżej +0.40% zysku uznajemy za brak impetu
-STAGNATION_FORCE_EXIT_SEC = 3600    # Twarde wyjście po 60 minutach bez ruchu
+STAGNATION_FORCE_EXIT_SEC = 3600    # Twarde wyjście po 60 min bez ruchu
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
@@ -312,7 +312,6 @@ def get_market_data_no_cache(symbol, interval="15", limit=200):
         df['rsi'] = calculate_rsi(df['close'], period=14)
         df['vol_ma20'] = df['volume'].rolling(window=20).mean()
 
-        # Wstęgi Bollingera i wskaźnik szerokości kanału (Bandwidth)
         df['bb_mid'] = df['close'].rolling(20).mean()
         df['bb_std'] = df['close'].rolling(20).std()
         df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
@@ -396,7 +395,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ŁAPANIA DOŁKA SINUSOIDY Z BLOKADĄ KONSOLIDACJI (ANTY-CHOPOWA)
+# STRATEGIA ŁAPANIA DOŁKA SINUSOIDY Z BLOKADĄ KONSOLIDACJI
 # ==============================================================================
 def run_sine_wave_strategy():
     global active_positions
@@ -438,7 +437,6 @@ def run_sine_wave_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # Cooldown po stracie
             cooldown_ok = True
             with lock_history:
                 for t in reversed(trade_history.get("trades_log", [])):
@@ -449,43 +447,33 @@ def run_sine_wave_strategy():
             if not cooldown_ok:
                 continue
 
-            # ------------------------------------------------------------------
-            # 1. TWARDE BEZPIECZNIKI ANTY-SIECZKOWE (ELIMINACJA CIASNYCH KANAŁÓW)
-            # ------------------------------------------------------------------
-            # A) Szerokość Wstęg Bollingera musi wynosić min. 2.2% (wystarczająca fala)
+            # 1. BEZPIECZNIKI ANTY-SIECZKOWE
             bb_width = c.get('bb_width', 0.0)
             if bb_width < MIN_BB_BANDWIDTH_PCT:
-                continue  # Rynek uśpiony w wąskiej linii – ZAKAZ WEJŚCIA!
+                continue
 
-            # B) Rozpiętość ostatnich 4 godzin (16 świec 15M) musi wynosić min. 2.0%
             recent_4h_high = df['high'].iloc[-16:].max()
             recent_4h_low = df['low'].iloc[-16:].min()
             recent_range_pct = (recent_4h_high - recent_4h_low) / recent_4h_low if recent_4h_low > 0 else 0.0
             if recent_range_pct < MIN_4H_RANGE_PCT:
-                continue  # Brak zmienności w ostatnich 4h – ZAKAZ WEJŚCIA!
+                continue
 
-            # C) Filtr splątanych średnich (EMA Entanglement): jeśli średnie leżą na sobie
             ema_tangle = (abs(c['ema21'] - c['ema50']) / c['ema50'] < 0.0035) and (abs(c['ema50'] - c['ema89']) / c['ema89'] < 0.0035)
             if ema_tangle:
-                continue  # Średnie spłaszczone w sieczce – ZAKAZ WEJŚCIA!
+                continue
 
-            # ------------------------------------------------------------------
-            # 2. PRZESTRZEŃ DO NAJBLIŻSZEGO OPORU (RUNWAY CLEARANCE)
-            # ------------------------------------------------------------------
-            # Zakaz kupowania, jeśli tuż nad głową wisi opór EMA 89 lub EMA 200
+            # 2. PRZESTRZEŃ DO OPORÓW
             if c['close'] < c['ema200']:
                 dist_to_200 = (c['ema200'] - c['close']) / c['close']
                 if dist_to_200 < MIN_SPACE_TO_RESISTANCE_PCT:
-                    continue  # Brak miejsca na ruch do EMA 200!
+                    continue
 
             if c['close'] < c['ema89']:
                 dist_to_89 = (c['ema89'] - c['close']) / c['close']
                 if dist_to_89 < 0.015:
-                    continue  # Brak miejsca do EMA 89!
+                    continue
 
-            # ------------------------------------------------------------------
             # 3. REŻIM RYNKU I DOŁEK SINUSOIDY
-            # ------------------------------------------------------------------
             is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
 
             at_lower_band = (c['low'] <= c['bb_lower'] * 1.003) or (p['low'] <= p['bb_lower'] * 1.003)
@@ -495,9 +483,7 @@ def run_sine_wave_strategy():
             if not in_trough_zone:
                 continue
 
-            # ------------------------------------------------------------------
-            # 4. ZAKAZ ŁAPANIA SPADAJĄCYCH NOŻY (POTWIERDZENIE POPYTOWE)
-            # ------------------------------------------------------------------
+            # 4. POTWIERDZENIE POPYTOWE (BEZ ŁAPANIA SPADAJĄCYCH NOŻY)
             candle_range = c['high'] - c['low']
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
@@ -514,10 +500,9 @@ def run_sine_wave_strategy():
             if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
-            # Wymóg skoku wolumenu – musi pojawić się reakcja kupujących
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             if vol_ratio < 1.25:
-                continue  # Ospałe odbicie bez wolumenu – odrzucamy
+                continue
 
             if is_downtrend:
                 if c['close'] <= c['ema9'] or c['rsi'] <= p['rsi']:
@@ -552,9 +537,7 @@ def run_sine_wave_strategy():
         current_count = len(active_positions)
         current_items = list(active_positions.items())
 
-    # ==========================================================================
-    # SCENARIUSZ 1: WOLNY SLOT W PORTFELU (< MAX_TOTAL_POSITIONS)
-    # ==========================================================================
+    # SCENARIUSZ 1: WOLNY SLOT W PORTFELU
     if current_count < MAX_TOTAL_POSITIONS:
         position_pct = (CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT
         target_allocation = total_equity * position_pct
@@ -592,9 +575,7 @@ def run_sine_wave_strategy():
                 logging.info(f"🎯🌊 [WEJŚCIE W DOŁKU] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
         return
 
-    # ==========================================================================
-    # SCENARIUSZ 2: PORTFEL PEŁNY -> AKTYWNA ROTACJA OSPAŁEJ POZYCJI
-    # ==========================================================================
+    # SCENARIUSZ 2: PORTFEL PEŁNY -> ROTACJA OSPAŁEJ POZYCJI
     stagnant_candidate = None
     for def_sym, def_pos in current_items:
         c_curr = safe_float(tickers.get(def_sym, {}).get("lastPrice"), def_pos["buy_price"])
@@ -617,7 +598,7 @@ def run_sine_wave_strategy():
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
         old_time = stagnant_candidate["time_min"]
-        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam ospałą monetę {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy dołek na {cand_sym}!")
+        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy dołek na {cand_sym}!")
 
         base_old = get_base_coin(old_sym)
         bal_old = get_coin_available_balance(base_old)
@@ -670,11 +651,11 @@ def run_sine_wave_strategy():
                     logging.info(f"🎉🚀 [ROTACJA UDANA] Zamieniono na {cand_sym} w dołku po cenie {curr_price_c}!")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: SZCZYT SINUSOIDY + PEŁNA ZAPADKA PROCENTOWA
+# MONITORING ZYSKÓW: ELASTYCZNY BUFOR PROPORCJONALNY DO SKOKU CENY
 # ==============================================================================
 def monitoring_worker():
     global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z pełną zapadką zysków i detekcją szczytu sinusoidy.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z elastycznym buforem wybić.")
     while True:
         try:
             with lock_pos:
@@ -721,7 +702,7 @@ def monitoring_worker():
                     time.sleep(2.0)
                     continue
 
-            # 2. INDYWIDUALNA KONTROLA POZYCJI: PEŁNA ZAPADKA + WYKRYWANIE SZCZYTU FALI
+            # 2. ADAPTACYJNY ELASTYCZNY BUFOR TRAILINGU (ROŚNIE WRAZ ZE SKOKIEM CENY)
             to_delete = []
             for symbol, pos in items:
                 c_curr = position_prices.get(symbol, 0.0)
@@ -733,6 +714,7 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
+                # Śledzenie absolutnego szczytu
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
@@ -740,15 +722,26 @@ def monitoring_worker():
                 current_sl = pos.get("trailing_sl", bp * 0.98)
 
                 # --------------------------------------------------------------
-                # A) PEŁNA WIELOPOZIOMOWA ZAPADKA PROCENTOWA (RATCHET TRAILING)
+                # DYNAMICZNY BUFOR PROPORCJONALNY DO SKOKU WYBICIA:
                 # --------------------------------------------------------------
-                if peak_pct >= 0.085:
-                    current_sl = max(current_sl, peak * (1.0 - 0.0160), bp * 1.065)
+                if peak_pct >= 0.100:
+                    # Skok mega-paraboliczny (>= +10%): bufor aż 3.5% - 4.2% od szczytu,
+                    # gwarantujemy zachowanie min. 65% całego zysku!
+                    elastic_buffer = min(0.042, peak_pct * 0.35)
+                    min_floor = bp * (1.0 + (peak_pct * 0.65))
+                    current_sl = max(current_sl, peak * (1.0 - elastic_buffer), min_floor)
+
                 elif peak_pct >= 0.065:
-                    current_sl = max(current_sl, peak * (1.0 - 0.0140), bp * 1.048)
-                elif peak_pct >= 0.045:
-                    current_sl = max(current_sl, peak * (1.0 - 0.0125), bp * 1.032)
+                    # Bardzo silny skok (>= +6.5%): bufor 3.0% od szczytu, podłoga +4.5%
+                    current_sl = max(current_sl, peak * (1.0 - 0.030), bp * 1.045)
+
+                elif peak_pct >= 0.040:
+                    # Silny impuls (>= +4.0%): bufor 2.4% od szczytu (spokojny retest EMA 9),
+                    # podłoga zysku zablokowana na min. +2.4%
+                    current_sl = max(current_sl, peak * (1.0 - 0.024), bp * 1.024)
+
                 elif peak_pct >= 0.032:
+                    # TP1: Realizacja 50% pozycji przy +3.2%
                     if not pos.get("tp1_executed", False):
                         full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
                         half_qty = full_qty / Decimal("2")
@@ -762,21 +755,27 @@ def monitoring_worker():
                                 pos["qty"] = remaining_qty or half_qty_str
                                 pos["tp1_executed"] = True
                                 record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(half_qty_str), "TP1 (+3.2% sprzedano 50%)")
-                                logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Sprzedano 50% pozycji przy +{gain_pct*100:.2f}%! Zysk zrealizowany.")
+                                logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Sprzedano 50% pozycji przy +{gain_pct*100:.2f}%!")
                         pos["tp1_executed"] = True
                     
-                    current_sl = max(current_sl, peak * (1.0 - 0.0115), bp * 1.020)
-                elif peak_pct >= 0.023:
-                    current_sl = max(current_sl, peak * (1.0 - 0.0110), bp * 1.012)
+                    # Dla reszty pozycji bufor 1.8% od szczytu, podłoga min. +1.5%
+                    current_sl = max(current_sl, peak * (1.0 - 0.018), bp * 1.015)
+
+                elif peak_pct >= 0.022:
+                    # Rozwinięcie ruchu (>= +2.2%): bufor 1.6% od szczytu,
+                    # gwarancja min. +0.80% zysku (koniec z wypadaniem na 1.1%!)
+                    current_sl = max(current_sl, peak * (1.0 - 0.016), bp * 1.008)
+
                 elif peak_pct >= 0.016:
-                    current_sl = max(current_sl, bp * 1.006)
+                    # Początek wybicia (>= +1.6%): Pewny Break-Even (+0.50% na prowizje)
+                    current_sl = max(current_sl, bp * 1.005)
 
                 pos["trailing_sl"] = current_sl
 
                 # --------------------------------------------------------------
-                # B) WYKRYCIE SZCZYTU SINUSOIDY (BEZPOŚREDNIE ZAMKNIĘCIE NA GÓRCE)
+                # BEZPIECZNE WYKRYCIE SZCZYTU (TYLKO POTĘŻNE KNOTY ODRZUCENIA)
                 # --------------------------------------------------------------
-                is_at_wave_top = False
+                is_extreme_climax = False
                 df_cur = get_market_data_no_cache(symbol, interval="15", limit=30)
                 if df_cur is not None and len(df_cur) >= 2:
                     c15 = df_cur.iloc[-1]
@@ -784,25 +783,22 @@ def monitoring_worker():
                     u_wick = c15['high'] - max(c15['open'], c15['close'])
                     upper_wick_ratio = (u_wick / rng) if rng > 0 else 0.0
 
-                    near_bb_upper = c15['high'] >= c15['bb_upper'] * 0.998
-                    wick_rejection_at_top = (upper_wick_ratio >= 0.30) and (peak_pct >= 0.014)
-                    overbought_turnaround = (c15['rsi'] >= 68.0) and (c15['close'] < c15['open']) and (peak_pct >= 0.015)
-
-                    if (near_bb_upper and wick_rejection_at_top) or overbought_turnaround:
-                        is_at_wave_top = True
+                    # Zamykamy z ręki TYLKO w przypadku ekstremalnego knota odrzucenia (min. 45% świecy)
+                    # daleko ponad górną wstęgą Bollingera przy zysku min. +3.5%
+                    is_extreme_climax = (c15['high'] >= c15['bb_upper']) and (upper_wick_ratio >= 0.45) and (peak_pct >= 0.035)
 
                 # --------------------------------------------------------------
-                # C) WARUNKI WYJŚCIA
+                # WARUNKI WYJŚCIA
                 # --------------------------------------------------------------
                 trigger_exit = False
                 exit_reason = ""
 
-                if is_at_wave_top:
+                if is_extreme_climax:
                     trigger_exit = True
-                    exit_reason = f"Szczyt Sinusoidy (Zrealizowano na górce: {gain_pct*100:+.2f}%)"
+                    exit_reason = f"Ekstremalny Knot Odrzucenia Szczytu (Zrealizowano: {gain_pct*100:+.2f}%)"
                 elif c_curr <= current_sl:
                     trigger_exit = True
-                    exit_reason = f"Zapadka Trailing SL (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
+                    exit_reason = f"Elastyczny Trailing Stop (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
                 elif time_in_pos >= STAGNATION_FORCE_EXIT_SEC and gain_pct < 0.002:
                     trigger_exit = True
                     exit_reason = f"Stagnation Exit (60m bez reakcji)"
@@ -871,7 +867,7 @@ def bot_loop():
                     sl_fmt = f"{sl:.8f}" if is_micro else f"{sl:.4f}"
                     peak_fmt = f"{p.get('peak_price', curr):.8f}" if is_micro else f"{p.get('peak_price', curr):.4f}"
                     min_elapsed = int((now - p.get("entry_time", now)) / 60)
-                    tp1_status = " [TP1 zrealizowany 50%]" if p.get("tp1_executed", False) else ""
+                    tp1_status = " [TP1 50% OUT]" if p.get("tp1_executed", False) else ""
                     logging.info(f"📈 [{s}] PnL: {pnl:+.2f}% ({pnl_usd:+.2f}$){tp1_status} | Czas: {min_elapsed}m | Szczyt: {peak_fmt} | Zabezpieczenie SL: {sl_fmt}")
                 logging.info("--------------------------------------------------------------------------------")
                 last_print = now
@@ -895,7 +891,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Anti-Chop Sine Wave Strategy")
+        self.wfile.write(b"Bybit Spot Bot Active - Elastic Trailing & Anti-Chop")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
