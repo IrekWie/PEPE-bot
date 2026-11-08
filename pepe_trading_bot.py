@@ -45,7 +45,7 @@ def sync_bybit_clock():
     return False
 
 # ==============================================================================
-# KONFIGURACJA GŁÓWNA
+# KONFIGURACJA GŁÓWNA - ANTY-CHOPOWY OSCYLATOR SINUSOIDY
 # ==============================================================================
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "TUTAJ_TWÓJ_KEY").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "TUTAJ_TWÓJ_SECRET").strip()
@@ -66,6 +66,11 @@ MIN_EXCHANGE_NOTIONAL = 5.2
 
 MIN_24H_TURNOVER_USD = 60000.0     # Odrzucanie martwych par
 USDC_MAX_SPREAD_PCT = 0.0050       
+
+# FILTRY ZAPOBIEGAJĄCE WEJŚCIOM W CIASNYCH KONSOLIDACJACH (ANTY-SIECZKA)
+MIN_BB_BANDWIDTH_PCT = 0.022       # Kanał Bollingera musi mieć min. 2.2% szerokości (amplitudy)
+MIN_4H_RANGE_PCT = 0.020           # Rozpiętość ostatnich 4h (16 świec) musi wynosić min. 2.0%
+MIN_SPACE_TO_RESISTANCE_PCT = 0.018# Min. 1.8% wolnej przestrzeni do najbliższego oporu (EMA 89/200)
 
 # DOLAROWY TRAILING PORTFELA
 USD_PROFIT_TRIGGER = 20.0          
@@ -307,10 +312,12 @@ def get_market_data_no_cache(symbol, interval="15", limit=200):
         df['rsi'] = calculate_rsi(df['close'], period=14)
         df['vol_ma20'] = df['volume'].rolling(window=20).mean()
 
+        # Wstęgi Bollingera i wskaźnik szerokości kanału (Bandwidth)
         df['bb_mid'] = df['close'].rolling(20).mean()
         df['bb_std'] = df['close'].rolling(20).std()
         df['bb_lower'] = df['bb_mid'] - (2.0 * df['bb_std'])
         df['bb_upper'] = df['bb_mid'] + (2.0 * df['bb_std'])
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
         
         return df
     except Exception:
@@ -389,7 +396,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ŁAPANIA DOŁKA SINUSOIDY ORAZ AKTYWNA ROTACJA
+# STRATEGIA ŁAPANIA DOŁKA SINUSOIDY Z BLOKADĄ KONSOLIDACJI (ANTY-CHOPOWA)
 # ==============================================================================
 def run_sine_wave_strategy():
     global active_positions
@@ -431,6 +438,7 @@ def run_sine_wave_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
+            # Cooldown po stracie
             cooldown_ok = True
             with lock_history:
                 for t in reversed(trade_history.get("trades_log", [])):
@@ -441,10 +449,45 @@ def run_sine_wave_strategy():
             if not cooldown_ok:
                 continue
 
-            # 1. REŻIM RYNKU
+            # ------------------------------------------------------------------
+            # 1. TWARDE BEZPIECZNIKI ANTY-SIECZKOWE (ELIMINACJA CIASNYCH KANAŁÓW)
+            # ------------------------------------------------------------------
+            # A) Szerokość Wstęg Bollingera musi wynosić min. 2.2% (wystarczająca fala)
+            bb_width = c.get('bb_width', 0.0)
+            if bb_width < MIN_BB_BANDWIDTH_PCT:
+                continue  # Rynek uśpiony w wąskiej linii – ZAKAZ WEJŚCIA!
+
+            # B) Rozpiętość ostatnich 4 godzin (16 świec 15M) musi wynosić min. 2.0%
+            recent_4h_high = df['high'].iloc[-16:].max()
+            recent_4h_low = df['low'].iloc[-16:].min()
+            recent_range_pct = (recent_4h_high - recent_4h_low) / recent_4h_low if recent_4h_low > 0 else 0.0
+            if recent_range_pct < MIN_4H_RANGE_PCT:
+                continue  # Brak zmienności w ostatnich 4h – ZAKAZ WEJŚCIA!
+
+            # C) Filtr splątanych średnich (EMA Entanglement): jeśli średnie leżą na sobie
+            ema_tangle = (abs(c['ema21'] - c['ema50']) / c['ema50'] < 0.0035) and (abs(c['ema50'] - c['ema89']) / c['ema89'] < 0.0035)
+            if ema_tangle:
+                continue  # Średnie spłaszczone w sieczce – ZAKAZ WEJŚCIA!
+
+            # ------------------------------------------------------------------
+            # 2. PRZESTRZEŃ DO NAJBLIŻSZEGO OPORU (RUNWAY CLEARANCE)
+            # ------------------------------------------------------------------
+            # Zakaz kupowania, jeśli tuż nad głową wisi opór EMA 89 lub EMA 200
+            if c['close'] < c['ema200']:
+                dist_to_200 = (c['ema200'] - c['close']) / c['close']
+                if dist_to_200 < MIN_SPACE_TO_RESISTANCE_PCT:
+                    continue  # Brak miejsca na ruch do EMA 200!
+
+            if c['close'] < c['ema89']:
+                dist_to_89 = (c['ema89'] - c['close']) / c['close']
+                if dist_to_89 < 0.015:
+                    continue  # Brak miejsca do EMA 89!
+
+            # ------------------------------------------------------------------
+            # 3. REŻIM RYNKU I DOŁEK SINUSOIDY
+            # ------------------------------------------------------------------
             is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
 
-            # 2. DOŁEK SINUSOIDY (Oversold)
             at_lower_band = (c['low'] <= c['bb_lower'] * 1.003) or (p['low'] <= p['bb_lower'] * 1.003)
             rsi_oversold = (c['rsi'] <= 40.0) or (p['rsi'] <= 38.0)
             in_trough_zone = at_lower_band or rsi_oversold
@@ -452,7 +495,9 @@ def run_sine_wave_strategy():
             if not in_trough_zone:
                 continue
 
-            # 3. ZAKAZ ŁAPANIA SPADAJĄCYCH NOŻY
+            # ------------------------------------------------------------------
+            # 4. ZAKAZ ŁAPANIA SPADAJĄCYCH NOŻY (POTWIERDZENIE POPYTOWE)
+            # ------------------------------------------------------------------
             candle_range = c['high'] - c['low']
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
@@ -466,10 +511,14 @@ def run_sine_wave_strategy():
             if not has_bottom_confirmation:
                 continue
 
-            if candle_range > 0 and (upper_wick / candle_range > 0.30):
+            if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
-            # 4. OSTROŻNOŚĆ W TRENDZIE SPADKOWYM
+            # Wymóg skoku wolumenu – musi pojawić się reakcja kupujących
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
+            if vol_ratio < 1.25:
+                continue  # Ospałe odbicie bez wolumenu – odrzucamy
+
             if is_downtrend:
                 if c['close'] <= c['ema9'] or c['rsi'] <= p['rsi']:
                     continue
@@ -478,8 +527,7 @@ def run_sine_wave_strategy():
             live_not_dumping = c_now['close'] >= c_now['open']
 
             if live_holding and live_not_dumping:
-                vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-                score = (100 - c['rsi']) * (vol_ratio ** 0.5)
+                score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
                 tag = "DOWNTREND_BOTTOM" if is_downtrend else "SINE_WAVE_BOTTOM"
 
                 if best_candidate is None or score > best_candidate['score']:
@@ -554,11 +602,9 @@ def run_sine_wave_strategy():
         gain_pct = (c_curr - bp) / bp
         time_in_pos = now_ts - def_pos.get("entry_time", now_ts)
 
-        # Jeśli pozycja zrealizowała TP1 lub dynamicznie rośnie (>= +0.8%), nie dotykamy jej
         if def_pos.get("tp1_executed", False) or gain_pct >= 0.008:
             continue
 
-        # Warunek ospałości: stoi ponad 35 minut z marnym zyskiem (< +0.40%)
         is_stagnant = (time_in_pos >= STAGNATION_ROTATION_TIME_SEC) and (gain_pct <= STAGNATION_MAX_GAIN_PCT)
         if is_stagnant:
             if stagnant_candidate is None or gain_pct < stagnant_candidate["gain_pct"]:
@@ -703,7 +749,6 @@ def monitoring_worker():
                 elif peak_pct >= 0.045:
                     current_sl = max(current_sl, peak * (1.0 - 0.0125), bp * 1.032)
                 elif peak_pct >= 0.032:
-                    # REALIZACJA 50% ZYSKU DO GOTÓWKI PRZY +3.2%
                     if not pos.get("tp1_executed", False):
                         full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
                         half_qty = full_qty / Decimal("2")
@@ -759,7 +804,6 @@ def monitoring_worker():
                     trigger_exit = True
                     exit_reason = f"Zapadka Trailing SL (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
                 elif time_in_pos >= STAGNATION_FORCE_EXIT_SEC and gain_pct < 0.002:
-                    # Po pełnych 60 minutach bezruchu bezwzględnie zwalniamy slot
                     trigger_exit = True
                     exit_reason = f"Stagnation Exit (60m bez reakcji)"
 
@@ -851,7 +895,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Full Sine Wave & Active Rotation")
+        self.wfile.write(b"Bybit Spot Bot Active - Anti-Chop Sine Wave Strategy")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
