@@ -54,33 +54,28 @@ TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# KOSZYK 13 PAR RYNKU USDC
 TARGET_COINS = [
     "PEPEUSDC", "SOLUSDC", "DOGEUSDC", "WIFUSDC", "SUIUSDC", "BONKUSDC",
     "ETHUSDC", "XRPUSDC", "NEARUSDC", "AVAXUSDC", "LINKUSDC", "INJUSDC", "SHIBUSDC"
 ]
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na transakcję (pozwala na 2 pozycje)
-MAX_TOTAL_POSITIONS = 2            # Maksymalnie 2 otwarte pozycje jednocześnie
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (max 2 pozycje)
+MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-# FILTRY JAKOŚCIOWE
-MIN_24H_TURNOVER_USD = 70000.0     # Min. 70 tys. USD obrotu (odrzucenie pustych par)
-USDC_MAX_SPREAD_PCT = 0.0050       # Max spread 0.50%
+MIN_24H_TURNOVER_USD = 70000.0     # Odrzucanie pustych par
+USDC_MAX_SPREAD_PCT = 0.0050       
 
-# PARAMETRY OCHRONY KAPITAŁU
-MAX_INITIAL_STOP_LOSS_PCT = 0.024  # Bezpieczny SL: 2.4% pod dołkiem swingu
-BREAK_EVEN_TRIGGER_PCT = 0.018     # BE aktywowane po wyjściu na +1.80%
-BREAK_EVEN_LOCK_PCT = 0.0040       # Lock +0.40% na pokrycie prowizji
+MAX_INITIAL_STOP_LOSS_PCT = 0.024  # Bezpieczny początkowy SL: 2.4% pod strukturą dołka
 
-# DOLAROWY TRAILING PROFIT DLA KOSZYKA
+# DOLAROWY TRAILING STOP KOSZYKA (PORTFEL)
 USD_PROFIT_TRIGGER = 20.0          
 USD_TRAILING_DROP = 5.0            
 basket_peak_profit_usd = 0.0       
 
-# ROTACJA I STAGNATION
-STAGNATION_MIN_TIME_SEC = 3600     # Min. 60 min bez ruchu zanim uznamy za stagnację
+# STAGNATION & ROTACJA
+STAGNATION_MIN_TIME_SEC = 3600     # 60 min bez ruchu zanim uznamy za stagnację
 ROTATION_MIN_HOLD_SEC = 2700       # Min. 45 min trzymania przed rozważeniem rotacji
 ROTATION_MIN_CHALLENGER_VOL = 1.60 
 
@@ -465,22 +460,22 @@ def run_sniper_strategy():
                 continue
 
             # ------------------------------------------------------------------
-            # FILTRY ANTY-SZCZYTOWE (BEZWZGLĘDNY ZAKAZ FOMO)
+            # FILTRY ANTY-SZCZYTOWE
             # ------------------------------------------------------------------
             is_micro = any(m in symbol for m in ["PEPE", "BONK", "SHIB"])
             max_ema9_dist = 0.013 if is_micro else 0.0095
 
-            # 1. Zakaz kupowania, gdy cena uciekła od EMA 9 (Overextension)
+            # 1. Zakaz kupowania, gdy cena uciekła od EMA 9
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
             if dist_from_ema9 > max_ema9_dist:
                 continue
 
-            # 2. Zakaz kupowania świecy wyczerpania (Exhaustion Candle)
+            # 2. Zakaz kupowania świecy wyczerpania
             candle_body_pct = (c['close'] - c['open']) / c['open']
             if candle_body_pct >= 0.022:
                 continue
 
-            # 3. Filtr podaży z knota (Wick Rejection)
+            # 3. Filtr podaży z knota
             candle_range = c['high'] - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
             if candle_range > 0 and (upper_wick / candle_range > 0.25):
@@ -498,15 +493,11 @@ def run_sniper_strategy():
                 continue
 
             # ------------------------------------------------------------------
-            # BEZPIECZNE SYGNAŁY WEJŚCIA NA WSPARCIU (PULLBACK / BOUNCE)
+            # WEJŚCIE NA PULLBACKU
             # ------------------------------------------------------------------
             in_solid_trend = (c['close'] > c['ema50']) and (c['ema21'] > c['ema50'])
-
-            # A. PULLBACK RETEST: Świeca dotknęła EMA 9/21 i zamknęła się zielona
             tested_ema = (c['low'] <= c['ema9'] * 1.002) or (p['low'] <= p['ema9'] * 1.002) or (c['low'] <= c['ema21'] * 1.003)
             pullback_entry = in_solid_trend and tested_ema and (c['close'] > c['open']) and (vol_ratio >= 1.15)
-
-            # B. KONSOLIDACJA PRZED WYBICIEM: Mała świeca tuż nad średnimi po teście
             flat_compression = in_solid_trend and (abs(c['close'] - c['ema9']) / c['ema9'] < 0.005) and (c['close'] > p['high']) and (vol_ratio >= 1.25)
 
             live_green = c_now['close'] >= c_now['open']
@@ -539,7 +530,6 @@ def run_sniper_strategy():
             c_now = cand_df.iloc[-1]
             curr_price = c_now['close']
             
-            # SL bezpiecznie pod dołkiem korekty (EMA 21/50)
             recent_low = min(cand_df['low'].iloc[-4:].min(), c_now['low'])
             calculated_sl = recent_low * 0.995
             hard_sl_cap = curr_price * (1.0 - MAX_INITIAL_STOP_LOSS_PCT)
@@ -567,7 +557,7 @@ def run_sniper_strategy():
                     logging.info(f"⚡🎯 [ZAKUP NA RETEŚCIE] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
         return
 
-    # SCENARIUSZ 2: ROTACJA TYLKO WTEDY, GDY STARA POZYCJA UMARŁA (>45 MIN)
+    # SCENARIUSZ 2: ROTACJA PRZY STAGNACJI (>45 MIN)
     if best_candidate["vol_ratio"] < ROTATION_MIN_CHALLENGER_VOL:
         return
 
@@ -640,11 +630,11 @@ def run_sniper_strategy():
                     logging.info(f"🎉🚀 [ROTACJA] Otwarto {cand_sym} na korekcie po cenie {curr_price_c}!")
 
 # ==============================================================================
-# MONITORING W CZASIE RZECZYWISTYM (1.5s)
+# MONITORING W CZASIE RZECZYWISTYM (1.5s) - ADAPTACYJNA ZAPADKA ZYSKÓW
 # ==============================================================================
 def monitoring_worker():
     global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring w czasie rzeczywistym.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z adaptacyjną zapadką zysków.")
     while True:
         try:
             with lock_pos:
@@ -697,7 +687,7 @@ def monitoring_worker():
                     time.sleep(2.0)
                     continue
 
-            # 2. INDYWIDUALNA KONTROLA POZYCJI
+            # 2. ADAPTACYJNA DRABINKA ZYSKÓW DLA KAŻDEJ POZYCJI
             to_delete = []
             for symbol, pos in items:
                 c_curr = position_prices.get(symbol, 0.0)
@@ -709,47 +699,62 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
+                # Śledzenie absolutnego szczytu
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
 
                 current_sl = pos.get("trailing_sl", bp * (1.0 - MAX_INITIAL_STOP_LOSS_PCT))
 
-                # KROK 1: Break-Even po realnym wybiciu (+1.8%)
-                if peak_pct >= BREAK_EVEN_TRIGGER_PCT:
-                    current_sl = max(current_sl, bp * (1.0 + BREAK_EVEN_LOCK_PCT))
+                # --------------------------------------------------------------
+                # DYNAMICZNA ZAPADKA (RATCHET TRAILING LADDER)
+                # --------------------------------------------------------------
+                if peak_pct >= 0.085:
+                    # Poziom 6 (Szczyt >= +8.5%): Trailing 1.6% pod szczytem, min. +6.5% zysku
+                    current_sl = max(current_sl, peak * (1.0 - 0.016), bp * 1.065)
+                elif peak_pct >= 0.065:
+                    # Poziom 5 (Szczyt >= +6.5%): Trailing 1.4% pod szczytem, min. +4.8% zysku
+                    current_sl = max(current_sl, peak * (1.0 - 0.014), bp * 1.048)
+                elif peak_pct >= 0.045:
+                    # Poziom 4 (Szczyt >= +4.5%): Trailing 1.25% pod szczytem, min. +3.2% zysku
+                    current_sl = max(current_sl, peak * (1.0 - 0.0125), bp * 1.032)
+                elif peak_pct >= 0.032:
+                    # Poziom 3 (Szczyt >= +3.2%): TP1 + zabezpieczenie min. +2.0% zysku
+                    if not pos.get("tp1_executed", False):
+                        full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
+                        half_qty = full_qty / Decimal("2")
+                        step, minq = get_symbol_lot_filter(symbol)
+                        half_qty_str = format_qty_with_step(half_qty, step, minq)
 
-                # KROK 2: TP1 (+3.2%): Zabezpieczenie 50% pozycji
-                if peak_pct >= 0.032 and not pos.get("tp1_executed", False):
-                    full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
-                    half_qty = full_qty / Decimal("2")
-                    step, minq = get_symbol_lot_filter(symbol)
-                    half_qty_str = format_qty_with_step(half_qty, step, minq)
-
-                    if half_qty_str and (safe_float(half_qty_str) * c_curr >= MIN_EXCHANGE_NOTIONAL):
-                        res_tp1 = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=half_qty_str)
-                        if res_tp1.get("retCode") == 0:
-                            remaining_qty = format_qty_with_step(full_qty - Decimal(half_qty_str), step, minq)
-                            pos["qty"] = remaining_qty or half_qty_str
-                            pos["tp1_executed"] = True
-                            record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(half_qty_str), "TP1 (+3.2%)")
-                            logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Zabezpieczono 50% pozycji przy +{gain_pct*100:.2f}%!")
-                    pos["tp1_executed"] = True
-                    current_sl = max(current_sl, bp * 1.015)
-
-                # KROK 3: Paraboliczny trend (> +5.0%): Trailing 1.5% pod szczytem
-                if peak_pct >= 0.050:
-                    current_sl = max(current_sl, peak * 0.985, bp * 1.030)
+                        if half_qty_str and (safe_float(half_qty_str) * c_curr >= MIN_EXCHANGE_NOTIONAL):
+                            res_tp1 = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=half_qty_str)
+                            if res_tp1.get("retCode") == 0:
+                                remaining_qty = format_qty_with_step(full_qty - Decimal(half_qty_str), step, minq)
+                                pos["qty"] = remaining_qty or half_qty_str
+                                pos["tp1_executed"] = True
+                                record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(half_qty_str), "TP1 (+3.2%)")
+                                logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Zabezpieczono 50% pozycji przy +{gain_pct*100:.2f}%!")
+                        pos["tp1_executed"] = True
+                    
+                    current_sl = max(current_sl, peak * (1.0 - 0.0115), bp * 1.020)
+                elif peak_pct >= 0.023:
+                    # Poziom 2 (Szczyt >= +2.3%): Blokada zysku min. +1.20% (NIE WRACA DO BE!)
+                    current_sl = max(current_sl, peak * (1.0 - 0.0110), bp * 1.012)
+                elif peak_pct >= 0.016:
+                    # Poziom 1 (Szczyt >= +1.6%): Pewny Break-Even (+0.60% zysku na pokrycie opłat)
+                    current_sl = max(current_sl, bp * 1.006)
 
                 pos["trailing_sl"] = current_sl
 
+                # --------------------------------------------------------------
                 # WARUNKI WYJŚCIA
+                # --------------------------------------------------------------
                 trigger_exit = False
                 exit_reason = ""
 
                 if c_curr <= current_sl:
                     trigger_exit = True
-                    exit_reason = f"SL / Trailing Stop ({gain_pct*100:+.2f}%)"
+                    exit_reason = f"Ratchet Trailing SL (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
                 elif time_in_pos >= STAGNATION_MIN_TIME_SEC and gain_pct < 0.002:
                     trigger_exit = True
                     exit_reason = f"Stagnation Exit (60m bez ruchu | {gain_pct*100:+.2f}%)"
@@ -807,7 +812,8 @@ def bot_loop():
                     for s, p in current_items
                 )
                 logging.info("--------------------------------------------------------------------------------")
-                logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Niezrealizowany PnL: {total_unrealized_usd:+.2f}$ | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS}")
+                status_basket = f"Szczyt: +{basket_peak_profit_usd:.2f}$" if basket_peak_profit_usd >= USD_PROFIT_TRIGGER else "Nieaktywny (< 20$)"
+                logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Niezrealizowany PnL: {total_unrealized_usd:+.2f}$ ({status_basket}) | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS}")
                 for s, p in current_items:
                     curr = safe_float(tickers.get(s, {}).get("lastPrice"), p["buy_price"])
                     pnl = ((curr - p["buy_price"]) / p["buy_price"]) * 100
@@ -815,8 +821,9 @@ def bot_loop():
                     sl = p.get("trailing_sl", 0.0)
                     is_micro = any(m in s for m in ["PEPE", "BONK", "SHIB"])
                     sl_fmt = f"{sl:.8f}" if is_micro else f"{sl:.4f}"
+                    peak_fmt = f"{p.get('peak_price', curr):.8f}" if is_micro else f"{p.get('peak_price', curr):.4f}"
                     min_elapsed = int((now - p.get("entry_time", now)) / 60)
-                    logging.info(f"📈 [{s}] PnL: {pnl:+.2f}% ({pnl_usd:+.2f}$) | Czas: {min_elapsed}m | SL: {sl_fmt}")
+                    logging.info(f"📈 [{s}] PnL: {pnl:+.2f}% ({pnl_usd:+.2f}$) | Czas: {min_elapsed}m | Szczyt: {peak_fmt} | Zabezpieczenie SL: {sl_fmt}")
                 logging.info("--------------------------------------------------------------------------------")
                 last_print = now
 
@@ -839,7 +846,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Pullback Strategy")
+        self.wfile.write(b"Bybit Spot Bot Active - Ratchet Trailing Enabled")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
