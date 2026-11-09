@@ -67,9 +67,9 @@ MIN_EXCHANGE_NOTIONAL = 5.2
 MIN_24H_TURNOVER_USD = 60000.0     
 USDC_MAX_SPREAD_PCT = 0.0050       
 
-# BEZPIECZNIKI ANTY-PŁASKIEGO RYNKU (DEAD MARKET GUARDS)
-MIN_RECENT_90M_RANGE_PCT = 0.012   # Ostatnie 1.5h (6 świec 15M) musi mieć min. 1.2% ruchu (blokada płaskich rynków)
-MIN_BB_BANDWIDTH_PCT = 0.024       # Kanał Bollingera musi mieć min. 2.4% szerokości
+# BEZPIECZNIKI ANTY-PŁASKIEGO RYNKU
+MIN_RECENT_90M_RANGE_PCT = 0.012   # Ostatnie 1.5h musi mieć min. 1.2% ruchu
+MIN_BB_BANDWIDTH_PCT = 0.022       # Kanał Bollingera musi mieć min. 2.2% szerokości
 MIN_SPACE_TO_RESISTANCE_PCT = 0.018# Min. 1.8% wolnej przestrzeni do oporów EMA 89/200
 
 # DOLAROWY TRAILING PORTFELA
@@ -395,7 +395,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ZAKUPÓW: ELIMINACJA PŁASKICH KONSOLIDACJI
+# STRATEGIA ŁAPANIA DOŁKA: OBSŁUGA SCHODKOWEGO ODBICIA I WYCZERPANIA PODAŻY
 # ==============================================================================
 def run_sine_wave_strategy():
     global active_positions
@@ -436,6 +436,7 @@ def run_sine_wave_strategy():
             c_now = df.iloc[-1]
             c = df.iloc[-2]
             p = df.iloc[-3]
+            p2 = df.iloc[-4]
 
             # Cooldown po stracie
             cooldown_ok = True
@@ -449,78 +450,76 @@ def run_sine_wave_strategy():
                 continue
 
             # ------------------------------------------------------------------
-            # 1. BLOKADA ŚWIEŻEGO BEZRUCHU (DEAD MARKET GUARD)
+            # 1. BLOKADA ŚWIEŻEGO BEZRUCHU (90-MINUTOWA KONSOLIDACJA)
             # ------------------------------------------------------------------
-            # Badamy ostatnie 6 świec (90 minut). Jeśli rynek stoi płasko w miejscu, ZAKAZ!
             recent_90m_high = df['high'].iloc[-7:-1].max()
             recent_90m_low = df['low'].iloc[-7:-1].min()
             recent_90m_range = (recent_90m_high - recent_90m_low) / recent_90m_low if recent_90m_low > 0 else 0.0
             if recent_90m_range < MIN_RECENT_90M_RANGE_PCT:
-                continue  # Płaski rynek przez ostatnie 1.5h – ODRZUCAMY!
-
-            # Kanał Bollingera musi mieć min. 2.4% szerokości
-            bb_width = c.get('bb_width', 0.0)
-            if bb_width < MIN_BB_BANDWIDTH_PCT:
                 continue
 
-            # Średnie nie mogą być zbieżne w poziomą sieczkę
-            ema_tangle = (abs(c['ema21'] - c['ema50']) / c['ema50'] < 0.0035) and (abs(c['ema50'] - c['ema89']) / c['ema89'] < 0.0035)
-            if ema_tangle:
+            bb_width = c.get('bb_width', 0.0)
+            if bb_width < MIN_BB_BANDWIDTH_PCT:
                 continue
 
             # ------------------------------------------------------------------
             # 2. PRZESTRZEŃ DO OPORÓW (RUNWAY CLEARANCE)
             # ------------------------------------------------------------------
             if c['close'] < c['ema200']:
-                dist_to_200 = (c['ema200'] - c['close']) / c['close']
-                if dist_to_200 < MIN_SPACE_TO_RESISTANCE_PCT:
+                if (c['ema200'] - c['close']) / c['close'] < MIN_SPACE_TO_RESISTANCE_PCT:
                     continue
 
             if c['close'] < c['ema89']:
-                dist_to_89 = (c['ema89'] - c['close']) / c['close']
-                if dist_to_89 < 0.015:
+                if (c['ema89'] - c['close']) / c['close'] < 0.014:
                     continue
 
             # ------------------------------------------------------------------
-            # 3. REŻIM RYNKU I DOŁEK SINUSOIDY
+            # 3. REŻIM RYNKU I STREFA DOŁKA
             # ------------------------------------------------------------------
             is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
 
-            at_lower_band = (c['low'] <= c['bb_lower'] * 1.002) or (p['low'] <= p['bb_lower'] * 1.002)
-            rsi_oversold = (c['rsi'] <= 40.0) or (p['rsi'] <= 38.0)
-            in_trough_zone = at_lower_band or rsi_oversold
+            # Badamy dołek w oknie ostatnich 4 świec (czy rynek dotknął dna)
+            recent_low_4 = df['low'].iloc[-5:-1].min()
+            recent_bb_lower_min = df['bb_lower'].iloc[-5:-1].min()
+            recent_rsi_min = df['rsi'].iloc[-5:-1].min()
 
+            touched_bottom = (recent_low_4 <= recent_bb_lower_min * 1.004) or (recent_rsi_min <= 38.0)
+            is_oversold_now = (c['low'] <= c['bb_lower'] * 1.003) or (c['rsi'] <= 42.0)
+            
+            in_trough_zone = touched_bottom or is_oversold_now
             if not in_trough_zone:
                 continue
 
             # ------------------------------------------------------------------
-            # 4. POTWIERDZENIE POPYTOWE O REALNYM ZASIĘGU (NIE MIKRO-ŚWIECZKA)
+            # 4. POTWIERDZENIE POPYTU: MŁOT LUB SCHODKOWE ODWRÓCENIE (STAIRCASE)
             # ------------------------------------------------------------------
             candle_range = c['high'] - c['low']
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
             is_green = c['close'] > c['open']
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
 
-            # Minimalny realny korpus świecy potwierdzającej (odrzucenie mikro-doji)
-            is_micro_coin = any(m in symbol for m in ["PEPE", "BONK", "SHIB"])
-            min_rebound_body_pct = 0.0065 if is_micro_coin else 0.0040
-            actual_candle_gain = (c['close'] - c['open']) / c['open']
+            # SYGNAŁ A: Klasyczny silny młot (rejection pin bar)
+            strong_bottom_rejection = is_green and (candle_range > 0) and ((lower_wick / candle_range) >= 0.38) and (vol_ratio >= 1.15)
 
-            # Warunki odbicia:
-            # A) Silny młot (dolny knot min. 40% świecy)
-            strong_bottom_rejection = (lower_wick / candle_range >= 0.40) if candle_range > 0 else False
-            # B) Wybicie w górę o realnej skali (nie płaska świeczka)
-            real_green_breakout = is_green and (actual_candle_gain >= min_rebound_body_pct) and (c['close'] > p['high'])
+            # SYGNAŁ B: Dynamiczne objęcie hossy
+            bullish_engulfing = is_green and (c['close'] > p['open']) and (p['close'] < p['open']) and (vol_ratio >= 1.20)
 
-            has_valid_rebound = strong_bottom_rejection or real_green_breakout
-            if not has_valid_rebound:
-                continue  # Płaska świeczka bez impetu – ZAKAZ WEJŚCIA!
+            # SYGNAŁ C: Schodkowe ciche odwrócenie (Staircase Reversal)
+            # 2 kolejne zielone świece, wyższy dołek, kurs odzyskuje EMA 9 w dolnej połowie fali
+            staircase_higher_low = is_green and (c['low'] >= p['low']) and (c['close'] > p['close'])
+            staircase_reclaiming = (c['close'] >= c['ema9'] * 0.999) or (c_now['close'] >= c_now['ema9'])
+            still_in_lower_wave = c['close'] <= c['bb_mid'] * 1.003  # Nie gonimy szczytu fali
+            
+            # Przy wyczerpaniu podaży na dnie (volume dry-up) nie blokujemy brakiem wolumenu
+            staircase_confirmed = touched_bottom and staircase_higher_low and staircase_reclaiming and still_in_lower_wave and (vol_ratio >= 0.80)
 
-            if candle_range > 0 and (upper_wick / candle_range > 0.25):
+            has_valid_entry = strong_bottom_rejection or bullish_engulfing or staircase_confirmed
+            if not has_valid_entry:
                 continue
 
-            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-            if vol_ratio < 1.30:
+            # Odrzucenie świecy z dominującym knotem podażowym z góry
+            if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
             if is_downtrend:
@@ -531,12 +530,12 @@ def run_sine_wave_strategy():
             live_not_dumping = c_now['close'] >= c_now['open']
 
             if live_holding and live_not_dumping:
+                mode_tag = "STAIRCASE_BOTTOM" if staircase_confirmed else ("HAMMER_REVERSAL" if strong_bottom_rejection else "ENGULFING_BOTTOM")
                 score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
-                tag = "DOWNTREND_BOTTOM" if is_downtrend else "SINE_WAVE_BOTTOM"
 
                 if best_candidate is None or score > best_candidate['score']:
                     best_candidate = {
-                        "symbol": symbol, "score": score, "tag": tag, 
+                        "symbol": symbol, "score": score, "tag": mode_tag, 
                         "df": df, "is_downtrend": is_downtrend, "swing_low": min(c['low'], p['low'], c_now['low']),
                         "vol_ratio": vol_ratio
                     }
@@ -617,7 +616,7 @@ def run_sine_wave_strategy():
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
         old_time = stagnant_candidate["time_min"]
-        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy dołek na {cand_sym}!")
+        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy dołek na {cand_sym} ({cand_tag})!")
 
         base_old = get_base_coin(old_sym)
         bal_old = get_coin_available_balance(base_old)
@@ -882,7 +881,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Dead Market Protected")
+        self.wfile.write(b"Bybit Spot Bot Active - Staircase Reversal & Elastic Trailing")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
