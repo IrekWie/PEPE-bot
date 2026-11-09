@@ -59,7 +59,7 @@ TARGET_COINS = [
     "BONKUSDC", "ETHUSDC", "XRPUSDC", "NEARUSDC", "AVAXUSDC", "LINKUSDC", "SHIBUSDC"
 ]
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (pozwala na 2 jednoczesne pozycje)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (pozwala na 2 pozycje)
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
@@ -69,11 +69,11 @@ USDC_MAX_SPREAD_PCT = 0.0050
 
 # DOLAROWY TRAILING PORTFELA (BASKET LOCK)
 USD_PROFIT_TRIGGER = 20.0          # Aktywacja po wyjściu koszyka na +20 USD
-USD_TRAILING_DROP = 5.0            # Cofnięcie o 5 USD realizuje zysk
+USD_TRAILING_DROP = 5.0            # Cofnięcie o 5 USD realizuje cały zysk
 basket_peak_profit_usd = 0.0       
 
 # ROTACJA I STAGNATION
-STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez ruchu kwalifikuje do wymiany
+STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez ruchu kwalifikuje do rotacji
 STAGNATION_MAX_GAIN_PCT = 0.0040    
 STAGNATION_FORCE_EXIT_SEC = 3600    # Twardy exit po 60 min bezruchu
 
@@ -390,7 +390,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# GŁÓWNA STRATEGIA 2-SILNIKOWA: TREND RIDER ORAZ SWING WAVE
+# STRATEGIA ZAKUPÓW: 2 SILNIKI Z FILTREM DUMP CANDLE & PANIC VOLUME
 # ==============================================================================
 def run_dual_engine_strategy():
     global active_positions
@@ -431,6 +431,25 @@ def run_dual_engine_strategy():
             c_now = df.iloc[-1]
             c = df.iloc[-2]
             p = df.iloc[-3]
+            p2 = df.iloc[-4]
+
+            # ------------------------------------------------------------------
+            # BEZPIECZNIK 1: BLOKADA PO ZRZUCIE (DUMP CANDLE & PANIC VOLUME GUARD)
+            # Odrzuca pułapki na byki (takie jak na NEAR pod EMA 200)
+            # ------------------------------------------------------------------
+            p_is_red = p['close'] < p['open']
+            p_drop_pct = (p['open'] - p['close']) / p['open'] if p_is_red else 0.0
+            p_vol_ratio = (p['volume'] / p['vol_ma20']) if (p['vol_ma20'] and p['vol_ma20'] > 0) else 1.0
+
+            p2_is_red = p2['close'] < p2['open']
+            p2_drop_pct = (p2['open'] - p2['close']) / p2['open'] if p2_is_red else 0.0
+            p2_vol_ratio = (p2['volume'] / p2['vol_ma20']) if (p2['vol_ma20'] and p2['vol_ma20'] > 0) else 1.0
+
+            # Jeśli poprzednia świeca była potężnym zrzutem (> 1.3%) lub miała paniczny wolumen (> 1.4x)
+            recent_dump_detected = (p_is_red and (p_drop_pct >= 0.013 or p_vol_ratio >= 1.40)) or \
+                                   (p2_is_red and (p2_drop_pct >= 0.015 and p2_vol_ratio >= 1.40))
+            if recent_dump_detected:
+                continue  # Kurz po zrzucie jeszcze nie opadł – ZAKAZ WEJŚCIA!
 
             is_green = c['close'] > c['open']
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
@@ -438,30 +457,27 @@ def run_dual_engine_strategy():
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
 
-            # Bezpiecznik świecy wyczerpania: odrzucamy świece z potężnym knotem podażowym z góry
-            if candle_range > 0 and (upper_wick / candle_range > 0.30):
+            # Odrzucenie świecy wejścia z dominującym knotem podażowym z góry
+            if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
             # ------------------------------------------------------------------
-            # SILNIK 1: TREND RIDER (DLA MONET W SILNYM RAJDZIE WZROSTOWYM)
+            # SILNIK 1: TREND RIDER (WYŁĄCZNIE DLA PRAWDZIWEGO TRENDU NAD EMA 200)
             # ------------------------------------------------------------------
-            is_uptrend_structure = (c['close'] > c['ema50']) and (c['ema9'] >= c['ema21'])
-            is_breakout_ema200 = (c['close'] > c['ema200']) and (p['close'] <= c['ema200'])
+            # Moneta musi być FAKTYCZNIE w trendzie wzrostowym (nad EMA 200!)
+            is_above_ema200 = c['close'] > c['ema200']
+            is_uptrend_structure = is_above_ema200 and (c['close'] > c['ema50']) and (c['ema9'] >= c['ema21'])
             
-            # Test wsparcia na EMA 9 lub EMA 21 w trendzie
+            # Świeże, potężne wybicie ponad EMA 200
+            is_breakout_ema200 = (c['close'] > c['ema200']) and (p['close'] <= p['ema200']) and (c['close'] > c['open'])
+            
             tested_trend_support = (
                 (p['low'] <= p['ema9'] * 1.003) or (c['low'] <= c['ema9'] * 1.003) or
                 (p['low'] <= p['ema21'] * 1.003) or (c['low'] <= c['ema21'] * 1.003) or
                 is_breakout_ema200
             )
-            
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
 
-            # Warunek wejścia w trendzie:
-            # - Struktura wzrostowa
-            # - Świeca zamyka się zielona ponad EMA 9
-            # - Cena nie odjechała za daleko (max 1.5% od EMA 9)
-            # - RSI nie jest w skrajnym wyczerpaniu (< 72)
             trend_rider_signal = (
                 (is_uptrend_structure or is_breakout_ema200) and
                 tested_trend_support and
@@ -473,10 +489,10 @@ def run_dual_engine_strategy():
             )
 
             # ------------------------------------------------------------------
-            # SILNIK 2: SWING WAVE (DLA MONET W KANALE / REWERSJA DO ŚREDNIEJ)
+            # SILNIK 2: SWING WAVE (DLA KONSOLIDACJI I ODWRÓCEŃ W KANALE)
             # ------------------------------------------------------------------
             bb_width = c.get('bb_width', 0.0)
-            is_swing_market = bb_width >= 0.020  # Wymóg minimalnej amplitudy fali (anty-sieczka)
+            is_swing_market = bb_width >= 0.020  # Wymóg min. 2.0% zmienności kanału
 
             recent_low_4 = df['low'].iloc[-5:-1].min()
             recent_bb_lower = df['bb_lower'].iloc[-5:-1].min()
@@ -484,10 +500,6 @@ def run_dual_engine_strategy():
 
             in_wave_trough = (recent_low_4 <= recent_bb_lower * 1.004) or (recent_rsi_min <= 40.0) or (c['rsi'] <= 42.0)
 
-            # Potwierdzenie obrony dołka:
-            # - Młot z dolnym knotem >= 35%
-            # - Objęcie hossy
-            # - Schodkowe odwrócenie (2 zielone świece, wyższy dołek)
             is_hammer = (candle_range > 0) and ((lower_wick / candle_range) >= 0.35)
             is_engulfing = (c['close'] > p['open']) and (p['close'] < p['open'])
             is_staircase = (c['low'] >= p['low']) and (c['close'] > p['close']) and (c['close'] >= c['ema9'] * 0.999)
@@ -497,30 +509,32 @@ def run_dual_engine_strategy():
                 in_wave_trough and
                 is_green and
                 (is_hammer or is_engulfing or is_staircase) and
-                (c['close'] <= c['bb_mid'] * 1.004) and  # Kupujemy w dolnej połowie fali
+                (c['close'] <= c['bb_mid'] * 1.004) and
                 (vol_ratio >= 0.80)
             )
 
             # ------------------------------------------------------------------
-            # KWALIFIKACJA I WYBÓR NAJLEPSZEJ OKAZJI
+            # DECYZJA WEJŚCIA
             # ------------------------------------------------------------------
             if not trend_rider_signal and not swing_wave_signal:
                 continue
 
             is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
             if is_downtrend and not is_breakout_ema200:
-                # W downtrendzie wymagamy potwierdzenia RSI
+                # W reżimie spadkowym Trend Rider jest wyłączony! Działa tylko głęboki Swing Wave
+                if trend_rider_signal and not swing_wave_signal:
+                    continue
                 if c['close'] <= c['ema9'] or c['rsi'] <= p['rsi']:
                     continue
 
-            # Świeca bieżąca nie może się zapadać
+            # Świeca na żywo nie może wybijać nowego dna
             live_holding = c_now['low'] >= min(c['low'], p['low']) * 0.998
             live_not_dumping = c_now['close'] >= c_now['open']
 
             if live_holding and live_not_dumping:
                 if trend_rider_signal:
                     mode_tag = "TREND_RIDER"
-                    score = vol_ratio * 150.0 + (c['rsi'] * 0.5)  # Priorytet dla monet w ruchu
+                    score = vol_ratio * 150.0 + (c['rsi'] * 0.5)
                 else:
                     mode_tag = "SWING_WAVE"
                     score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
@@ -548,10 +562,9 @@ def run_dual_engine_strategy():
         current_items = list(active_positions.items())
 
     # ==========================================================================
-    # SCENARIUSZ 1: WOLNY SLOT W PORTFELU (< MAX_TOTAL_POSITIONS)
+    # SCENARIUSZ 1: WOLNY SLOT W PORTFELU
     # ==========================================================================
     if current_count < MAX_TOTAL_POSITIONS:
-        # Bezpiecznik downtrendu: redukcja wielkości pozycji do 60%
         position_pct = (CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT
         target_allocation = total_equity * position_pct
 
@@ -733,7 +746,6 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
-                # Śledzenie lokalnego szczytu
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
@@ -742,18 +754,14 @@ def monitoring_worker():
 
                 # Zapadka Ratchet & Elastyczny Bufor:
                 if peak_pct >= 0.100:
-                    # Rajd paraboliczny (>= +10%): bufor do 4.2%, zablokowane min. 65% zysku ze szczytu
                     elastic_buffer = min(0.042, peak_pct * 0.35)
                     min_floor = bp * (1.0 + (peak_pct * 0.65))
                     current_sl = max(current_sl, peak * (1.0 - elastic_buffer), min_floor)
                 elif peak_pct >= 0.065:
-                    # Bardzo silny ruch (>= +6.5%): bufor 3.0%, gwarancja min. +4.5% zysku
                     current_sl = max(current_sl, peak * (1.0 - 0.030), bp * 1.045)
                 elif peak_pct >= 0.040:
-                    # Silny impuls (>= +4.0%): bufor 2.4% (spokojny retest EMA 9), gwarancja min. +2.4%
                     current_sl = max(current_sl, peak * (1.0 - 0.024), bp * 1.024)
                 elif peak_pct >= 0.032:
-                    # TP1: Automatyczna realizacja 50% pozycji przy +3.2%
                     if not pos.get("tp1_executed", False):
                         full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
                         half_qty = full_qty / Decimal("2")
@@ -769,13 +777,10 @@ def monitoring_worker():
                                 record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(half_qty_str), "TP1 (+3.2% sprzedano 50%)")
                                 logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Sprzedano 50% pozycji przy +{gain_pct*100:.2f}%!")
                         pos["tp1_executed"] = True
-                    # Dla pozostałej części: bufor 1.8%, gwarancja min. +1.50%
                     current_sl = max(current_sl, peak * (1.0 - 0.018), bp * 1.015)
                 elif peak_pct >= 0.022:
-                    # Rozwinięcie ruchu (>= +2.2%): bufor 1.6%, gwarancja min. +0.80% zysku
                     current_sl = max(current_sl, peak * (1.0 - 0.016), bp * 1.008)
                 elif peak_pct >= 0.016:
-                    # Początek wybicia (>= +1.6%): Break-Even (+0.50% na pokrycie prowizji)
                     current_sl = max(current_sl, bp * 1.005)
 
                 pos["trailing_sl"] = current_sl
@@ -891,7 +896,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Dual Engine Architecture")
+        self.wfile.write(b"Bybit Spot Bot Active - Trap-Free Dual Engine Architecture")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
