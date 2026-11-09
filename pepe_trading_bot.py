@@ -59,7 +59,7 @@ TARGET_COINS = [
     "BONKUSDC", "ETHUSDC", "XRPUSDC", "NEARUSDC", "AVAXUSDC", "LINKUSDC", "SHIBUSDC"
 ]
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na transakcję
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (pozwala na 2 jednoczesne pozycje)
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
@@ -67,20 +67,15 @@ MIN_EXCHANGE_NOTIONAL = 5.2
 MIN_24H_TURNOVER_USD = 60000.0     
 USDC_MAX_SPREAD_PCT = 0.0050       
 
-# BEZPIECZNIKI ANTY-SIECZKOWE
-MIN_RECENT_90M_RANGE_PCT = 0.010   # Złagodzony do 1.0% (nie paraliżuje wybić z kompresji)
-MIN_BB_BANDWIDTH_PCT = 0.018       # Kanał Bollingera min. 1.8%
-MIN_SPACE_TO_RESISTANCE_PCT = 0.015# Min. 1.5% do oporów (chyba że następuje wybicie)
-
-# DOLAROWY TRAILING PORTFELA
-USD_PROFIT_TRIGGER = 20.0          
-USD_TRAILING_DROP = 5.0            
+# DOLAROWY TRAILING PORTFELA (BASKET LOCK)
+USD_PROFIT_TRIGGER = 20.0          # Aktywacja po wyjściu koszyka na +20 USD
+USD_TRAILING_DROP = 5.0            # Cofnięcie o 5 USD realizuje zysk
 basket_peak_profit_usd = 0.0       
 
 # ROTACJA I STAGNATION
-STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez ruchu kwalifikuje do rotacji
+STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez ruchu kwalifikuje do wymiany
 STAGNATION_MAX_GAIN_PCT = 0.0040    
-STAGNATION_FORCE_EXIT_SEC = 3600    # Twarde wyjście po 60 min
+STAGNATION_FORCE_EXIT_SEC = 3600    # Twardy exit po 60 min bezruchu
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
@@ -395,9 +390,9 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ZAKUPÓW: DOŁEK + KONTYNUACJA TRENDU (EMA9 RIDE) + PRZEŁAMANIE OPORÓW
+# GŁÓWNA STRATEGIA 2-SILNIKOWA: TREND RIDER ORAZ SWING WAVE
 # ==============================================================================
-def run_sine_wave_strategy():
+def run_dual_engine_strategy():
     global active_positions
     total_equity, free_usdc = get_balances()
     now_ts = time.time()
@@ -437,183 +432,104 @@ def run_sine_wave_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # ------------------------------------------------------------------
-            # 1. IDENTYFIKACJA REŻIMÓW RYNKOWYCH
-            # ------------------------------------------------------------------
-            is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
-            
-            # Silny trend wzrostowy (Bullish Stacked EMAs)
-            is_strong_uptrend = (c['close'] > c['ema200']) and (c['ema50'] > c['ema200']) and (c['ema21'] > c['ema89'])
-            is_riding_trend = (c['close'] > c['ema9']) and (c['ema9'] > c['ema21']) and (c['ema21'] > c['ema50'])
-
-            # Wybicie kluczowych oporów (EMA 89 lub EMA 200)
-            broke_above_ema200 = (c['close'] > c['ema200']) and (p['close'] <= p['ema200'])
-            broke_above_ema89 = (c['close'] > c['ema89']) and (p['close'] <= p['ema89'])
-            is_regime_breakout = (broke_above_ema200 or broke_above_ema89) and (c['close'] > c['ema9'])
-
-            # Wybicie ze świeżej kompresji (Breakout ze strefy 90-minutowej)
-            recent_90m_high = df['high'].iloc[-7:-1].max()
-            is_compression_breakout = (c['close'] > recent_90m_high) and (c['close'] > c['open'])
-
-            # ------------------------------------------------------------------
-            # 2. INTELIGENTNY COOLDOWN (ANULOWANY PRZY CZYSTYM SYGNALE TRENDOWYM)
-            # ------------------------------------------------------------------
-            has_momentum_override = is_strong_uptrend or is_regime_breakout or is_riding_trend
-            cooldown_period = 900 if has_momentum_override else 2400  # 15 min przy silnym trendzie zamiast 40 min
-
-            cooldown_ok = True
-            with lock_history:
-                for t in reversed(trade_history.get("trades_log", [])):
-                    if t.get("symbol") == symbol:
-                        if t.get("net_pnl", 0) < 0 and (now_ts - t.get("timestamp", 0)) < cooldown_period:
-                            cooldown_ok = False
-                        break
-            if not cooldown_ok:
-                continue
-
-            bb_width = c.get('bb_width', 0.0)
-            if bb_width < MIN_BB_BANDWIDTH_PCT:
-                continue
-
-            # ------------------------------------------------------------------
-            # 3. BEZPIECZNIKI ZBIEŻNOŚCI I OPORÓW
-            # ------------------------------------------------------------------
-            # Jeśli następuje wybicie z kompresji, oporu lub moneta jest w silnym trendzie -> NIE BLOKUJEMY!
-            if not is_regime_breakout and not is_compression_breakout and not is_riding_trend:
-                recent_90m_low = df['low'].iloc[-7:-1].min()
-                recent_90m_range = (recent_90m_high - recent_90m_low) / recent_90m_low if recent_90m_low > 0 else 0.0
-                if recent_90m_range < MIN_RECENT_90M_RANGE_PCT:
-                    continue
-
-                if c['close'] < c['ema200']:
-                    if (c['ema200'] - c['close']) / c['close'] < MIN_SPACE_TO_RESISTANCE_PCT:
-                        continue
-                if c['close'] < c['ema89']:
-                    if (c['ema89'] - c['close']) / c['close'] < 0.014:
-                        continue
-
-            # ------------------------------------------------------------------
-            # 4. KWALIFIKACJA STREF WEJŚCIA
-            # ------------------------------------------------------------------
-            # STREFA A: Głęboki dołek sinusoidy (Wstęga Bollingera lub RSI <= 40)
-            recent_low_4 = df['low'].iloc[-5:-1].min()
-            recent_bb_lower_min = df['bb_lower'].iloc[-5:-1].min()
-            recent_rsi_min = df['rsi'].iloc[-5:-1].min()
-            touched_bottom = (recent_low_4 <= recent_bb_lower_min * 1.004) or (recent_rsi_min <= 38.0)
-            is_oversold_now = (c['low'] <= c['bb_lower'] * 1.003) or (c['rsi'] <= 42.0)
-            in_trough_zone = touched_bottom or is_oversold_now
-
-            # STREFA B: Odbicie od średnich (EMA 50 / EMA 89) w trendzie
-            tested_ema_support = (
-                (p['low'] <= p['ema50'] * 1.004 and p['low'] >= p['ema50'] * 0.992) or
-                (c['low'] <= c['ema50'] * 1.004 and c['low'] >= c['ema50'] * 0.992) or
-                (p['low'] <= p['ema89'] * 1.004 and p['low'] >= p['ema89'] * 0.992) or
-                (c['low'] <= c['ema89'] * 1.004 and c['low'] >= c['ema89'] * 0.992) or
-                (p['low'] <= p['ema21'] * 1.003 and c['low'] <= c['ema21'] * 1.003)
-            )
-            in_trend_pullback_zone = is_strong_uptrend and tested_ema_support and (c['rsi'] <= 58.0)
-
-            # STREFA C: Impulsowe wybicie ponad opory
-            in_momentum_breakout = is_regime_breakout and (c['rsi'] <= 68.0)
-
-            # STREFA D (NOWOŚĆ): Jazda na fali trendu - Pullback do EMA 9 w silnym trendzie
-            tested_ema9_ride = (p['low'] <= p['ema9'] * 1.003) or (c['low'] <= c['ema9'] * 1.003)
-            in_ema9_trend_ride = is_riding_trend and tested_ema9_ride and (c['rsi'] <= 68.0)
-
-            if not in_trough_zone and not in_trend_pullback_zone and not in_momentum_breakout and not in_ema9_trend_ride:
-                continue
-
-            # ------------------------------------------------------------------
-            # 5. POTWIERDZENIE POPYTOWE
-            # ------------------------------------------------------------------
+            is_green = c['close'] > c['open']
+            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             candle_range = c['high'] - c['low']
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
-            is_green = c['close'] > c['open']
-            vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
-            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
 
-            # SYGNAŁ A: Młot na dnie
-            strong_bottom_rejection = in_trough_zone and is_green and (candle_range > 0) and ((lower_wick / candle_range) >= 0.38) and (vol_ratio >= 1.15)
-
-            # SYGNAŁ B: Objęcie hossy
-            bullish_engulfing = in_trough_zone and is_green and (c['close'] > p['open']) and (p['close'] < p['open']) and (vol_ratio >= 1.20)
-
-            # SYGNAŁ C: Schodkowe odwrócenie (Staircase)
-            staircase_higher_low = is_green and (c['low'] >= p['low']) and (c['close'] > p['close'])
-            staircase_reclaiming = (c['close'] >= c['ema9'] * 0.999) or (c_now['close'] >= c_now['ema9'])
-            still_in_lower_wave = c['close'] <= c['bb_mid'] * 1.003
-            staircase_confirmed = in_trough_zone and staircase_higher_low and staircase_reclaiming and still_in_lower_wave and (vol_ratio >= 0.80)
-
-            # SYGNAŁ D: Odbicie od średnich EMA 50/89
-            trend_bounce_confirmed = (
-                in_trend_pullback_zone and is_green and
-                (c['close'] >= c['ema9'] * 0.999) and (dist_from_ema9 <= 0.012) and
-                ((candle_range > 0 and (lower_wick / candle_range) >= 0.25) or (c['close'] > p['high'])) and
-                (vol_ratio >= 0.90)
-            )
-
-            # SYGNAŁ E: Wybicie oporu
-            breakout_momentum_confirmed = (
-                in_momentum_breakout and is_green and
-                (c['close'] > p['high']) and (dist_from_ema9 <= 0.018) and (vol_ratio >= 1.15)
-            )
-
-            # SYGNAŁ F (NOWOŚĆ): TREND MOMENTUM RIDE (PEPE / SUI RALLY CATCHER)
-            # Świeca odbija się od EMA 9 w układzie wzrostowym, zamyka zielona i nie ucieka za daleko
-            trend_ride_confirmed = (
-                in_ema9_trend_ride and is_green and
-                (c['close'] >= c['ema9'] * 0.999) and
-                (dist_from_ema9 <= 0.015) and
-                ((c['close'] > p['close']) or (c['close'] > p['high'])) and
-                (vol_ratio >= 0.85)
-            )
-
-            has_valid_entry = (
-                strong_bottom_rejection or bullish_engulfing or staircase_confirmed or 
-                trend_bounce_confirmed or breakout_momentum_confirmed or trend_ride_confirmed
-            )
-            if not has_valid_entry:
-                continue
-
+            # Bezpiecznik świecy wyczerpania: odrzucamy świece z potężnym knotem podażowym z góry
             if candle_range > 0 and (upper_wick / candle_range > 0.30):
                 continue
 
-            if is_downtrend and not breakout_momentum_confirmed:
+            # ------------------------------------------------------------------
+            # SILNIK 1: TREND RIDER (DLA MONET W SILNYM RAJDZIE WZROSTOWYM)
+            # ------------------------------------------------------------------
+            is_uptrend_structure = (c['close'] > c['ema50']) and (c['ema9'] >= c['ema21'])
+            is_breakout_ema200 = (c['close'] > c['ema200']) and (p['close'] <= c['ema200'])
+            
+            # Test wsparcia na EMA 9 lub EMA 21 w trendzie
+            tested_trend_support = (
+                (p['low'] <= p['ema9'] * 1.003) or (c['low'] <= c['ema9'] * 1.003) or
+                (p['low'] <= p['ema21'] * 1.003) or (c['low'] <= c['ema21'] * 1.003) or
+                is_breakout_ema200
+            )
+            
+            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
+
+            # Warunek wejścia w trendzie:
+            # - Struktura wzrostowa
+            # - Świeca zamyka się zielona ponad EMA 9
+            # - Cena nie odjechała za daleko (max 1.5% od EMA 9)
+            # - RSI nie jest w skrajnym wyczerpaniu (< 72)
+            trend_rider_signal = (
+                (is_uptrend_structure or is_breakout_ema200) and
+                tested_trend_support and
+                is_green and
+                (c['close'] >= c['ema9'] * 0.999) and
+                (dist_from_ema9 <= 0.015) and
+                (c['rsi'] <= 72.0) and
+                (vol_ratio >= 0.85)
+            )
+
+            # ------------------------------------------------------------------
+            # SILNIK 2: SWING WAVE (DLA MONET W KANALE / REWERSJA DO ŚREDNIEJ)
+            # ------------------------------------------------------------------
+            bb_width = c.get('bb_width', 0.0)
+            is_swing_market = bb_width >= 0.020  # Wymóg minimalnej amplitudy fali (anty-sieczka)
+
+            recent_low_4 = df['low'].iloc[-5:-1].min()
+            recent_bb_lower = df['bb_lower'].iloc[-5:-1].min()
+            recent_rsi_min = df['rsi'].iloc[-5:-1].min()
+
+            in_wave_trough = (recent_low_4 <= recent_bb_lower * 1.004) or (recent_rsi_min <= 40.0) or (c['rsi'] <= 42.0)
+
+            # Potwierdzenie obrony dołka:
+            # - Młot z dolnym knotem >= 35%
+            # - Objęcie hossy
+            # - Schodkowe odwrócenie (2 zielone świece, wyższy dołek)
+            is_hammer = (candle_range > 0) and ((lower_wick / candle_range) >= 0.35)
+            is_engulfing = (c['close'] > p['open']) and (p['close'] < p['open'])
+            is_staircase = (c['low'] >= p['low']) and (c['close'] > p['close']) and (c['close'] >= c['ema9'] * 0.999)
+
+            swing_wave_signal = (
+                is_swing_market and
+                in_wave_trough and
+                is_green and
+                (is_hammer or is_engulfing or is_staircase) and
+                (c['close'] <= c['bb_mid'] * 1.004) and  # Kupujemy w dolnej połowie fali
+                (vol_ratio >= 0.80)
+            )
+
+            # ------------------------------------------------------------------
+            # KWALIFIKACJA I WYBÓR NAJLEPSZEJ OKAZJI
+            # ------------------------------------------------------------------
+            if not trend_rider_signal and not swing_wave_signal:
+                continue
+
+            is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
+            if is_downtrend and not is_breakout_ema200:
+                # W downtrendzie wymagamy potwierdzenia RSI
                 if c['close'] <= c['ema9'] or c['rsi'] <= p['rsi']:
                     continue
 
+            # Świeca bieżąca nie może się zapadać
             live_holding = c_now['low'] >= min(c['low'], p['low']) * 0.998
             live_not_dumping = c_now['close'] >= c_now['open']
 
             if live_holding and live_not_dumping:
-                if trend_ride_confirmed:
-                    mode_tag = "TREND_MOMENTUM_RIDE"
-                elif breakout_momentum_confirmed:
-                    mode_tag = "EMA_BREAKOUT_MOMENTUM"
-                elif trend_bounce_confirmed:
-                    mode_tag = "TREND_EMA_BOUNCE"
-                elif staircase_confirmed:
-                    mode_tag = "STAIRCASE_BOTTOM"
-                elif strong_bottom_rejection:
-                    mode_tag = "HAMMER_REVERSAL"
+                if trend_rider_signal:
+                    mode_tag = "TREND_RIDER"
+                    score = vol_ratio * 150.0 + (c['rsi'] * 0.5)  # Priorytet dla monet w ruchu
                 else:
-                    mode_tag = "ENGULFING_BOTTOM"
-
-                score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
-                if trend_ride_confirmed:
-                    score = vol_ratio * 135.0  # Najwyższy priorytet dla monet w dynamicznym trendzie
-                elif breakout_momentum_confirmed:
-                    score = vol_ratio * 120.0
-                elif trend_bounce_confirmed:
-                    score *= 1.25
+                    mode_tag = "SWING_WAVE"
+                    score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
 
                 if best_candidate is None or score > best_candidate['score']:
                     best_candidate = {
                         "symbol": symbol, "score": score, "tag": mode_tag, 
-                        "df": df, "is_downtrend": is_downtrend and not breakout_momentum_confirmed,
-                        "swing_low": min(c['low'], p['low'], c_now['low']),
-                        "vol_ratio": vol_ratio
+                        "df": df, "is_downtrend": is_downtrend and not is_breakout_ema200,
+                        "swing_low": min(c['low'], p['low'], c_now['low'])
                     }
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
@@ -631,8 +547,11 @@ def run_sine_wave_strategy():
         current_count = len(active_positions)
         current_items = list(active_positions.items())
 
-    # SCENARIUSZ 1: WOLNY SLOT
+    # ==========================================================================
+    # SCENARIUSZ 1: WOLNY SLOT W PORTFELU (< MAX_TOTAL_POSITIONS)
+    # ==========================================================================
     if current_count < MAX_TOTAL_POSITIONS:
+        # Bezpiecznik downtrendu: redukcja wielkości pozycji do 60%
         position_pct = (CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT
         target_allocation = total_equity * position_pct
 
@@ -666,10 +585,12 @@ def run_sine_wave_strategy():
                     save_positions(active_positions)
                 is_micro = any(m in cand_sym for m in ["PEPE", "BONK", "SHIB"])
                 sl_fmt = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-                logging.info(f"🎯🚀 [WEJŚCIE W POZYCJĘ] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
+                logging.info(f"🎯🚀 [ZAKUP: {cand_tag}] {cand_sym} | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
         return
 
+    # ==========================================================================
     # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI
+    # ==========================================================================
     stagnant_candidate = None
     for def_sym, def_pos in current_items:
         c_curr = safe_float(tickers.get(def_sym, {}).get("lastPrice"), def_pos["buy_price"])
@@ -692,7 +613,7 @@ def run_sine_wave_strategy():
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
         old_time = stagnant_candidate["time_min"]
-        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy sygnał na {cand_sym} ({cand_tag})!")
+        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} ({old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy sygnał: {cand_sym} ({cand_tag})!")
 
         base_old = get_base_coin(old_sym)
         bal_old = get_coin_available_balance(base_old)
@@ -745,11 +666,11 @@ def run_sine_wave_strategy():
                     logging.info(f"🎉🚀 [ROTACJA UDANA] Zamieniono na {cand_sym} po cenie {curr_price_c} ({cand_tag})!")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: ELASTYCZNY BUFOR
+# MONITORING ZYSKÓW: ELASTYCZNY BUFOR TRAILINGU I ZAPADKA RATCHET
 # ==============================================================================
 def monitoring_worker():
     global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z elastycznym buforem.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z elastycznym buforem i zapadką Ratchet.")
     while True:
         try:
             with lock_pos:
@@ -762,7 +683,9 @@ def monitoring_worker():
             tickers = get_all_spot_tickers()
             now_ts = time.time()
 
-            # 1. DOLAROWY TRAILING PORTFELA
+            # ------------------------------------------------------------------
+            # 1. DOLAROWY TRAILING PORTFELA (BASKET LOCK: +20$ SZCZYT -> STOP -5$)
+            # ------------------------------------------------------------------
             total_unrealized_usd = 0.0
             position_prices = {}
 
@@ -777,7 +700,7 @@ def monitoring_worker():
 
             if basket_peak_profit_usd >= USD_PROFIT_TRIGGER:
                 if total_unrealized_usd <= (basket_peak_profit_usd - USD_TRAILING_DROP):
-                    logging.info(f"🏆💰 [BASKET LOCK] Zamknięcie koszyka przy zysku +{total_unrealized_usd:.2f}$ (szczyt: +{basket_peak_profit_usd:.2f}$).")
+                    logging.info(f"🏆💰 [BASKET LOCK] Zrealizowano zysk koszyka: +{total_unrealized_usd:.2f}$ (ze szczytu: +{basket_peak_profit_usd:.2f}$).")
                     for symbol, pos in items:
                         c_curr = position_prices.get(symbol, pos["buy_price"])
                         base_c = get_base_coin(symbol)
@@ -796,7 +719,9 @@ def monitoring_worker():
                     time.sleep(2.0)
                     continue
 
-            # 2. ELASTYCZNY BUFOR TRAILINGU
+            # ------------------------------------------------------------------
+            # 2. ADAPTACYJNA ZAPADKA PROCENTOWA I ELASTYCZNY BUFOR DLA KAŻDEJ POZYCJI
+            # ------------------------------------------------------------------
             to_delete = []
             for symbol, pos in items:
                 c_curr = position_prices.get(symbol, 0.0)
@@ -808,21 +733,27 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
+                # Śledzenie lokalnego szczytu
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
 
                 current_sl = pos.get("trailing_sl", bp * 0.98)
 
+                # Zapadka Ratchet & Elastyczny Bufor:
                 if peak_pct >= 0.100:
+                    # Rajd paraboliczny (>= +10%): bufor do 4.2%, zablokowane min. 65% zysku ze szczytu
                     elastic_buffer = min(0.042, peak_pct * 0.35)
                     min_floor = bp * (1.0 + (peak_pct * 0.65))
                     current_sl = max(current_sl, peak * (1.0 - elastic_buffer), min_floor)
                 elif peak_pct >= 0.065:
+                    # Bardzo silny ruch (>= +6.5%): bufor 3.0%, gwarancja min. +4.5% zysku
                     current_sl = max(current_sl, peak * (1.0 - 0.030), bp * 1.045)
                 elif peak_pct >= 0.040:
+                    # Silny impuls (>= +4.0%): bufor 2.4% (spokojny retest EMA 9), gwarancja min. +2.4%
                     current_sl = max(current_sl, peak * (1.0 - 0.024), bp * 1.024)
                 elif peak_pct >= 0.032:
+                    # TP1: Automatyczna realizacja 50% pozycji przy +3.2%
                     if not pos.get("tp1_executed", False):
                         full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
                         half_qty = full_qty / Decimal("2")
@@ -838,15 +769,18 @@ def monitoring_worker():
                                 record_closed_trade(symbol, pos.get("strategy"), bp, c_curr, safe_float(half_qty_str), "TP1 (+3.2% sprzedano 50%)")
                                 logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Sprzedano 50% pozycji przy +{gain_pct*100:.2f}%!")
                         pos["tp1_executed"] = True
+                    # Dla pozostałej części: bufor 1.8%, gwarancja min. +1.50%
                     current_sl = max(current_sl, peak * (1.0 - 0.018), bp * 1.015)
                 elif peak_pct >= 0.022:
+                    # Rozwinięcie ruchu (>= +2.2%): bufor 1.6%, gwarancja min. +0.80% zysku
                     current_sl = max(current_sl, peak * (1.0 - 0.016), bp * 1.008)
                 elif peak_pct >= 0.016:
+                    # Początek wybicia (>= +1.6%): Break-Even (+0.50% na pokrycie prowizji)
                     current_sl = max(current_sl, bp * 1.005)
 
                 pos["trailing_sl"] = current_sl
 
-                # EKSTREMALNY KNOT ODRZUCENIA
+                # Bezpiecznik skrajnego knota odrzucenia szczytu (tylko gigantyczny knot podażowy >= 45%)
                 is_extreme_climax = False
                 df_cur = get_market_data_no_cache(symbol, interval="15", limit=30)
                 if df_cur is not None and len(df_cur) >= 2:
@@ -939,7 +873,7 @@ def bot_loop():
                 last_print = now
 
             if is_btc_market_healthy():
-                run_sine_wave_strategy()
+                run_dual_engine_strategy()
 
         except Exception as e:
             logging.error(f"Błąd głównej pętli: {e}")
@@ -957,7 +891,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Momentum Ride & Breakout")
+        self.wfile.write(b"Bybit Spot Bot Active - Dual Engine Architecture")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
