@@ -68,9 +68,9 @@ MIN_24H_TURNOVER_USD = 60000.0
 USDC_MAX_SPREAD_PCT = 0.0050       
 
 # BEZPIECZNIKI ANTY-PŁASKIEGO RYNKU
-MIN_RECENT_90M_RANGE_PCT = 0.012   # Ostatnie 1.5h musi mieć min. 1.2% ruchu
-MIN_BB_BANDWIDTH_PCT = 0.022       # Kanał Bollingera musi mieć min. 2.2% szerokości
-MIN_SPACE_TO_RESISTANCE_PCT = 0.018# Min. 1.8% wolnej przestrzeni do oporów EMA 89/200
+MIN_RECENT_90M_RANGE_PCT = 0.011   # Min. 1.1% ruchu w 90 min (nie blokuje wybić po akumulacji)
+MIN_BB_BANDWIDTH_PCT = 0.020       # Kanał Bollingera min. 2.0% szerokości
+MIN_SPACE_TO_RESISTANCE_PCT = 0.016# Min. 1.6% przestrzeni do oporów (chyba że następuje wybicie)
 
 # DOLAROWY TRAILING PORTFELA
 USD_PROFIT_TRIGGER = 20.0          
@@ -395,7 +395,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ZAKUPÓW: OBSŁUGA GŁĘBOKIEGO DOŁKA ORAZ ODBICIA W TRENDZIE (EMA BOUNCE)
+# STRATEGIA ZAKUPÓW: OBSŁUGA DOŁKÓW, ODBIĆ ORAZ WYBIĆ Z PRZEŁAMANIEM OPORU (BREAKOUT)
 # ==============================================================================
 def run_sine_wave_strategy():
     global active_positions
@@ -437,7 +437,6 @@ def run_sine_wave_strategy():
             c = df.iloc[-2]
             p = df.iloc[-3]
 
-            # Cooldown po stracie
             cooldown_ok = True
             with lock_history:
                 for t in reversed(trade_history.get("trades_log", [])):
@@ -448,46 +447,52 @@ def run_sine_wave_strategy():
             if not cooldown_ok:
                 continue
 
-            # ------------------------------------------------------------------
-            # 1. BLOKADA ŚWIEŻEGO BEZRUCHU (90-MINUTOWA KONSOLIDACJA)
-            # ------------------------------------------------------------------
-            recent_90m_high = df['high'].iloc[-7:-1].max()
-            recent_90m_low = df['low'].iloc[-7:-1].min()
-            recent_90m_range = (recent_90m_high - recent_90m_low) / recent_90m_low if recent_90m_low > 0 else 0.0
-            if recent_90m_range < MIN_RECENT_90M_RANGE_PCT:
-                continue
-
             bb_width = c.get('bb_width', 0.0)
             if bb_width < MIN_BB_BANDWIDTH_PCT:
                 continue
 
             # ------------------------------------------------------------------
-            # 2. PRZESTRZEŃ DO OPORÓW (RUNWAY CLEARANCE)
-            # ------------------------------------------------------------------
-            if c['close'] < c['ema200']:
-                if (c['ema200'] - c['close']) / c['close'] < MIN_SPACE_TO_RESISTANCE_PCT:
-                    continue
-
-            if c['close'] < c['ema89']:
-                if (c['ema89'] - c['close']) / c['close'] < 0.014:
-                    continue
-
-            # ------------------------------------------------------------------
-            # 3. REŻIM RYNKU
+            # 1. IDENTYFIKACJA REŻIMÓW RYNKOWYCH
             # ------------------------------------------------------------------
             is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
             is_strong_uptrend = (c['close'] > c['ema200']) and (c['ema50'] > c['ema200']) and (c['ema21'] > c['ema89'])
 
+            # NOWOŚĆ: Wykrycie wybicia przez kluczowe średnie (EMA 89 lub EMA 200)
+            # Świeca zamyka się ponad EMA 200 lub EMA 89, podczas gdy poprzednia świeca była pod nią
+            broke_above_ema200 = (c['close'] > c['ema200']) and (p['close'] <= p['ema200'])
+            broke_above_ema89 = (c['close'] > c['ema89']) and (p['close'] <= p['ema89'])
+            is_regime_breakout = (broke_above_ema200 or broke_above_ema89) and (c['close'] > c['ema9'])
+
+            # ------------------------------------------------------------------
+            # 2. BEZPIECZNIKI ZBIEŻNOŚCI I OPORÓW (RUNWAY CLEARANCE)
+            # ------------------------------------------------------------------
+            # Jeśli następuje przełamanie i wybicie ponad opór, Runway Clearance NIE BLOKUJE zlecenia!
+            if not is_regime_breakout:
+                recent_90m_high = df['high'].iloc[-7:-1].max()
+                recent_90m_low = df['low'].iloc[-7:-1].min()
+                recent_90m_range = (recent_90m_high - recent_90m_low) / recent_90m_low if recent_90m_low > 0 else 0.0
+                if recent_90m_range < MIN_RECENT_90M_RANGE_PCT:
+                    continue
+
+                if c['close'] < c['ema200']:
+                    if (c['ema200'] - c['close']) / c['close'] < MIN_SPACE_TO_RESISTANCE_PCT:
+                        continue
+                if c['close'] < c['ema89']:
+                    if (c['ema89'] - c['close']) / c['close'] < 0.014:
+                        continue
+
+            # ------------------------------------------------------------------
+            # 3. KWALIFIKACJA STREF WEJŚCIA
+            # ------------------------------------------------------------------
             # STREFA A: Głęboki dołek sinusoidy (Wstęga Bollingera lub RSI <= 38)
             recent_low_4 = df['low'].iloc[-5:-1].min()
             recent_bb_lower_min = df['bb_lower'].iloc[-5:-1].min()
             recent_rsi_min = df['rsi'].iloc[-5:-1].min()
-
             touched_bottom = (recent_low_4 <= recent_bb_lower_min * 1.004) or (recent_rsi_min <= 38.0)
             is_oversold_now = (c['low'] <= c['bb_lower'] * 1.003) or (c['rsi'] <= 42.0)
             in_trough_zone = touched_bottom or is_oversold_now
 
-            # STREFA B: Płytki dołek / pullback do średnich w silnym trendzie wzrostowym (NOWOŚĆ)
+            # STREFA B: Płytki dołek / odbicie od średnich w silnym trendzie wzrostowym
             tested_ema_support = (
                 (p['low'] <= p['ema50'] * 1.004 and p['low'] >= p['ema50'] * 0.992) or
                 (c['low'] <= c['ema50'] * 1.004 and c['low'] >= c['ema50'] * 0.992) or
@@ -497,7 +502,10 @@ def run_sine_wave_strategy():
             )
             in_trend_pullback_zone = is_strong_uptrend and tested_ema_support and (c['rsi'] <= 58.0)
 
-            if not in_trough_zone and not in_trend_pullback_zone:
+            # STREFA C: Impulsowe wybicie ponad opory (SUI-style breakout)
+            in_momentum_breakout = is_regime_breakout and (c['rsi'] <= 68.0)
+
+            if not in_trough_zone and not in_trend_pullback_zone and not in_momentum_breakout:
                 continue
 
             # ------------------------------------------------------------------
@@ -510,37 +518,42 @@ def run_sine_wave_strategy():
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
 
             # SYGNAŁ A: Klasyczny młot na dnie
-            strong_bottom_rejection = is_green and (candle_range > 0) and ((lower_wick / candle_range) >= 0.38) and (vol_ratio >= 1.15)
+            strong_bottom_rejection = in_trough_zone and is_green and (candle_range > 0) and ((lower_wick / candle_range) >= 0.38) and (vol_ratio >= 1.15)
 
             # SYGNAŁ B: Dynamiczne objęcie hossy
-            bullish_engulfing = is_green and (c['close'] > p['open']) and (p['close'] < p['open']) and (vol_ratio >= 1.20)
+            bullish_engulfing = in_trough_zone and is_green and (c['close'] > p['open']) and (p['close'] < p['open']) and (vol_ratio >= 1.20)
 
-            # SYGNAŁ C: Schodkowe ciche odwrócenie (Staircase Reversal na dnie)
+            # SYGNAŁ C: Schodkowe odwrócenie (Staircase)
             staircase_higher_low = is_green and (c['low'] >= p['low']) and (c['close'] > p['close'])
             staircase_reclaiming = (c['close'] >= c['ema9'] * 0.999) or (c_now['close'] >= c_now['ema9'])
             still_in_lower_wave = c['close'] <= c['bb_mid'] * 1.003
             staircase_confirmed = in_trough_zone and staircase_higher_low and staircase_reclaiming and still_in_lower_wave and (vol_ratio >= 0.80)
 
-            # SYGNAŁ D: Odbicie od średnich w silnym trendzie wzrostowym (TREND EMA BOUNCE)
+            # SYGNAŁ D: Odbicie od średnich w trendzie wzrostowym
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
             trend_bounce_confirmed = (
-                in_trend_pullback_zone and
-                is_green and
-                (c['close'] >= c['ema9'] * 0.999) and
-                (dist_from_ema9 <= 0.012) and
+                in_trend_pullback_zone and is_green and
+                (c['close'] >= c['ema9'] * 0.999) and (dist_from_ema9 <= 0.012) and
                 ((candle_range > 0 and (lower_wick / candle_range) >= 0.25) or (c['close'] > p['high'])) and
                 (vol_ratio >= 0.90)
             )
 
-            has_valid_entry = strong_bottom_rejection or bullish_engulfing or staircase_confirmed or trend_bounce_confirmed
+            # SYGNAŁ E: Impuls wybicia oporu (EMA BREAKOUT MOMENTUM)
+            breakout_momentum_confirmed = (
+                in_momentum_breakout and is_green and
+                (c['close'] > p['high']) and
+                (dist_from_ema9 <= 0.018) and
+                (vol_ratio >= 1.15)
+            )
+
+            has_valid_entry = strong_bottom_rejection or bullish_engulfing or staircase_confirmed or trend_bounce_confirmed or breakout_momentum_confirmed
             if not has_valid_entry:
                 continue
 
-            # Odrzucenie świecy z dominującym knotem z góry
             if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
-            if is_downtrend:
+            if is_downtrend and not breakout_momentum_confirmed:
                 if c['close'] <= c['ema9'] or c['rsi'] <= p['rsi']:
                     continue
 
@@ -548,7 +561,9 @@ def run_sine_wave_strategy():
             live_not_dumping = c_now['close'] >= c_now['open']
 
             if live_holding and live_not_dumping:
-                if trend_bounce_confirmed:
+                if breakout_momentum_confirmed:
+                    mode_tag = "EMA_BREAKOUT_MOMENTUM"
+                elif trend_bounce_confirmed:
                     mode_tag = "TREND_EMA_BOUNCE"
                 elif staircase_confirmed:
                     mode_tag = "STAIRCASE_BOTTOM"
@@ -558,13 +573,16 @@ def run_sine_wave_strategy():
                     mode_tag = "ENGULFING_BOTTOM"
 
                 score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
-                if trend_bounce_confirmed:
-                    score *= 1.25  # Priorytet dla monet w silnym trendzie
+                if breakout_momentum_confirmed:
+                    score = vol_ratio * 120.0  # Wysoki priorytet dla świeżych wybić oporów
+                elif trend_bounce_confirmed:
+                    score *= 1.25
 
                 if best_candidate is None or score > best_candidate['score']:
                     best_candidate = {
                         "symbol": symbol, "score": score, "tag": mode_tag, 
-                        "df": df, "is_downtrend": is_downtrend, "swing_low": min(c['low'], p['low'], c_now['low']),
+                        "df": df, "is_downtrend": is_downtrend and not breakout_momentum_confirmed,
+                        "swing_low": min(c['low'], p['low'], c_now['low']),
                         "vol_ratio": vol_ratio
                     }
         except Exception as e:
@@ -618,7 +636,7 @@ def run_sine_wave_strategy():
                     save_positions(active_positions)
                 is_micro = any(m in cand_sym for m in ["PEPE", "BONK", "SHIB"])
                 sl_fmt = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-                logging.info(f"🎯🌊 [WEJŚCIE W POZYCJĘ] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
+                logging.info(f"🎯🚀 [WEJŚCIE W POZYCJĘ] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
         return
 
     # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI
@@ -909,7 +927,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Trend EMA Bounce & Sine Wave Strategy")
+        self.wfile.write(b"Bybit Spot Bot Active - Momentum Breakout & Sine Wave")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
