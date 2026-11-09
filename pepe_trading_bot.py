@@ -45,7 +45,7 @@ def sync_bybit_clock():
     return False
 
 # ==============================================================================
-# KONFIGURACJA GŁÓWNA
+# KONFIGURACJA GŁÓWNA I PARAMETRY SKANERA
 # ==============================================================================
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "TUTAJ_TWÓJ_KEY").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "TUTAJ_TWÓJ_SECRET").strip()
@@ -54,26 +54,27 @@ TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-TARGET_COINS = [
-    "INJUSDC", "PEPEUSDC", "SOLUSDC", "DOGEUSDC", "WIFUSDC", "SUIUSDC", 
-    "BONKUSDC", "ETHUSDC", "XRPUSDC", "NEARUSDC", "AVAXUSDC", "LINKUSDC", "SHIBUSDC"
-]
+# CZARNA LISTA STABLECOINÓW (BRAK ZMIENNOŚCI)
+EXCLUDED_BASE_COINS = {
+    "USDT", "EURC", "USD", "DAI", "FDUSD", "TUSD", "BUSD", "USDE", "PYUSD", "USDD"
+}
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (pozwala na 2 pozycje)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-MIN_24H_TURNOVER_USD = 60000.0     
-USDC_MAX_SPREAD_PCT = 0.0050       
+MIN_24H_TURNOVER_USD = 60000.0     # Odsiew martwych par o znikomym obrocie
+USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny dopuszczalny spread (0.50%)
+MAX_SCAN_CANDIDATES = 35           # Limit par analizowanych równolegle (ochrona przed rate-limitami)
 
 # DOLAROWY TRAILING PORTFELA (BASKET LOCK)
-USD_PROFIT_TRIGGER = 20.0          # Aktywacja po wyjściu koszyka na +20 USD
-USD_TRAILING_DROP = 5.0            # Cofnięcie o 5 USD realizuje cały zysk
+USD_PROFIT_TRIGGER = 20.0          # Zysk koszyka >= 20 USD aktywuje trailing
+USD_TRAILING_DROP = 5.0            # Cofnięcie o 5 USD realizuje cały koszyk
 basket_peak_profit_usd = 0.0       
 
 # ROTACJA I STAGNATION
-STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez ruchu kwalifikuje do rotacji
+STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez ruchu kwalifikuje do wymiany
 STAGNATION_MAX_GAIN_PCT = 0.0040    
 STAGNATION_FORCE_EXIT_SEC = 3600    # Twardy exit po 60 min bezruchu
 
@@ -111,7 +112,7 @@ if not session:
     session = HTTP(testnet=TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=20000)
     session.endpoint = "https://api.bybit.eu"
 
-adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
+adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40)
 if hasattr(session, "client") and isinstance(session.client, requests.Session):
     session.client.mount("https://", adapter)
     session.client.mount("http://", adapter)
@@ -334,7 +335,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# SYNCHRONIZACJA PORTFELA
+# SYNCHRONIZACJA PORTFELA (DOWOLNA MONETA USDC NA KONCIE)
 # ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
@@ -353,11 +354,11 @@ def sync_positions_from_bybit():
                     continue
                 bal = max(safe_float(coin_info.get("walletBalance")), safe_float(coin_info.get("equity")))
                 if bal > 0:
-                    real_holdings[f"{coin}USDC"] = bal
+                    real_holdings[f"{coin}{QUOTE_COIN}"] = bal
 
             to_remove = []
             for sym, pos in list(active_positions.items()):
-                if sym not in TARGET_COINS or real_holdings.get(sym, 0.0) <= 0:
+                if not sym.endswith(QUOTE_COIN) or real_holdings.get(sym, 0.0) <= 0:
                     to_remove.append((sym, "brak salda na Bybit"))
 
             for sym, reason in to_remove:
@@ -366,7 +367,7 @@ def sync_positions_from_bybit():
                     logging.info(f"🧹 [SYNC] Usunięto {sym} ({reason}).")
 
             for sym, bal in real_holdings.items():
-                if sym in TARGET_COINS and sym not in active_positions:
+                if sym not in active_positions:
                     tickers = get_all_spot_tickers()
                     curr_p = safe_float(tickers.get(sym, {}).get("lastPrice"), 0.0)
                     if (bal * curr_p) >= MIN_EXCHANGE_NOTIONAL:
@@ -390,38 +391,71 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ZAKUPÓW: 2 SILNIKI Z FILTREM DUMP CANDLE & PANIC VOLUME
+# DYNAMICZNY SKANER CAŁEGO RYNKU SPOT USDC
 # ==============================================================================
-def run_dual_engine_strategy():
-    global active_positions
-    total_equity, free_usdc = get_balances()
-    now_ts = time.time()
+def get_dynamic_usdc_targets(all_tickers):
+    """Przeszukuje całą giełdę Bybit i wybiera płynne pary USDC z wykluczeniem stablecoinów."""
+    valid_candidates = []
+    for symbol, t_data in all_tickers.items():
+        if not symbol.endswith(QUOTE_COIN):
+            continue
 
-    tickers = get_all_spot_tickers()
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in TARGET_COINS}
-        for future in concurrent.futures.as_completed(futures):
-            sym, df = future.result()
-            if df is not None:
-                results[sym] = df
+        base = get_base_coin(symbol)
+        if base in EXCLUDED_BASE_COINS:
+            continue
 
-    best_candidate = None
-
-    for symbol in TARGET_COINS:
-        with lock_pos:
-            if symbol in active_positions:
-                continue
-
-        t_data = tickers.get(symbol, {})
         turnover_24h = safe_float(t_data.get("turnover24h", 0.0))
         if turnover_24h < MIN_24H_TURNOVER_USD:
             continue
 
         bid = safe_float(t_data.get("bid1Price"))
         ask = safe_float(t_data.get("ask1Price"))
-        if bid > 0 and ask > 0 and ((ask - bid) / bid) > USDC_MAX_SPREAD_PCT:
+        if bid <= 0 or ask <= 0:
             continue
+        spread = (ask - bid) / bid
+        if spread > USDC_MAX_SPREAD_PCT:
+            continue
+
+        valid_candidates.append({
+            "symbol": symbol,
+            "turnover": turnover_24h,
+            "price24hPcnt": safe_float(t_data.get("price24hPcnt", 0.0))
+        })
+
+    # Sortujemy wstępnie po obrocie 24h i bierzemy topowe pary pod kątem analizy technicznej
+    valid_candidates.sort(key=lambda x: x["turnover"], reverse=True)
+    selected_symbols = [c["symbol"] for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
+    return selected_symbols
+
+# ==============================================================================
+# STRATEGIA ŁOWCY BONUSÓW Z DYNAMICZNYM SKANEREM
+# ==============================================================================
+def run_bonus_hunter_strategy():
+    global active_positions
+    total_equity, free_usdc = get_balances()
+    now_ts = time.time()
+
+    all_tickers = get_all_spot_tickers()
+    if not all_tickers:
+        return
+
+    # Dynamiczne wykrywanie wszystkich par USDC na giełdzie
+    scanned_coins = get_dynamic_usdc_targets(all_tickers)
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_data_worker, symbol): symbol for symbol in scanned_coins}
+        for future in concurrent.futures.as_completed(futures):
+            sym, df = future.result()
+            if df is not None:
+                results[sym] = df
+
+    candidates = []
+
+    for symbol in scanned_coins:
+        with lock_pos:
+            if symbol in active_positions:
+                continue
 
         df = results.get(symbol)
         if df is None or len(df) < 60:
@@ -434,22 +468,23 @@ def run_dual_engine_strategy():
             p2 = df.iloc[-4]
 
             # ------------------------------------------------------------------
-            # BEZPIECZNIK 1: BLOKADA PO ZRZUCIE (DUMP CANDLE & PANIC VOLUME GUARD)
-            # Odrzuca pułapki na byki (takie jak na NEAR pod EMA 200)
+            # 1. BEZPIECZNIK ANTY-PUŁAPKA (BULL TRAP / DUMP CANDLE ANNIHILATOR)
             # ------------------------------------------------------------------
-            p_is_red = p['close'] < p['open']
-            p_drop_pct = (p['open'] - p['close']) / p['open'] if p_is_red else 0.0
+            p_red = p['close'] < p['open']
+            p_drop = (p['open'] - p['close']) / p['open'] if p_red else 0.0
             p_vol_ratio = (p['volume'] / p['vol_ma20']) if (p['vol_ma20'] and p['vol_ma20'] > 0) else 1.0
 
-            p2_is_red = p2['close'] < p2['open']
-            p2_drop_pct = (p2['open'] - p2['close']) / p2['open'] if p2_is_red else 0.0
+            p2_red = p2['close'] < p2['open']
+            p2_drop = (p2['open'] - p2['close']) / p2['open'] if p2_red else 0.0
             p2_vol_ratio = (p2['volume'] / p2['vol_ma20']) if (p2['vol_ma20'] and p2['vol_ma20'] > 0) else 1.0
 
-            # Jeśli poprzednia świeca była potężnym zrzutem (> 1.3%) lub miała paniczny wolumen (> 1.4x)
-            recent_dump_detected = (p_is_red and (p_drop_pct >= 0.013 or p_vol_ratio >= 1.40)) or \
-                                   (p2_is_red and (p2_drop_pct >= 0.015 and p2_vol_ratio >= 1.40))
-            if recent_dump_detected:
-                continue  # Kurz po zrzucie jeszcze nie opadł – ZAKAZ WEJŚCIA!
+            dump_in_recent = (p_red and (p_drop >= 0.012 or p_vol_ratio >= 1.35)) or \
+                             (p2_red and (p2_drop >= 0.014 and p2_vol_ratio >= 1.35))
+
+            if dump_in_recent:
+                highest_dump_level = max(p['high'], p2['high'])
+                if c['close'] <= highest_dump_level:
+                    continue  # Podaż nie została zanegowana – omijamy pułapkę!
 
             is_green = c['close'] > c['open']
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
@@ -457,99 +492,97 @@ def run_dual_engine_strategy():
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
 
-            # Odrzucenie świecy wejścia z dominującym knotem podażowym z góry
             if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
             # ------------------------------------------------------------------
-            # SILNIK 1: TREND RIDER (WYŁĄCZNIE DLA PRAWDZIWEGO TRENDU NAD EMA 200)
+            # 2. SELEKCJA BONUSÓW: TREND RUNNER, GOLDEN BREAKOUT, SWING REVERSAL
             # ------------------------------------------------------------------
-            # Moneta musi być FAKTYCZNIE w trendzie wzrostowym (nad EMA 200!)
-            is_above_ema200 = c['close'] > c['ema200']
-            is_uptrend_structure = is_above_ema200 and (c['close'] > c['ema50']) and (c['ema9'] >= c['ema21'])
-            
-            # Świeże, potężne wybicie ponad EMA 200
-            is_breakout_ema200 = (c['close'] > c['ema200']) and (p['close'] <= p['ema200']) and (c['close'] > c['open'])
-            
-            tested_trend_support = (
-                (p['low'] <= p['ema9'] * 1.003) or (c['low'] <= c['ema9'] * 1.003) or
-                (p['low'] <= p['ema21'] * 1.003) or (c['low'] <= c['ema21'] * 1.003) or
-                is_breakout_ema200
-            )
-            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
+            is_bull_market = c['close'] > c['ema200']
+            is_stacked_bull = is_bull_market and (c['close'] > c['ema50']) and (c['ema9'] > c['ema21'])
 
-            trend_rider_signal = (
-                (is_uptrend_structure or is_breakout_ema200) and
-                tested_trend_support and
+            # A) BONUS 1: GOLDEN BREAKOUT (WYBICIE NOWEGO SZCZYTU 4H Z WOLUMENEM)
+            high_4h = df['high'].iloc[-17:-2].max()
+            is_golden_breakout = (
+                is_bull_market and
+                (c['close'] > high_4h) and
+                is_green and
+                (vol_ratio >= 1.25) and
+                (c['rsi'] <= 75.0)
+            )
+
+            # B) BONUS 2: TREND RUNNER (PULLBACK DO EMA 9/21 W SILNYM RAJDZIE)
+            tested_ema9_or_21 = (p['low'] <= p['ema9'] * 1.003) or (c['low'] <= c['ema9'] * 1.003) or (p['low'] <= p['ema21'] * 1.003)
+            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
+            is_trend_runner = (
+                is_stacked_bull and
+                tested_ema9_or_21 and
                 is_green and
                 (c['close'] >= c['ema9'] * 0.999) and
-                (dist_from_ema9 <= 0.015) and
-                (c['rsi'] <= 72.0) and
+                (dist_from_ema9 <= 0.016) and
+                (c['rsi'] <= 70.0) and
                 (vol_ratio >= 0.85)
             )
 
-            # ------------------------------------------------------------------
-            # SILNIK 2: SWING WAVE (DLA KONSOLIDACJI I ODWRÓCEŃ W KANALE)
-            # ------------------------------------------------------------------
+            # C) SWING REVERSAL: DOŁEK W KONSOLIDACJI
             bb_width = c.get('bb_width', 0.0)
-            is_swing_market = bb_width >= 0.020  # Wymóg min. 2.0% zmienności kanału
-
             recent_low_4 = df['low'].iloc[-5:-1].min()
             recent_bb_lower = df['bb_lower'].iloc[-5:-1].min()
             recent_rsi_min = df['rsi'].iloc[-5:-1].min()
+            in_deep_trough = (recent_low_4 <= recent_bb_lower * 1.003) or (recent_rsi_min <= 38.0)
 
-            in_wave_trough = (recent_low_4 <= recent_bb_lower * 1.004) or (recent_rsi_min <= 40.0) or (c['rsi'] <= 42.0)
-
-            is_hammer = (candle_range > 0) and ((lower_wick / candle_range) >= 0.35)
+            is_hammer = (candle_range > 0) and ((lower_wick / candle_range) >= 0.38)
             is_engulfing = (c['close'] > p['open']) and (p['close'] < p['open'])
             is_staircase = (c['low'] >= p['low']) and (c['close'] > p['close']) and (c['close'] >= c['ema9'] * 0.999)
 
-            swing_wave_signal = (
-                is_swing_market and
-                in_wave_trough and
+            is_swing_reversal = (
+                (bb_width >= 0.020) and
+                in_deep_trough and
                 is_green and
                 (is_hammer or is_engulfing or is_staircase) and
-                (c['close'] <= c['bb_mid'] * 1.004) and
+                (c['close'] <= c['bb_mid'] * 1.003) and
                 (vol_ratio >= 0.80)
             )
 
-            # ------------------------------------------------------------------
-            # DECYZJA WEJŚCIA
-            # ------------------------------------------------------------------
-            if not trend_rider_signal and not swing_wave_signal:
+            if not is_golden_breakout and not is_trend_runner and not is_swing_reversal:
                 continue
 
-            is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
-            if is_downtrend and not is_breakout_ema200:
-                # W reżimie spadkowym Trend Rider jest wyłączony! Działa tylko głęboki Swing Wave
-                if trend_rider_signal and not swing_wave_signal:
-                    continue
-                if c['close'] <= c['ema9'] or c['rsi'] <= p['rsi']:
-                    continue
-
-            # Świeca na żywo nie może wybijać nowego dna
             live_holding = c_now['low'] >= min(c['low'], p['low']) * 0.998
             live_not_dumping = c_now['close'] >= c_now['open']
+            if not (live_holding and live_not_dumping):
+                continue
 
-            if live_holding and live_not_dumping:
-                if trend_rider_signal:
-                    mode_tag = "TREND_RIDER"
-                    score = vol_ratio * 150.0 + (c['rsi'] * 0.5)
-                else:
-                    mode_tag = "SWING_WAVE"
-                    score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
+            # ------------------------------------------------------------------
+            # 3. RANKING SIŁY RELATYWNEJ
+            # ------------------------------------------------------------------
+            ret_1h = (c['close'] - df['close'].iloc[-5]) / df['close'].iloc[-5]
 
-                if best_candidate is None or score > best_candidate['score']:
-                    best_candidate = {
-                        "symbol": symbol, "score": score, "tag": mode_tag, 
-                        "df": df, "is_downtrend": is_downtrend and not is_breakout_ema200,
-                        "swing_low": min(c['low'], p['low'], c_now['low'])
-                    }
+            if is_golden_breakout:
+                tag = "GOLDEN_BREAKOUT"
+                score = 300.0 + (ret_1h * 1000.0) + (vol_ratio * 40.0)
+            elif is_trend_runner:
+                tag = "TREND_RUNNER"
+                score = 200.0 + (ret_1h * 800.0) + (vol_ratio * 30.0)
+            else:
+                tag = "SWING_REVERSAL"
+                score = 100.0 + ((100.0 - c['rsi']) * 1.5)
+
+            candidates.append({
+                "symbol": symbol, "score": score, "tag": tag, "df": df,
+                "is_downtrend": not is_bull_market,
+                "swing_low": min(c['low'], p['low'], c_now['low']),
+                "ret_1h": ret_1h
+            })
+
         except Exception as e:
             logging.error(f"Błąd analizy {symbol}: {e}")
 
-    if not best_candidate:
+    if not candidates:
         return
+
+    # Zawsze wybieramy monetę z najwyższym wynikiem impetu na rynku
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best_candidate = candidates[0]
 
     cand_sym = best_candidate["symbol"]
     cand_tag = best_candidate["tag"]
@@ -598,15 +631,15 @@ def run_dual_engine_strategy():
                     save_positions(active_positions)
                 is_micro = any(m in cand_sym for m in ["PEPE", "BONK", "SHIB"])
                 sl_fmt = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-                logging.info(f"🎯🚀 [ZAKUP: {cand_tag}] {cand_sym} | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
+                logging.info(f"💎🚀 [ŁOWCA BONUSÓW: {cand_tag}] {cand_sym} (Impet 1h: {best_candidate['ret_1h']*100:+.2f}%) | Cena: {curr_price} | SL: {sl_fmt}")
         return
 
     # ==========================================================================
-    # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI
+    # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI NA LIDERA RYNKU
     # ==========================================================================
     stagnant_candidate = None
     for def_sym, def_pos in current_items:
-        c_curr = safe_float(tickers.get(def_sym, {}).get("lastPrice"), def_pos["buy_price"])
+        c_curr = safe_float(all_tickers.get(def_sym, {}).get("lastPrice"), def_pos["buy_price"])
         bp = def_pos["buy_price"]
         gain_pct = (c_curr - bp) / bp
         time_in_pos = now_ts - def_pos.get("entry_time", now_ts)
@@ -626,7 +659,7 @@ def run_dual_engine_strategy():
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
         old_time = stagnant_candidate["time_min"]
-        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} ({old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy sygnał: {cand_sym} ({cand_tag})!")
+        logging.info(f"🔄⚡ [ROTACJA NA LIDERA] Wymiana ospałej {old_sym} ({old_gain*100:+.2f}%, {old_time}m) -> Nowy BONUS na {cand_sym} ({cand_tag})!")
 
         base_old = get_base_coin(old_sym)
         bal_old = get_coin_available_balance(base_old)
@@ -639,7 +672,7 @@ def run_dual_engine_strategy():
                 res_sell = session.place_order(category=CATEGORY, symbol=old_sym, side="Sell", orderType="Market", qty=sell_q_str)
                 if res_sell.get("retCode") == 0:
                     sold_ok = True
-                    reason = f"Rotacja ze stagnacji ({old_time}m) -> {cand_sym}"
+                    reason = f"Rotacja ze stagnacji ({old_time}m) -> Lider {cand_sym}"
                     record_closed_trade(old_sym, stagnant_candidate["pos"].get("strategy"), stagnant_candidate["pos"]["buy_price"], stagnant_candidate["curr_price"], safe_float(sell_q_str), reason)
                     with lock_pos:
                         if old_sym in active_positions:
@@ -676,7 +709,7 @@ def run_dual_engine_strategy():
                             "is_downtrend": is_down
                         }
                         save_positions(active_positions)
-                    logging.info(f"🎉🚀 [ROTACJA UDANA] Zamieniono na {cand_sym} po cenie {curr_price_c} ({cand_tag})!")
+                    logging.info(f"🎉🚀 [ROTACJA UDANA] Wskoczono w lidera {cand_sym} ({cand_tag}) po cenie {curr_price_c}!")
 
 # ==============================================================================
 # MONITORING ZYSKÓW: ELASTYCZNY BUFOR TRAILINGU I ZAPADKA RATCHET
@@ -713,7 +746,7 @@ def monitoring_worker():
 
             if basket_peak_profit_usd >= USD_PROFIT_TRIGGER:
                 if total_unrealized_usd <= (basket_peak_profit_usd - USD_TRAILING_DROP):
-                    logging.info(f"🏆💰 [BASKET LOCK] Zrealizowano zysk koszyka: +{total_unrealized_usd:.2f}$ (ze szczytu: +{basket_peak_profit_usd:.2f}$).")
+                    logging.info(f"🏆💰 [BASKET LOCK] Zrealizowano zysk koszyka: +{total_unrealized_usd:.2f}$ (szczyt: +{basket_peak_profit_usd:.2f}$).")
                     for symbol, pos in items:
                         c_curr = position_prices.get(symbol, pos["buy_price"])
                         base_c = get_base_coin(symbol)
@@ -785,7 +818,7 @@ def monitoring_worker():
 
                 pos["trailing_sl"] = current_sl
 
-                # Bezpiecznik skrajnego knota odrzucenia szczytu (tylko gigantyczny knot podażowy >= 45%)
+                # Bezpiecznik skrajnego knota wyczerpania szczytu
                 is_extreme_climax = False
                 df_cur = get_market_data_no_cache(symbol, interval="15", limit=30)
                 if df_cur is not None and len(df_cur) >= 2:
@@ -855,16 +888,16 @@ def bot_loop():
 
             if now - last_print >= 30:
                 total_eq, free_usdc = get_balances()
-                tickers = get_all_spot_tickers()
+                all_tickers = get_all_spot_tickers()
                 total_unrealized_usd = sum(
-                    (safe_float(tickers.get(s, {}).get("lastPrice"), p["buy_price"]) - p["buy_price"]) * safe_float(p.get("qty", 0.0))
+                    (safe_float(all_tickers.get(s, {}).get("lastPrice"), p["buy_price"]) - p["buy_price"]) * safe_float(p.get("qty", 0.0))
                     for s, p in current_items
                 )
                 logging.info("--------------------------------------------------------------------------------")
                 status_basket = f"Szczyt: +{basket_peak_profit_usd:.2f}$" if basket_peak_profit_usd >= USD_PROFIT_TRIGGER else "Nieaktywny (< 20$)"
                 logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Niezrealizowany PnL: {total_unrealized_usd:+.2f}$ ({status_basket}) | Pozycje: {len(current_items)}/{MAX_TOTAL_POSITIONS}")
                 for s, p in current_items:
-                    curr = safe_float(tickers.get(s, {}).get("lastPrice"), p["buy_price"])
+                    curr = safe_float(all_tickers.get(s, {}).get("lastPrice"), p["buy_price"])
                     pnl = ((curr - p["buy_price"]) / p["buy_price"]) * 100
                     pnl_usd = (curr - p["buy_price"]) * safe_float(p.get("qty", 0.0))
                     sl = p.get("trailing_sl", 0.0)
@@ -878,7 +911,7 @@ def bot_loop():
                 last_print = now
 
             if is_btc_market_healthy():
-                run_dual_engine_strategy()
+                run_bonus_hunter_strategy()
 
         except Exception as e:
             logging.error(f"Błąd głównej pętli: {e}")
@@ -896,7 +929,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Trap-Free Dual Engine Architecture")
+        self.wfile.write(b"Bybit Spot Bot Active - Dynamic Full USDC Market Scanner")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
