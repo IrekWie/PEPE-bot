@@ -395,7 +395,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ŁAPANIA DOŁKA: OBSŁUGA SCHODKOWEGO ODBICIA I WYCZERPANIA PODAŻY
+# STRATEGIA ZAKUPÓW: OBSŁUGA GŁĘBOKIEGO DOŁKA ORAZ ODBICIA W TRENDZIE (EMA BOUNCE)
 # ==============================================================================
 def run_sine_wave_strategy():
     global active_positions
@@ -436,7 +436,6 @@ def run_sine_wave_strategy():
             c_now = df.iloc[-1]
             c = df.iloc[-2]
             p = df.iloc[-3]
-            p2 = df.iloc[-4]
 
             # Cooldown po stracie
             cooldown_ok = True
@@ -474,24 +473,35 @@ def run_sine_wave_strategy():
                     continue
 
             # ------------------------------------------------------------------
-            # 3. REŻIM RYNKU I STREFA DOŁKA
+            # 3. REŻIM RYNKU
             # ------------------------------------------------------------------
             is_downtrend = (c['close'] < c['ema200']) and (c['ema21'] < c['ema50'])
+            is_strong_uptrend = (c['close'] > c['ema200']) and (c['ema50'] > c['ema200']) and (c['ema21'] > c['ema89'])
 
-            # Badamy dołek w oknie ostatnich 4 świec (czy rynek dotknął dna)
+            # STREFA A: Głęboki dołek sinusoidy (Wstęga Bollingera lub RSI <= 38)
             recent_low_4 = df['low'].iloc[-5:-1].min()
             recent_bb_lower_min = df['bb_lower'].iloc[-5:-1].min()
             recent_rsi_min = df['rsi'].iloc[-5:-1].min()
 
             touched_bottom = (recent_low_4 <= recent_bb_lower_min * 1.004) or (recent_rsi_min <= 38.0)
             is_oversold_now = (c['low'] <= c['bb_lower'] * 1.003) or (c['rsi'] <= 42.0)
-            
             in_trough_zone = touched_bottom or is_oversold_now
-            if not in_trough_zone:
+
+            # STREFA B: Płytki dołek / pullback do średnich w silnym trendzie wzrostowym (NOWOŚĆ)
+            tested_ema_support = (
+                (p['low'] <= p['ema50'] * 1.004 and p['low'] >= p['ema50'] * 0.992) or
+                (c['low'] <= c['ema50'] * 1.004 and c['low'] >= c['ema50'] * 0.992) or
+                (p['low'] <= p['ema89'] * 1.004 and p['low'] >= p['ema89'] * 0.992) or
+                (c['low'] <= c['ema89'] * 1.004 and c['low'] >= c['ema89'] * 0.992) or
+                (p['low'] <= p['ema21'] * 1.003 and c['low'] <= c['ema21'] * 1.003)
+            )
+            in_trend_pullback_zone = is_strong_uptrend and tested_ema_support and (c['rsi'] <= 58.0)
+
+            if not in_trough_zone and not in_trend_pullback_zone:
                 continue
 
             # ------------------------------------------------------------------
-            # 4. POTWIERDZENIE POPYTU: MŁOT LUB SCHODKOWE ODWRÓCENIE (STAIRCASE)
+            # 4. POTWIERDZENIE POPYTOWE
             # ------------------------------------------------------------------
             candle_range = c['high'] - c['low']
             lower_wick = min(c['open'], c['close']) - c['low']
@@ -499,26 +509,34 @@ def run_sine_wave_strategy():
             is_green = c['close'] > c['open']
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
 
-            # SYGNAŁ A: Klasyczny silny młot (rejection pin bar)
+            # SYGNAŁ A: Klasyczny młot na dnie
             strong_bottom_rejection = is_green and (candle_range > 0) and ((lower_wick / candle_range) >= 0.38) and (vol_ratio >= 1.15)
 
             # SYGNAŁ B: Dynamiczne objęcie hossy
             bullish_engulfing = is_green and (c['close'] > p['open']) and (p['close'] < p['open']) and (vol_ratio >= 1.20)
 
-            # SYGNAŁ C: Schodkowe ciche odwrócenie (Staircase Reversal)
-            # 2 kolejne zielone świece, wyższy dołek, kurs odzyskuje EMA 9 w dolnej połowie fali
+            # SYGNAŁ C: Schodkowe ciche odwrócenie (Staircase Reversal na dnie)
             staircase_higher_low = is_green and (c['low'] >= p['low']) and (c['close'] > p['close'])
             staircase_reclaiming = (c['close'] >= c['ema9'] * 0.999) or (c_now['close'] >= c_now['ema9'])
-            still_in_lower_wave = c['close'] <= c['bb_mid'] * 1.003  # Nie gonimy szczytu fali
-            
-            # Przy wyczerpaniu podaży na dnie (volume dry-up) nie blokujemy brakiem wolumenu
-            staircase_confirmed = touched_bottom and staircase_higher_low and staircase_reclaiming and still_in_lower_wave and (vol_ratio >= 0.80)
+            still_in_lower_wave = c['close'] <= c['bb_mid'] * 1.003
+            staircase_confirmed = in_trough_zone and staircase_higher_low and staircase_reclaiming and still_in_lower_wave and (vol_ratio >= 0.80)
 
-            has_valid_entry = strong_bottom_rejection or bullish_engulfing or staircase_confirmed
+            # SYGNAŁ D: Odbicie od średnich w silnym trendzie wzrostowym (TREND EMA BOUNCE)
+            dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
+            trend_bounce_confirmed = (
+                in_trend_pullback_zone and
+                is_green and
+                (c['close'] >= c['ema9'] * 0.999) and
+                (dist_from_ema9 <= 0.012) and
+                ((candle_range > 0 and (lower_wick / candle_range) >= 0.25) or (c['close'] > p['high'])) and
+                (vol_ratio >= 0.90)
+            )
+
+            has_valid_entry = strong_bottom_rejection or bullish_engulfing or staircase_confirmed or trend_bounce_confirmed
             if not has_valid_entry:
                 continue
 
-            # Odrzucenie świecy z dominującym knotem podażowym z góry
+            # Odrzucenie świecy z dominującym knotem z góry
             if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
@@ -530,8 +548,18 @@ def run_sine_wave_strategy():
             live_not_dumping = c_now['close'] >= c_now['open']
 
             if live_holding and live_not_dumping:
-                mode_tag = "STAIRCASE_BOTTOM" if staircase_confirmed else ("HAMMER_REVERSAL" if strong_bottom_rejection else "ENGULFING_BOTTOM")
+                if trend_bounce_confirmed:
+                    mode_tag = "TREND_EMA_BOUNCE"
+                elif staircase_confirmed:
+                    mode_tag = "STAIRCASE_BOTTOM"
+                elif strong_bottom_rejection:
+                    mode_tag = "HAMMER_REVERSAL"
+                else:
+                    mode_tag = "ENGULFING_BOTTOM"
+
                 score = (100 - c['rsi']) * (vol_ratio ** 0.5) * (bb_width * 50)
+                if trend_bounce_confirmed:
+                    score *= 1.25  # Priorytet dla monet w silnym trendzie
 
                 if best_candidate is None or score > best_candidate['score']:
                     best_candidate = {
@@ -590,7 +618,7 @@ def run_sine_wave_strategy():
                     save_positions(active_positions)
                 is_micro = any(m in cand_sym for m in ["PEPE", "BONK", "SHIB"])
                 sl_fmt = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-                logging.info(f"🎯🌊 [WEJŚCIE W DOŁKU] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
+                logging.info(f"🎯🌊 [WEJŚCIE W POZYCJĘ] {cand_sym} ({cand_tag}) | Cena: {curr_price} | SL: {sl_fmt} (-{((curr_price-initial_sl)/curr_price)*100:.2f}%)")
         return
 
     # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI
@@ -616,7 +644,7 @@ def run_sine_wave_strategy():
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
         old_time = stagnant_candidate["time_min"]
-        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy dołek na {cand_sym} ({cand_tag})!")
+        logging.info(f"🔄⚡ [AKTYWNA ROTACJA] Zwalniam {old_sym} (PnL: {old_gain*100:+.2f}%, {old_time}m w miejscu) -> Nowy sygnał na {cand_sym} ({cand_tag})!")
 
         base_old = get_base_coin(old_sym)
         bal_old = get_coin_available_balance(base_old)
@@ -666,7 +694,7 @@ def run_sine_wave_strategy():
                             "is_downtrend": is_down
                         }
                         save_positions(active_positions)
-                    logging.info(f"🎉🚀 [ROTACJA UDANA] Zamieniono na {cand_sym} w dołku po cenie {curr_price_c}!")
+                    logging.info(f"🎉🚀 [ROTACJA UDANA] Zamieniono na {cand_sym} po cenie {curr_price_c} ({cand_tag})!")
 
 # ==============================================================================
 # MONITORING ZYSKÓW: ELASTYCZNY BUFOR
@@ -881,7 +909,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Staircase Reversal & Elastic Trailing")
+        self.wfile.write(b"Bybit Spot Bot Active - Trend EMA Bounce & Sine Wave Strategy")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
