@@ -68,28 +68,23 @@ USDC_MAX_SPREAD_PCT = 0.0050
 MAX_SCAN_CANDIDATES = 35           
 
 # ==============================================================================
-# DZIENNY BEZPIECZNIK STRATY (DAILY CIRCUIT BREAKER)
+# NADRZĘDNY BEZPIECZNIK SALDA PORTFELA (MASTER EQUITY RATCHET)
 # ==============================================================================
-MAX_DAILY_LOSS_USD = 15.0          # Maksymalna strata dzienna: po przekroczeniu -15$ bot odcina handel do 00:00 UTC
+EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda konta (np. 725$) - 5$ = twarde zamknięcie wszystkiego przy 720$!
+DOLLAR_STEP_USD = 5.0              # Schodek wielokrotności 5$ dla pojedynczej pozycji
+MAX_DAILY_LOSS_USD = 15.0          # Maksymalna strata dzienna (-15$)
 
-# SCHODEK 5 USD
-DOLLAR_STEP_USD = 5.0              
-
-# AGRESYWNE CIĘCIE PŁASKICH POZYCJI (FLAT MARKET KILLER)
+# CIĘCIE PŁASKICH POZYCJI (FLAT MARKET KILLER)
 FLAT_MAX_TIME_SEC = 600            # Max 10 minut na ruch
 FLAT_MIN_GAIN_PCT = 0.0040         # Wymóg min. +0.40% po 10 minutach
 MID_TIME_SEC = 900                 # Max 15 minut
 MID_MIN_GAIN_PCT = 0.0080          # Wymóg min. +0.80% po 15 minutach
 STAGNATION_ROTATION_TIME_SEC = 420 # 7 minut bezruchu pozwala na rotację
 
-# DOLAROWY TRAILING PORTFELA (BASKET LOCK)
-USD_PROFIT_TRIGGER = 20.0          
-USD_TRAILING_DROP = 5.0            
-basket_peak_profit_usd = 0.0       
-
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
 TRADE_HISTORY_FILE = "trade_history.json"
+PORTFOLIO_STATE_FILE = "portfolio_state.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,6 +94,7 @@ logging.basicConfig(
 
 lock_pos = threading.RLock()
 lock_history = threading.RLock()
+lock_state = threading.RLock()
 instrument_filters = {}
 
 sync_bybit_clock()
@@ -169,8 +165,27 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         return None
 
 # ==============================================================================
-# MODUŁ ZAPISU I HISTORII
+# STAN PORTFELA I HISTORIA (TRWAŁY ZAPIS NA DYSKU)
 # ==============================================================================
+def load_portfolio_state():
+    if os.path.exists(PORTFOLIO_STATE_FILE):
+        try:
+            with open(PORTFOLIO_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"peak_total_equity": 0.0}
+
+def save_portfolio_state(state):
+    with lock_state:
+        try:
+            with open(PORTFOLIO_STATE_FILE, "w") as f:
+                json.dump(state, f, indent=4)
+        except Exception as e:
+            logging.error(f"Błąd zapisu portfolio_state: {e}")
+
+portfolio_state = load_portfolio_state()
+
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
         try:
@@ -259,7 +274,6 @@ def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason, is_ma
         logging.info(f"📊 [BILANS TRANSAKCJI] {symbol} | Wynik: {sign}{pnl_usd:.2f} USD ({sign}{pnl_pct*100:.2f}%) | {reason}")
 
 def get_today_pnl(tickers=None):
-    """Zwraca dzisiejszy zrealizowany PnL + aktualny niezrealizowany PnL otwartych pozycji."""
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with lock_history:
         realized_today = trade_history.get("daily", {}).get(today_str, {}).get("realized_usd", 0.0)
@@ -274,11 +288,6 @@ def get_today_pnl(tickers=None):
                 unrealized_today += (curr - bp) * qty_f
 
     return realized_today, unrealized_today, (realized_today + unrealized_today)
-
-def is_daily_circuit_breaker_active(tickers=None):
-    """Sprawdza, czy łączna strata dzienna osiągnęła limit 15 USD."""
-    _, _, total_today = get_today_pnl(tickers)
-    return total_today <= -MAX_DAILY_LOSS_USD
 
 # ==============================================================================
 # WSKAŹNIKI I DANE RYNKOWE
@@ -475,8 +484,9 @@ def run_bonus_hunter_strategy():
     if not all_tickers:
         return
 
-    # SPRAWDZENIE BEZPIECZNIKA DZIENNEJ STRATY (-15 USD)
-    if is_daily_circuit_breaker_active(all_tickers):
+    # SPRAWDZENIE DZIENNEJ STRATY
+    _, _, total_today = get_today_pnl(all_tickers)
+    if total_today <= -MAX_DAILY_LOSS_USD:
         return
 
     total_equity, free_usdc = get_balances()
@@ -507,22 +517,18 @@ def run_bonus_hunter_strategy():
             c = df.iloc[-2]
             curr_price = c_now['close']
 
-            # ==================================================================
-            # ŻELAZNE BLOKADY PRZECIWKO KUPOWANIU NA GÓRCE (ZERO TOLERANCJI)
-            # ==================================================================
+            # ZAKAZ KUPNA NA GÓRKACH
             ret_1h = (curr_price - df['close'].iloc[-5]) / df['close'].iloc[-5]
             if ret_1h > 0.002:
-                continue  # Moneta już po wzroście – ODRZUCENIE!
+                continue
 
             if curr_price > (c_now['ema9'] * 1.001):
-                continue  # Zakaz kupowania nad średnią EMA 9!
+                continue
 
             if curr_price >= (c_now['bb_mid'] * 1.002) or c_now['rsi'] >= 52.0:
-                continue  # Wykluczenie górnych stref konsolidacji!
+                continue
 
-            # ==================================================================
-            # 1. LIVE CAPITULATION SNIPER (GŁĘBOKI ZRZUT I ODBICIE Z DNA)
-            # ==================================================================
+            # LIVE CAPITULATION SNIPER
             now_range = c_now['high'] - c_now['low']
             now_drop_pct = (c_now['high'] - c_now['low']) / c_now['high'] if c_now['high'] > 0 else 0.0
             rebound_from_bottom = (curr_price - c_now['low']) / c_now['low'] if c_now['low'] > 0 else 0.0
@@ -551,10 +557,7 @@ def run_bonus_hunter_strategy():
 
             is_capitulation_snipe = live_capitulation_active or closed_capitulation_absorbed
 
-            # ==================================================================
-            # 2. DOŁEK W KANALE KONSOLIDACJI (SWING BOTTOM)
-            # ==================================================================
-            at_absolute_bottom = (curr_price <= c_now['bb_lower'] * 1.003) or (c['low'] <= c['bb_lower'] * 1.003)
+            at_absolute_bottom = (curr_price <= c_now['bb_lower'] * 1.003) or (c['low'] <= c_now['bb_lower'] * 1.003)
             is_oversold_bottom = at_absolute_bottom and (c_now['rsi'] <= 36.0) and (curr_price > c_now['low'])
 
             if not is_capitulation_snipe and not is_oversold_bottom:
@@ -706,11 +709,11 @@ def run_bonus_hunter_strategy():
                     logging.info(f"🎉🚀 [ROTACJA UDANA] Kupiono na dołku {cand_sym} ({cand_tag}) po cenie {curr_price_c}!")
 
 # ==============================================================================
-# MONITORING ZYSKÓW, DZIENNEGO LIMITU I CIĘCIA STAGNACJI
+# MONITORING ZYSKÓW: MASTER EQUITY RATCHET (725$ -> 720$) + SCHODEK 5 USD
 # ==============================================================================
 def monitoring_worker():
-    global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z bezpiecznikiem dziennym (-15 USD) i ekspresowym trailingiem.")
+    global active_positions, portfolio_state
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z Master Equity Ratchet (spadek o 5$ zamyka portfel) i schodkiem pozycji.")
     while True:
         try:
             with lock_pos:
@@ -718,14 +721,53 @@ def monitoring_worker():
 
             tickers = get_all_spot_tickers()
             now_ts = time.time()
+            total_eq, free_usdc = get_balances()
 
             # ------------------------------------------------------------------
-            # 1. AWARYJNY DZIENNY BEZPIECZNIK STRATY (DAILY LOSS CAP: -15.00 USD)
+            # 1. NADRZĘDNY BEZPIECZNIK SALDA PORTFELA (MASTER EQUITY RATCHET)
+            # Przykład: Saldo osiągnęło 725 USD -> spadek do 720 USD = WYJŚCIE ZE WSZYSTKIEGO!
             # ------------------------------------------------------------------
-            realized_d, unrealized_d, total_d = get_today_pnl(tickers)
-            if total_d <= -MAX_DAILY_LOSS_USD and items:
-                logging.error(f"🛑🛑🛑 [DZIENNY BEZPIECZNIK AKTYWNY] Osiągnięto limit straty: {total_d:.2f}$ (limit: -{MAX_DAILY_LOSS_USD:.2f}$).")
-                logging.error("🚨 Natychmiastowe awaryjne zamknięcie wszystkich otwartych pozycji do gotówki USDC!")
+            if total_eq > 0:
+                current_peak_eq = portfolio_state.get("peak_total_equity", 0.0)
+
+                # Aktualizacja szczytu całkowitego salda portfela
+                if total_eq > current_peak_eq:
+                    portfolio_state["peak_total_equity"] = total_eq
+                    save_portfolio_state(portfolio_state)
+                    current_peak_eq = total_eq
+                    logging.info(f"👑 [NOWY SZCZYT SALDA] Całkowite saldo: {total_eq:.2f}$! Poziom obrony portfela: {total_eq - EQUITY_DROP_LIMIT_USD:.2f}$")
+
+                # Jeśli mamy otwarte pozycje i saldo spadło o 5 USD od szczytu (np. 725$ -> 720$)
+                if len(items) > 0 and current_peak_eq > 0:
+                    if total_eq <= (current_peak_eq - EQUITY_DROP_LIMIT_USD):
+                        logging.error(f"🛑🛑🛑 [MASTER EQUITY LOCK] Saldo konta spadło z {current_peak_eq:.2f}$ do {total_eq:.2f}$ (spadek >= {EQUITY_DROP_LIMIT_USD:.2f}$).")
+                        logging.error("🚨 Zamykam WSZYSTKIE pozycje rynkowo, aby zablokować kapitał w USDC!")
+                        for symbol, pos in items:
+                            c_curr = safe_float(tickers.get(symbol, {}).get("lastPrice"), pos["buy_price"])
+                            base_c = get_base_coin(symbol)
+                            bal_coin = get_coin_available_balance(base_c)
+                            if bal_coin > 0 and (bal_coin * c_curr) >= MIN_EXCHANGE_NOTIONAL:
+                                step, minq = get_symbol_lot_filter(symbol)
+                                sell_q_str = format_qty_with_step(bal_coin, step, minq)
+                                if sell_q_str:
+                                    res_s = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=sell_q_str)
+                                    if res_s.get("retCode") == 0:
+                                        record_closed_trade(symbol, pos.get("strategy"), pos["buy_price"], c_curr, safe_float(sell_q_str), f"Master Equity Lock (Szczyt {current_peak_eq:.2f}$ -> Stop {total_eq:.2f}$)")
+                        with lock_pos:
+                            active_positions.clear()
+                            save_positions(active_positions)
+                        # Reset szczytu po wyjściu
+                        portfolio_state["peak_total_equity"] = total_eq
+                        save_portfolio_state(portfolio_state)
+                        time.sleep(2.0)
+                        continue
+
+            # ------------------------------------------------------------------
+            # 2. DZIENNY LIMIT STRATY (-15 USD)
+            # ------------------------------------------------------------------
+            _, _, total_today = get_today_pnl(tickers)
+            if total_today <= -MAX_DAILY_LOSS_USD and items:
+                logging.error(f"🛑🛑🛑 [DZIENNY LIMIT -15$] Osiągnięto limit straty: {total_today:.2f}$. Zamykam pozycje.")
                 for symbol, pos in items:
                     c_curr = safe_float(tickers.get(symbol, {}).get("lastPrice"), pos["buy_price"])
                     base_c = get_base_coin(symbol)
@@ -740,57 +782,20 @@ def monitoring_worker():
                 with lock_pos:
                     active_positions.clear()
                     save_positions(active_positions)
-                basket_peak_profit_usd = 0.0
                 time.sleep(2.0)
                 continue
 
             if not items:
-                basket_peak_profit_usd = 0.0
                 time.sleep(1.0)
                 continue
 
             # ------------------------------------------------------------------
-            # 2. DOLAROWY TRAILING PORTFELA (BASKET LOCK: +20$ SZCZYT -> STOP -5$)
-            # ------------------------------------------------------------------
-            total_unrealized_usd = 0.0
-            position_prices = {}
-
-            for symbol, pos in items:
-                ticker = tickers.get(symbol)
-                c_curr = safe_float(ticker.get("lastPrice")) if ticker else pos["buy_price"]
-                position_prices[symbol] = c_curr
-                total_unrealized_usd += (c_curr - pos["buy_price"]) * safe_float(pos.get("qty", 0.0))
-
-            if total_unrealized_usd > basket_peak_profit_usd:
-                basket_peak_profit_usd = total_unrealized_usd
-
-            if basket_peak_profit_usd >= USD_PROFIT_TRIGGER:
-                if total_unrealized_usd <= (basket_peak_profit_usd - USD_TRAILING_DROP):
-                    logging.info(f"🏆💰 [BASKET LOCK] Zrealizowano zysk koszyka: +{total_unrealized_usd:.2f}$ (szczyt: +{basket_peak_profit_usd:.2f}$).")
-                    for symbol, pos in items:
-                        c_curr = position_prices.get(symbol, pos["buy_price"])
-                        base_c = get_base_coin(symbol)
-                        bal_coin = get_coin_available_balance(base_c)
-                        if bal_coin > 0 and (bal_coin * c_curr) >= MIN_EXCHANGE_NOTIONAL:
-                            step, minq = get_symbol_lot_filter(symbol)
-                            sell_q_str = format_qty_with_step(bal_coin, step, minq)
-                            if sell_q_str:
-                                res_s = session.place_order(category=CATEGORY, symbol=symbol, side="Sell", orderType="Market", qty=sell_q_str)
-                                if res_s.get("retCode") == 0:
-                                    record_closed_trade(symbol, pos.get("strategy"), pos["buy_price"], c_curr, safe_float(sell_q_str), "Basket Dollar Lock")
-                    with lock_pos:
-                        active_positions.clear()
-                        save_positions(active_positions)
-                    basket_peak_profit_usd = 0.0
-                    time.sleep(1.5)
-                    continue
-
-            # ------------------------------------------------------------------
-            # 3. MONITOROWANIE POJEDYNCZYCH POZYCJI
+            # 3. MONITOROWANIE POJEDYNCZYCH POZYCJI (ZAPADKA 5 USD + CIĘCIE COFNIĘCIA)
             # ------------------------------------------------------------------
             to_delete = []
             for symbol, pos in items:
-                c_curr = position_prices.get(symbol, 0.0)
+                ticker = tickers.get(symbol)
+                c_curr = safe_float(ticker.get("lastPrice")) if ticker else pos["buy_price"]
                 if c_curr <= 0:
                     continue
 
@@ -811,11 +816,12 @@ def monitoring_worker():
                 peak_pnl = max(pos.get("peak_pnl_usd", 0.0), net_pnl_usd)
                 pos["peak_pnl_usd"] = peak_pnl
 
+                # AKTUALIZACJA SCHODKA WIELOKROTNOŚCI 5 USD (5$, 10$, 15$...)
                 if net_pnl_usd >= DOLLAR_STEP_USD:
                     current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
                     if current_multiple > pos.get("locked_dollar_floor", 0.0):
                         pos["locked_dollar_floor"] = current_multiple
-                        logging.info(f"🔒💰 [SCHODEK 5$] {symbol} | Zysk: +{net_pnl_usd:.2f}$! Zablokowano próg: +{current_multiple:.2f}$!")
+                        logging.info(f"🔒💰 [SCHODEK 5$] {symbol} | Zysk: +{net_pnl_usd:.2f}$! Zablokowano twardy próg: +{current_multiple:.2f}$!")
 
                 locked_floor = pos.get("locked_dollar_floor", 0.0)
                 current_sl = pos.get("trailing_sl", bp * 0.988)
@@ -825,23 +831,34 @@ def monitoring_worker():
 
                 price_drop_from_peak = (peak_p - c_curr) / peak_p if peak_p > 0 else 0.0
 
-                # BŁYSKAWICZNE CIĘCIE PRZY COFNIĘCIU (0.35%) GDY JEST ZYSK
-                if (peak_p - bp) / bp >= 0.0070 or peak_pnl >= 1.8:
+                # --------------------------------------------------------------
+                # WARUNEK 1: OBRONA ZABLOKOWANEGO SCHODKA 5 USD (NAPRAWIONO!)
+                # Jeśli zysk dotknął np. 5$, a teraz spadł poniżej 4.80$ -> NATYCHMIAST SPRZEDAWAJ!
+                # --------------------------------------------------------------
+                if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.20):
+                    trigger_exit = True
+                    exit_reason = f"Obrona schodka 5$ (Zrealizowano: +{net_pnl_usd:.2f}$ | Złamany próg: +{locked_floor:.2f}$)"
+
+                # WARUNEK 2: Błyskawiczne cięcie przy cofnięciu o 0.35% od szczytu gdy jest zysk
+                elif (peak_p - bp) / bp >= 0.0070 or peak_pnl >= 1.8:
                     if price_drop_from_peak >= 0.0035:
                         trigger_exit = True
                         exit_reason = f"Peak Cut (-{price_drop_from_peak*100:.2f}% ze szczytu | Zysk: +{net_pnl_usd:.2f}$)"
 
-                # CIĘCIE STAGNACJI / PŁASKIEGO RYNKU
-                if not trigger_exit:
-                    if time_in_pos >= FLAT_MAX_TIME_SEC and gain_pct < FLAT_MIN_GAIN_PCT:
-                        trigger_exit = True
-                        exit_reason = f"Flat Market Exit (10m bez ruchu, PnL: {gain_pct*100:+.2f}%)"
-                    elif time_in_pos >= MID_TIME_SEC and gain_pct < MID_MIN_GAIN_PCT:
-                        trigger_exit = True
-                        exit_reason = f"Brak Dynamiki (15m < +0.80%, PnL: {gain_pct*100:+.2f}%)"
-                    elif c_curr <= current_sl:
-                        trigger_exit = True
-                        exit_reason = f"Stop Loss (Wynik: {gain_pct*100:+.2f}%)"
+                # WARUNEK 3: Cięcie stagnacji (10 minut bez ruchu powyżej +0.40%)
+                elif time_in_pos >= FLAT_MAX_TIME_SEC and gain_pct < FLAT_MIN_GAIN_PCT:
+                    trigger_exit = True
+                    exit_reason = f"Flat Market Exit (10m bez ruchu, PnL: {gain_pct*100:+.2f}%)"
+
+                # WARUNEK 4: Brak dynamiki po 15 minutach (< +0.80%)
+                elif time_in_pos >= MID_TIME_SEC and gain_pct < MID_MIN_GAIN_PCT:
+                    trigger_exit = True
+                    exit_reason = f"Brak Dynamiki (15m < +0.80%, PnL: {gain_pct*100:+.2f}%)"
+
+                # WARUNEK 5: Ciasny Stop Loss pod dołkiem wejścia
+                elif c_curr <= current_sl:
+                    trigger_exit = True
+                    exit_reason = f"Stop Loss (Wynik: {gain_pct*100:+.2f}%)"
 
                 if trigger_exit:
                     base_c = get_base_coin(symbol)
@@ -894,14 +911,12 @@ def bot_loop():
 
             if now - last_print >= 25:
                 total_eq, free_usdc = get_balances()
-                total_unrealized_usd = sum(
-                    (safe_float(all_tickers.get(s, {}).get("lastPrice"), p["buy_price"]) - p["buy_price"]) * safe_float(p.get("qty", 0.0))
-                    for s, p in current_items
-                )
-                logging.info("--------------------------------------------------------------------------------")
+                peak_eq = portfolio_state.get("peak_total_equity", total_eq)
                 status_circuit = "🛑 [ZABLOKOWANY - LIMIT -15$]" if daily_limit_hit else "✅ Aktywny"
-                status_basket = f"Szczyt: +{basket_peak_profit_usd:.2f}$" if basket_peak_profit_usd >= USD_PROFIT_TRIGGER else "Nieaktywny (< 20$)"
-                logging.info(f"💰 [PORTFEL] Saldo: {total_eq:.2f}$ | Wolne: {free_usdc:.2f}$ | Niezrealizowany PnL: {total_unrealized_usd:+.2f}$ ({status_basket})")
+                stop_floor_eq = max(0.0, peak_eq - EQUITY_DROP_LIMIT_USD)
+
+                logging.info("--------------------------------------------------------------------------------")
+                logging.info(f"💰 [PORTFEL] Saldo konta: {total_eq:.2f}$ | Szczyt konta: {peak_eq:.2f}$ (Obrona przy: {stop_floor_eq:.2f}$) | Wolne: {free_usdc:.2f}$")
                 logging.info(f"📅 [BILANS DNIA] Dzisiaj: {total_day_pnl:+.2f}$ (Zrealizowany: {realized_d:+.2f}$, Otwarty: {unrealized_d:+.2f}$) | Status bota: {status_circuit}")
                 for s, p in current_items:
                     curr = safe_float(all_tickers.get(s, {}).get("lastPrice"), p["buy_price"])
@@ -910,13 +925,12 @@ def bot_loop():
                     floor_val = p.get("locked_dollar_floor", 0.0)
                     peak_usd = p.get("peak_pnl_usd", pnl_usd)
                     strat_info = p.get("strategy", "")
-                    floor_txt = f" | 🔒 Podłoga: +{floor_val:.2f}$ (Szczyt: +{peak_usd:.2f}$)" if floor_val > 0 else f" (Szczyt: +{peak_usd:.2f}$)"
+                    floor_txt = f" | 🔒 Podłoga pozycji: +{floor_val:.2f}$ (Szczyt: +{peak_usd:.2f}$)" if floor_val > 0 else f" (Szczyt: +{peak_usd:.2f}$)"
                     min_elapsed = int((now - p.get("entry_time", now)) / 60)
                     logging.info(f"📈 [{s}] ({strat_info}) Zysk: {pnl_usd:+.2f}$ ({pnl_pct:+.2f}%){floor_txt} | Czas: {min_elapsed}m")
                 logging.info("--------------------------------------------------------------------------------")
                 last_print = now
 
-            # Zakupy dozwolone tylko jeśli dzienny bezpiecznik NIE jest aktywny i rynek BTC jest stabilny
             if not daily_limit_hit and is_btc_market_healthy():
                 run_bonus_hunter_strategy()
 
@@ -936,7 +950,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Daily Loss Limiter (-15 USD) Enabled")
+        self.wfile.write(b"Bybit Spot Bot Active - Master Equity Ratchet Enabled")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
