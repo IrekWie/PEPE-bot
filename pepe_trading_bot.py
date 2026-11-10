@@ -59,18 +59,17 @@ EXCLUDED_BASE_COINS = {
     "USDT", "EURC", "USD", "DAI", "FDUSD", "TUSD", "BUSD", "USDE", "PYUSD", "USDD"
 }
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na transakcję (max 2 jednoczesne pozycje)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (max 2 pozycje)
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-MIN_24H_TURNOVER_USD = 60000.0     # Odrzucanie niepłynnych rynków
-USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny spread 0.50%
-MAX_SCAN_CANDIDATES = 35           # Limit analizowanych par
+MIN_24H_TURNOVER_USD = 60000.0     
+USDC_MAX_SPREAD_PCT = 0.0050       
+MAX_SCAN_CANDIDATES = 35           
 
-# PARAMETRY ZAPADKI DOLAROWEJ (POJEDYNCZA POZYCJA)
-DOLLAR_STEP_USD = 5.0              # Krok zapadki: wielokrotności 5 USD (5$, 10$, 15$...)
-DOLLAR_STEP_BUFFER = 0.20          # Bufor 0.20$ zapobiegający wycięciu na mikro-szumie
+# PARAMETRY ZAPADKI DOLAROWEJ ZE SCHODKIEM CO 5 USD
+DOLLAR_STEP_USD = 5.0              # Krok bazowy: 5$, 10$, 15$, 20$...
 
 # DOLAROWY TRAILING PORTFELA (BASKET LOCK)
 USD_PROFIT_TRIGGER = 20.0          
@@ -387,7 +386,8 @@ def sync_positions_from_bybit():
                                 "trailing_sl": curr_p * 0.98,
                                 "entry_time": time.time(),
                                 "is_downtrend": False,
-                                "locked_dollar_floor": 0.0
+                                "locked_dollar_floor": 0.0,
+                                "peak_pnl_usd": 0.0
                             }
                             logging.info(f"🎯 [SYNC] Zaimportowano pozycję {sym} | Ilość: {q_str}")
             save_positions(active_positions)
@@ -429,7 +429,7 @@ def get_dynamic_usdc_targets(all_tickers):
     return [c["symbol"] for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
 
 # ==============================================================================
-# STRATEGIA ŁOWCY BONUSÓW Z RANKINGIEM SIŁY
+# STRATEGIA ŁOWCY BONUSÓW
 # ==============================================================================
 def run_bonus_hunter_strategy():
     global active_positions
@@ -613,7 +613,8 @@ def run_bonus_hunter_strategy():
                         "trailing_sl": initial_sl,
                         "entry_time": time.time(),
                         "is_downtrend": is_down,
-                        "locked_dollar_floor": 0.0
+                        "locked_dollar_floor": 0.0,
+                        "peak_pnl_usd": 0.0
                     }
                     save_positions(active_positions)
                 is_micro = any(m in cand_sym for m in ["PEPE", "BONK", "SHIB"])
@@ -691,17 +692,18 @@ def run_bonus_hunter_strategy():
                             "trailing_sl": initial_sl_c,
                             "entry_time": time.time(),
                             "is_downtrend": is_down,
-                            "locked_dollar_floor": 0.0
+                            "locked_dollar_floor": 0.0,
+                            "peak_pnl_usd": 0.0
                         }
                         save_positions(active_positions)
                     logging.info(f"🎉🚀 [ROTACJA UDANA] Wskoczono w lidera {cand_sym} ({cand_tag}) po cenie {curr_price_c}!")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: ZAPADKA SCHODKOWA (WIELOKROTNOŚCI 5 USD)
+# MONITORING ZYSKÓW: PROCENTOWE ŚCIEŻKI WYJŚCIA ZE SCHODKIEM 5 USD (ANTI-SHAKEOUT)
 # ==============================================================================
 def monitoring_worker():
     global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring ze schodkową zapadką 5 USD (Dynamic Dollar Step-Ratchet).")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z dynamicznym buforem procentowym i schodkiem 5 USD.")
     while True:
         try:
             with lock_pos:
@@ -748,7 +750,7 @@ def monitoring_worker():
                     time.sleep(2.0)
                     continue
 
-            # 2. ZAPADKA DOLAROWA DLA KAŻDEJ POZYCJI (WIELOKROTNOŚCI 5 USD)
+            # 2. ADAPTACYJNY TRAILING PROCENTOWY OD SZCZYTU DLA POZYCJI
             to_delete = []
             for symbol, pos in items:
                 c_curr = position_prices.get(symbol, 0.0)
@@ -767,25 +769,64 @@ def monitoring_worker():
                 est_fees = (trade_cost + curr_value) * 0.001
                 net_pnl_usd = (curr_value - trade_cost) - est_fees
 
-                # Aktualizacja najwyższego szczebla 5 USD
+                # Aktualizacja szczytu cenowego oraz szczytu dolarowego
+                peak_p = max(pos.get("peak_price", bp), c_curr)
+                pos["peak_price"] = peak_p
+                
+                peak_pnl = max(pos.get("peak_pnl_usd", 0.0), net_pnl_usd)
+                pos["peak_pnl_usd"] = peak_pnl
+
+                # Aktualizacja najwyższego schodka wielokrotności 5 USD
                 if net_pnl_usd >= DOLLAR_STEP_USD:
                     current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
                     if current_multiple > pos.get("locked_dollar_floor", 0.0):
                         pos["locked_dollar_floor"] = current_multiple
-                        logging.info(f"🔒💰 [ZAPADKA 5$] {symbol} | Osiągnięto zysk: +{net_pnl_usd:.2f}$! Zablokowano gwarantowany próg: +{current_multiple:.2f}$!")
+                        logging.info(f"🔒💰 [SCHODEK 5$] {symbol} | Zysk: +{net_pnl_usd:.2f}$! Zablokowano gwarantowaną podłogę: +{current_multiple:.2f}$!")
 
                 locked_floor = pos.get("locked_dollar_floor", 0.0)
                 current_sl = pos.get("trailing_sl", bp * 0.98)
 
+                # --------------------------------------------------------------
+                # DYNAMICZNY PROCENTOWY SPADEK ZE SZCZYTU (ANTI-SHAKEOUT)
+                # --------------------------------------------------------------
                 trigger_exit = False
                 exit_reason = ""
 
-                # Warunek A: Zysk osiągnął min. 5 USD i cofnął się poniżej szczebla
-                if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - DOLLAR_STEP_BUFFER):
-                    trigger_exit = True
-                    exit_reason = f"Zapadka Dolarowa (Zrealizowano: +{net_pnl_usd:.2f}$ | Obrona szczebla: +{locked_floor:.2f}$)"
+                if peak_pnl >= DOLLAR_STEP_USD:
+                    # 1. Określamy dopuszczalny spadek procentowy w zależności od siły wzrostu:
+                    if peak_pnl >= 20.0:
+                        # Silna pompa: pozwalamy na 2.5% korekty ceny ze szczytu (lub max 20% givebacku zysku)
+                        allowed_price_drop_pct = 0.025
+                        allowed_profit_giveback = 0.20
+                        floor_security = locked_floor  # Twardy schodek (np. 20$)
+                    elif peak_pnl >= 10.0:
+                        # Szybki wzrost: pozwalamy na 1.8% korekty ceny ze szczytu (lub max 18% givebacku)
+                        allowed_price_drop_pct = 0.018
+                        allowed_profit_giveback = 0.18
+                        floor_security = locked_floor  # Twardy schodek (np. 10$)
+                    else:
+                        # Zysk 5$ - 10$: pozwalamy na 1.0% korekty ceny (lub max 15% givebacku)
+                        allowed_price_drop_pct = 0.010
+                        allowed_profit_giveback = 0.15
+                        floor_security = 4.50  # Gwarancja min. 4.50$ zysku netto po prowizjach
 
-                # Warunek B: Standardowy Stop Loss (ochrona przed zjazdem przed osiągnięciem 5 USD)
+                    # Warunek A: Spadek ceny od lokalnego szczytu o wyznaczony procent
+                    price_drop_from_peak = (peak_p - c_curr) / peak_p if peak_p > 0 else 0.0
+                    profit_drop_from_peak = (peak_pnl - net_pnl_usd)
+
+                    hit_price_percent_drop = price_drop_from_peak >= allowed_price_drop_pct
+                    hit_profit_giveback = profit_drop_from_peak >= (peak_pnl * allowed_profit_giveback)
+                    fell_below_floor = net_pnl_usd < floor_security
+
+                    # Wychodzimy, jeśli nastąpiło realne odwrócenie procentowe LUB naruszenie gwarantowanego szczebla
+                    if (hit_price_percent_drop or hit_profit_giveback) and net_pnl_usd <= (peak_pnl * (1.0 - allowed_profit_giveback)):
+                        trigger_exit = True
+                        exit_reason = f"Procentowy Spadek ze Szczytu (-{price_drop_from_peak*100:.2f}% od ceny | Zrealizowano: +{net_pnl_usd:.2f}$ ze szczytu +{peak_pnl:.2f}$)"
+                    elif fell_below_floor:
+                        trigger_exit = True
+                        exit_reason = f"Obrona Schodka Zysku (Zrealizowano: +{net_pnl_usd:.2f}$ | Podłoga: +{floor_security:.2f}$)"
+
+                # Warunek B: Ochrona kapitału przed osiągnięciem 5 USD (standardowy SL)
                 elif locked_floor < DOLLAR_STEP_USD and c_curr <= current_sl:
                     trigger_exit = True
                     exit_reason = f"Stop Loss (Wynik: {gain_pct*100:+.2f}%)"
@@ -855,7 +896,8 @@ def bot_loop():
                     pnl_pct = ((curr - p["buy_price"]) / p["buy_price"]) * 100
                     pnl_usd = (curr - p["buy_price"]) * safe_float(p.get("qty", 0.0))
                     floor_val = p.get("locked_dollar_floor", 0.0)
-                    floor_txt = f" | 🔒 Zablokowany zysk: +{floor_val:.2f}$" if floor_val > 0 else ""
+                    peak_usd = p.get("peak_pnl_usd", pnl_usd)
+                    floor_txt = f" | 🔒 Podłoga: +{floor_val:.2f}$ (Szczyt: +{peak_usd:.2f}$)" if floor_val > 0 else ""
                     min_elapsed = int((now - p.get("entry_time", now)) / 60)
                     logging.info(f"📈 [{s}] Zysk: {pnl_usd:+.2f}$ ({pnl_pct:+.2f}%){floor_txt} | Czas: {min_elapsed}m")
                 logging.info("--------------------------------------------------------------------------------")
@@ -880,7 +922,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - 5 USD Step Ratchet & Full USDC Scanner")
+        self.wfile.write(b"Bybit Spot Bot Active - Dynamic Percentage Trailing & Step-Ratchet")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
