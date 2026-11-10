@@ -59,7 +59,7 @@ EXCLUDED_BASE_COINS = {
     "USDT", "EURC", "USD", "DAI", "FDUSD", "TUSD", "BUSD", "USDE", "PYUSD", "USDD"
 }
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (max 2 pozycje)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na transakcję (max 2 pozycje)
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
@@ -429,7 +429,7 @@ def get_dynamic_usdc_targets(all_tickers):
     return [c["symbol"] for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
 
 # ==============================================================================
-# STRATEGIA ŁOWCY BONUSÓW
+# STRATEGIA ŁOWCY BONUSÓW + MODUŁ ODBICIA PO ZRZUCIE (CAPITULATION ABSORPTION)
 # ==============================================================================
 def run_bonus_hunter_strategy():
     global active_positions
@@ -467,33 +467,72 @@ def run_bonus_hunter_strategy():
             p = df.iloc[-3]
             p2 = df.iloc[-4]
 
-            # 1. BEZPIECZNIK ANTY-PUŁAPKA
-            p_red = p['close'] < p['open']
-            p_drop = (p['open'] - p['close']) / p['open'] if p_red else 0.0
-            p_vol_ratio = (p['volume'] / p['vol_ma20']) if (p['vol_ma20'] and p['vol_ma20'] > 0) else 1.0
-
-            p2_red = p2['close'] < p2['open']
-            p2_drop = (p2['open'] - p2['close']) / p2['open'] if p2_red else 0.0
-            p2_vol_ratio = (p2['volume'] / p2['vol_ma20']) if (p2['vol_ma20'] and p2['vol_ma20'] > 0) else 1.0
-
-            dump_in_recent = (p_red and (p_drop >= 0.012 or p_vol_ratio >= 1.35)) or \
-                             (p2_red and (p2_drop >= 0.014 and p2_vol_ratio >= 1.35))
-
-            if dump_in_recent:
-                highest_dump_level = max(p['high'], p2['high'])
-                if c['close'] <= highest_dump_level:
-                    continue
-
             is_green = c['close'] > c['open']
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
             candle_range = c['high'] - c['low']
             lower_wick = min(c['open'], c['close']) - c['low']
             upper_wick = c['high'] - max(c['open'], c['close'])
 
-            if candle_range > 0 and (upper_wick / candle_range > 0.28):
+            # ==================================================================
+            # NOWOŚĆ: MODUŁ ODBICIA PO ZRZUCIE (CAPITULATION BOUNCE HUNTER)
+            # Wychwytuje paniczny zrzut z wielkim wolumenem i długim dolnym knotem
+            # ==================================================================
+            p_red = p['close'] < p['open']
+            p_range = p['high'] - p['low']
+            p_lower_wick = min(p['open'], p['close']) - p['low']
+            p_drop_pct = (p['open'] - p['close']) / p['open'] if p_red else 0.0
+            p_vol_ratio = (p['volume'] / p['vol_ma20']) if (p['vol_ma20'] and p['vol_ma20'] > 0) else 1.0
+
+            p2_red = p2['close'] < p2['open']
+            p2_range = p2['high'] - p2['low']
+            p2_lower_wick = min(p2['open'], p2['close']) - p2['low']
+            p2_drop_pct = (p2['open'] - p2['close']) / p2['open'] if p2_red else 0.0
+            p2_vol_ratio = (p2['volume'] / p2['vol_ma20']) if (p2['vol_ma20'] and p2['vol_ma20'] > 0) else 1.0
+
+            # Czy świeca p lub p2 była paniczną kapitulacją z absorpcją podaży?
+            capitulation_candle_p = (
+                p_red and (p_range / p['low'] >= 0.016) and
+                (p_vol_ratio >= 2.0) and
+                (p_range > 0 and (p_lower_wick / p_range) >= 0.28)
+            )
+            capitulation_candle_p2 = (
+                p2_red and (p2_range / p2['low'] >= 0.018) and
+                (p2_vol_ratio >= 2.0) and
+                (p2_range > 0 and (p2_lower_wick / p2_range) >= 0.28)
+            )
+
+            is_capitulation_absorbed = capitulation_candle_p or capitulation_candle_p2
+
+            # Warunek wejścia „gdy wraca”:
+            # 1. Poprzednia świeca lub 2 świece temu była wielkim zrzutem z absorpcją
+            # 2. Bieżąca świeca zamyka się zielona (powrót popytu) i trzyma się powyżej dołka
+            # 3. Kurs nie ma dominującego knota z góry (nie został znowu uderzony)
+            capitulation_bounce_signal = (
+                is_capitulation_absorbed and
+                is_green and
+                (c['close'] > min(p['low'], p2['low']) * 1.004) and
+                (candle_range > 0 and (upper_wick / candle_range <= 0.30)) and
+                (c_now['close'] >= c_now['open'])
+            )
+
+            # ==================================================================
+            # BEZPIECZNIK ANTY-PUŁAPKA DLA STANDARDOWYCH WEJŚĆ
+            # ==================================================================
+            dump_in_recent = (p_red and (p_drop_pct >= 0.012 or p_vol_ratio >= 1.35)) or \
+                             (p2_red and (p2_drop_pct >= 0.014 and p2_vol_ratio >= 1.35))
+
+            # Jeśli był zrzut, a NIE JEST to podręcznikowy Capitulation Bounce -> Odrzucamy!
+            if dump_in_recent and not capitulation_bounce_signal:
+                highest_dump_level = max(p['high'], p2['high'])
+                if c['close'] <= highest_dump_level:
+                    continue
+
+            if candle_range > 0 and (upper_wick / candle_range > 0.28) and not capitulation_bounce_signal:
                 continue
 
-            # 2. SELEKCJA BONUSÓW
+            # ==================================================================
+            # POZOSTAŁE TRYBY WEJŚCIA (TREND RUNNER, BREAKOUT, SWING)
+            # ==================================================================
             is_bull_market = c['close'] > c['ema200']
             is_stacked_bull = is_bull_market and (c['close'] > c['ema50']) and (c['ema9'] > c['ema21'])
 
@@ -537,7 +576,7 @@ def run_bonus_hunter_strategy():
                 (vol_ratio >= 0.80)
             )
 
-            if not is_golden_breakout and not is_trend_runner and not is_swing_reversal:
+            if not capitulation_bounce_signal and not is_golden_breakout and not is_trend_runner and not is_swing_reversal:
                 continue
 
             live_holding = c_now['low'] >= min(c['low'], p['low']) * 0.998
@@ -547,7 +586,11 @@ def run_bonus_hunter_strategy():
 
             ret_1h = (c['close'] - df['close'].iloc[-5]) / df['close'].iloc[-5]
 
-            if is_golden_breakout:
+            # Priorytet punktowy
+            if capitulation_bounce_signal:
+                tag = "CAPITULATION_BOUNCE"
+                score = 350.0 + (max(p_vol_ratio, p2_vol_ratio) * 45.0)  # Najwyższy priorytet dla odbicia po panice!
+            elif is_golden_breakout:
                 tag = "GOLDEN_BREAKOUT"
                 score = 300.0 + (ret_1h * 1000.0) + (vol_ratio * 40.0)
             elif is_trend_runner:
@@ -560,7 +603,7 @@ def run_bonus_hunter_strategy():
             candidates.append({
                 "symbol": symbol, "score": score, "tag": tag, "df": df,
                 "is_downtrend": not is_bull_market,
-                "swing_low": min(c['low'], p['low'], c_now['low']),
+                "swing_low": min(c['low'], p['low'], p2['low'], c_now['low']),
                 "ret_1h": ret_1h
             })
 
@@ -585,7 +628,8 @@ def run_bonus_hunter_strategy():
 
     # SCENARIUSZ 1: WOLNY SLOT
     if current_count < MAX_TOTAL_POSITIONS:
-        position_pct = (CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT
+        # W Capitulation Bounce wchodzimy z pełną stawką (wąski SL pod knotem kapitulacji)
+        position_pct = CAPITAL_PER_TRADE_PCT if cand_tag == "CAPITULATION_BOUNCE" else ((CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT)
         target_allocation = total_equity * position_pct
 
         if free_usdc < (target_allocation * 0.98):
@@ -594,7 +638,7 @@ def run_bonus_hunter_strategy():
         c_now = cand_df.iloc[-1]
         curr_price = c_now['close']
         
-        calculated_sl = swing_low * 0.995
+        calculated_sl = swing_low * 0.997  # Ciasny SL tuż pod knotem kapitulacji
         hard_sl_cap = curr_price * (1.0 - (0.016 if is_down else 0.022))
         initial_sl = max(calculated_sl, hard_sl_cap)
 
@@ -619,7 +663,7 @@ def run_bonus_hunter_strategy():
                     save_positions(active_positions)
                 is_micro = any(m in cand_sym for m in ["PEPE", "BONK", "SHIB"])
                 sl_fmt = f"{initial_sl:.8f}" if is_micro else f"{initial_sl:.4f}"
-                logging.info(f"💎🚀 [ŁOWCA BONUSÓW: {cand_tag}] {cand_sym} (Impet 1h: {best_candidate['ret_1h']*100:+.2f}%) | Cena: {curr_price} | SL: {sl_fmt}")
+                logging.info(f"💎🚀 [ZAKUP: {cand_tag}] {cand_sym} | Cena: {curr_price} | SL: {sl_fmt}")
         return
 
     # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI
@@ -645,7 +689,7 @@ def run_bonus_hunter_strategy():
         old_sym = stagnant_candidate["symbol"]
         old_gain = stagnant_candidate["gain_pct"]
         old_time = stagnant_candidate["time_min"]
-        logging.info(f"🔄⚡ [ROTACJA NA LIDERA] Wymiana ospałej {old_sym} ({old_gain*100:+.2f}%, {old_time}m) -> Nowy BONUS na {cand_sym} ({cand_tag})!")
+        logging.info(f"🔄⚡ [ROTACJA NA LIDERA] Wymiana ospałej {old_sym} ({old_gain*100:+.2f}%, {old_time}m) -> Nowy sygnał: {cand_sym} ({cand_tag})!")
 
         base_old = get_base_coin(old_sym)
         bal_old = get_coin_available_balance(base_old)
@@ -658,7 +702,7 @@ def run_bonus_hunter_strategy():
                 res_sell = session.place_order(category=CATEGORY, symbol=old_sym, side="Sell", orderType="Market", qty=sell_q_str)
                 if res_sell.get("retCode") == 0:
                     sold_ok = True
-                    reason = f"Rotacja ze stagnacji ({old_time}m) -> Lider {cand_sym}"
+                    reason = f"Rotacja ze stagnacji ({old_time}m) -> {cand_sym}"
                     record_closed_trade(old_sym, stagnant_candidate["pos"].get("strategy"), stagnant_candidate["pos"]["buy_price"], stagnant_candidate["curr_price"], safe_float(sell_q_str), reason)
                     with lock_pos:
                         if old_sym in active_positions:
@@ -669,13 +713,13 @@ def run_bonus_hunter_strategy():
             time.sleep(1.2)
             _, free_usdc_now = get_balances()
             total_eq_now, _ = get_balances()
-            pos_pct = (CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT
-            buy_capital = min(free_usdc_now * 0.985, total_eq_now * pos_pct)
+            position_pct = CAPITAL_PER_TRADE_PCT if cand_tag == "CAPITULATION_BOUNCE" else ((CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT)
+            buy_capital = min(free_usdc_now * 0.985, total_eq_now * position_pct)
 
             if buy_capital >= STANDARD_MIN_ORDER_VALUE:
                 c_now_c = cand_df.iloc[-1]
                 curr_price_c = c_now_c['close']
-                calc_sl = swing_low * 0.995
+                calc_sl = swing_low * 0.997
                 initial_sl_c = max(calc_sl, curr_price_c * (1.0 - (0.016 if is_down else 0.022)))
 
                 res_buy = session.place_order(category=CATEGORY, symbol=cand_sym, side="Buy", orderType="Market", qty=f"{buy_capital:.2f}")
@@ -696,14 +740,14 @@ def run_bonus_hunter_strategy():
                             "peak_pnl_usd": 0.0
                         }
                         save_positions(active_positions)
-                    logging.info(f"🎉🚀 [ROTACJA UDANA] Wskoczono w lidera {cand_sym} ({cand_tag}) po cenie {curr_price_c}!")
+                    logging.info(f"🎉🚀 [ROTACJA UDANA] Zamieniono na {cand_sym} ({cand_tag}) po cenie {curr_price_c}!")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: PROCENTOWE ŚCIEŻKI WYJŚCIA ZE SCHODKIEM 5 USD (ANTI-SHAKEOUT)
+# MONITORING ZYSKÓW: ZAPADKA 5 USD + NATYCHMIASTOWE CIĘCIE PRZY COFNIĘCIU
 # ==============================================================================
 def monitoring_worker():
     global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z dynamicznym buforem procentowym i schodkiem 5 USD.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z natychmiastowym ścinaniem cofnięć i schodkiem 5 USD.")
     while True:
         try:
             with lock_pos:
@@ -750,7 +794,7 @@ def monitoring_worker():
                     time.sleep(2.0)
                     continue
 
-            # 2. ADAPTACYJNY TRAILING PROCENTOWY OD SZCZYTU DLA POZYCJI
+            # 2. MONITOROWANIE POJEDYNCZYCH POZYCJI (W TYM BŁYSKAWICZNY EXIT DLA ODBIĆ)
             to_delete = []
             for symbol, pos in items:
                 c_curr = position_prices.get(symbol, 0.0)
@@ -763,78 +807,80 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
-                # Rzeczywisty zysk netto w USD (po odliczeniu prowizji wejścia i wyjścia)
                 trade_cost = bp * qty_f
                 curr_value = c_curr * qty_f
                 est_fees = (trade_cost + curr_value) * 0.001
                 net_pnl_usd = (curr_value - trade_cost) - est_fees
 
-                # Aktualizacja szczytu cenowego oraz szczytu dolarowego
                 peak_p = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak_p
                 
                 peak_pnl = max(pos.get("peak_pnl_usd", 0.0), net_pnl_usd)
                 pos["peak_pnl_usd"] = peak_pnl
 
-                # Aktualizacja najwyższego schodka wielokrotności 5 USD
+                # Aktualizacja schodka 5 USD
                 if net_pnl_usd >= DOLLAR_STEP_USD:
                     current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
                     if current_multiple > pos.get("locked_dollar_floor", 0.0):
                         pos["locked_dollar_floor"] = current_multiple
-                        logging.info(f"🔒💰 [SCHODEK 5$] {symbol} | Zysk: +{net_pnl_usd:.2f}$! Zablokowano gwarantowaną podłogę: +{current_multiple:.2f}$!")
+                        logging.info(f"🔒💰 [SCHODEK 5$] {symbol} | Zysk: +{net_pnl_usd:.2f}$! Zablokowano próg: +{current_multiple:.2f}$!")
 
                 locked_floor = pos.get("locked_dollar_floor", 0.0)
                 current_sl = pos.get("trailing_sl", bp * 0.98)
+                strat_tag = pos.get("strategy", "")
 
-                # --------------------------------------------------------------
-                # DYNAMICZNY PROCENTOWY SPADEK ZE SZCZYTU (ANTI-SHAKEOUT)
-                # --------------------------------------------------------------
                 trigger_exit = False
                 exit_reason = ""
 
-                if peak_pnl >= DOLLAR_STEP_USD:
-                    # 1. Określamy dopuszczalny spadek procentowy w zależności od siły wzrostu:
-                    if peak_pnl >= 20.0:
-                        # Silna pompa: pozwalamy na 2.5% korekty ceny ze szczytu (lub max 20% givebacku zysku)
-                        allowed_price_drop_pct = 0.025
-                        allowed_profit_giveback = 0.20
-                        floor_security = locked_floor  # Twardy schodek (np. 20$)
-                    elif peak_pnl >= 10.0:
-                        # Szybki wzrost: pozwalamy na 1.8% korekty ceny ze szczytu (lub max 18% givebacku)
-                        allowed_price_drop_pct = 0.018
-                        allowed_profit_giveback = 0.18
-                        floor_security = locked_floor  # Twardy schodek (np. 10$)
-                    else:
-                        # Zysk 5$ - 10$: pozwalamy na 1.0% korekty ceny (lub max 15% givebacku)
-                        allowed_price_drop_pct = 0.010
-                        allowed_profit_giveback = 0.15
-                        floor_security = 4.50  # Gwarancja min. 4.50$ zysku netto po prowizjach
+                price_drop_from_peak = (peak_p - c_curr) / peak_p if peak_p > 0 else 0.0
 
-                    # Warunek A: Spadek ceny od lokalnego szczytu o wyznaczony procent
-                    price_drop_from_peak = (peak_p - c_curr) / peak_p if peak_p > 0 else 0.0
-                    profit_drop_from_peak = (peak_pnl - net_pnl_usd)
+                # --------------------------------------------------------------
+                # DEDYKOWANE SZYBKIE WYJŚCIE DLA CAPITULATION BOUNCE:
+                # Trzymasz dopóki rośnie, przy pierwszym cofnięciu (0.45% - 0.60%) natychmiastowa sprzedaż!
+                # --------------------------------------------------------------
+                if "CAPITULATION" in strat_tag:
+                    # Jeśli ruch wybił w górę min. +1.1% (lub dał >= 4.00$) i zaczyna cofać:
+                    if peak_pnl >= 4.0 or (peak_p - bp) / bp >= 0.011:
+                        if price_drop_from_peak >= 0.0045:  # Cofnięcie o zaledwie 0.45% od lokalnego szczytu
+                            trigger_exit = True
+                            exit_reason = f"Capitulation Bounce Peak Cut (-{price_drop_from_peak*100:.2f}% ze szczytu | Zysk: +{net_pnl_usd:.2f}$)"
 
-                    hit_price_percent_drop = price_drop_from_peak >= allowed_price_drop_pct
-                    hit_profit_giveback = profit_drop_from_peak >= (peak_pnl * allowed_profit_giveback)
-                    fell_below_floor = net_pnl_usd < floor_security
+                # --------------------------------------------------------------
+                # STANDARDOWA ZAPADKA PROCENTOWA I SCHODKOWA DLA POZOSTAŁYCH TRYBÓW
+                # --------------------------------------------------------------
+                if not trigger_exit:
+                    if peak_pnl >= DOLLAR_STEP_USD:
+                        if peak_pnl >= 20.0:
+                            allowed_price_drop_pct = 0.025
+                            allowed_profit_giveback = 0.20
+                            floor_security = locked_floor
+                        elif peak_pnl >= 10.0:
+                            allowed_price_drop_pct = 0.018
+                            allowed_profit_giveback = 0.18
+                            floor_security = locked_floor
+                        else:
+                            allowed_price_drop_pct = 0.010
+                            allowed_profit_giveback = 0.15
+                            floor_security = 4.50
 
-                    # Wychodzimy, jeśli nastąpiło realne odwrócenie procentowe LUB naruszenie gwarantowanego szczebla
-                    if (hit_price_percent_drop or hit_profit_giveback) and net_pnl_usd <= (peak_pnl * (1.0 - allowed_profit_giveback)):
+                        hit_price_percent_drop = price_drop_from_peak >= allowed_price_drop_pct
+                        hit_profit_giveback = (peak_pnl - net_pnl_usd) >= (peak_pnl * allowed_profit_giveback)
+                        fell_below_floor = net_pnl_usd < floor_security
+
+                        if (hit_price_percent_drop or hit_profit_giveback) and net_pnl_usd <= (peak_pnl * (1.0 - allowed_profit_giveback)):
+                            trigger_exit = True
+                            exit_reason = f"Procentowy Spadek ze Szczytu (-{price_drop_from_peak*100:.2f}% | Zrealizowano: +{net_pnl_usd:.2f}$)"
+                        elif fell_below_floor:
+                            trigger_exit = True
+                            exit_reason = f"Obrona Schodka Zysku (Zrealizowano: +{net_pnl_usd:.2f}$ | Podłoga: +{floor_security:.2f}$)"
+
+                    elif locked_floor < DOLLAR_STEP_USD and c_curr <= current_sl:
                         trigger_exit = True
-                        exit_reason = f"Procentowy Spadek ze Szczytu (-{price_drop_from_peak*100:.2f}% od ceny | Zrealizowano: +{net_pnl_usd:.2f}$ ze szczytu +{peak_pnl:.2f}$)"
-                    elif fell_below_floor:
+                        exit_reason = f"Stop Loss (Wynik: {gain_pct*100:+.2f}%)"
+
+                    elif time_in_pos >= STAGNATION_FORCE_EXIT_SEC and gain_pct < 0.002:
                         trigger_exit = True
-                        exit_reason = f"Obrona Schodka Zysku (Zrealizowano: +{net_pnl_usd:.2f}$ | Podłoga: +{floor_security:.2f}$)"
-
-                # Warunek B: Ochrona kapitału przed osiągnięciem 5 USD (standardowy SL)
-                elif locked_floor < DOLLAR_STEP_USD and c_curr <= current_sl:
-                    trigger_exit = True
-                    exit_reason = f"Stop Loss (Wynik: {gain_pct*100:+.2f}%)"
-
-                # Warunek C: Stagnacja (60 minut bezruchu)
-                elif time_in_pos >= STAGNATION_FORCE_EXIT_SEC and gain_pct < 0.002:
-                    trigger_exit = True
-                    exit_reason = f"Stagnation Exit (60m bez reakcji)"
+                        exit_reason = f"Stagnation Exit (60m bez reakcji)"
 
                 if trigger_exit:
                     base_c = get_base_coin(symbol)
@@ -897,9 +943,10 @@ def bot_loop():
                     pnl_usd = (curr - p["buy_price"]) * safe_float(p.get("qty", 0.0))
                     floor_val = p.get("locked_dollar_floor", 0.0)
                     peak_usd = p.get("peak_pnl_usd", pnl_usd)
+                    strat_info = p.get("strategy", "")
                     floor_txt = f" | 🔒 Podłoga: +{floor_val:.2f}$ (Szczyt: +{peak_usd:.2f}$)" if floor_val > 0 else ""
                     min_elapsed = int((now - p.get("entry_time", now)) / 60)
-                    logging.info(f"📈 [{s}] Zysk: {pnl_usd:+.2f}$ ({pnl_pct:+.2f}%){floor_txt} | Czas: {min_elapsed}m")
+                    logging.info(f"📈 [{s}] ({strat_info}) Zysk: {pnl_usd:+.2f}$ ({pnl_pct:+.2f}%){floor_txt} | Czas: {min_elapsed}m")
                 logging.info("--------------------------------------------------------------------------------")
                 last_print = now
 
@@ -922,7 +969,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Dynamic Percentage Trailing & Step-Ratchet")
+        self.wfile.write(b"Bybit Spot Bot Active - Capitulation Bounce & Dynamic Dollar Ratchet")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
