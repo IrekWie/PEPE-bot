@@ -54,29 +54,29 @@ TESTNET = False
 CATEGORY = "spot"
 QUOTE_COIN = "USDC"
 
-# CZARNA LISTA STABLECOINÓW (BRAK ZMIENNOŚCI)
+# CZARNA LISTA STABLECOINÓW
 EXCLUDED_BASE_COINS = {
     "USDT", "EURC", "USD", "DAI", "FDUSD", "TUSD", "BUSD", "USDE", "PYUSD", "USDD"
 }
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (max 2 jednoczesne pozycje)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-MIN_24H_TURNOVER_USD = 60000.0     # Odsiew par o zbyt małym obrocie
-USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny dopuszczalny spread (0.50%)
-MAX_SCAN_CANDIDATES = 35           # Limit par analizowanych równolegle
+MIN_24H_TURNOVER_USD = 60000.0     
+USDC_MAX_SPREAD_PCT = 0.0050       
+MAX_SCAN_CANDIDATES = 35           
 
 # DOLAROWY TRAILING PORTFELA (BASKET LOCK)
-USD_PROFIT_TRIGGER = 20.0          # Zysk koszyka >= 20 USD aktywuje trailing
-USD_TRAILING_DROP = 5.0            # Cofnięcie o 5 USD realizuje cały koszyk
+USD_PROFIT_TRIGGER = 20.0          
+USD_TRAILING_DROP = 5.0            
 basket_peak_profit_usd = 0.0       
 
 # ROTACJA I STAGNATION
-STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez zysku kwalifikuje do rotacji na lidera
+STAGNATION_ROTATION_TIME_SEC = 2100  # 35 min bez zysku kwalifikuje do rotacji
 STAGNATION_MAX_GAIN_PCT = 0.0040    
-STAGNATION_FORCE_EXIT_SEC = 3600    # Twarde wyjście po 60 min bezruchu
+STAGNATION_FORCE_EXIT_SEC = 3600    # Twarde wyjście po 60 min
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
@@ -160,7 +160,7 @@ def format_qty_with_step(raw_qty, qty_step_str, min_qty_str):
         return None
 
 # ==============================================================================
-# MODUŁ ZAPISU I HISTORII TRANSAKCJI
+# MODUŁ ZAPISU I HISTORII
 # ==============================================================================
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
@@ -335,7 +335,7 @@ def is_btc_market_healthy():
     return True
 
 # ==============================================================================
-# SYNCHRONIZACJA PORTFELA (DOWOLNA MONETA USDC NA KONCIE)
+# SYNCHRONIZACJA PORTFELA
 # ==============================================================================
 def sync_positions_from_bybit():
     global active_positions
@@ -391,7 +391,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# DYNAMICZNY SKANER CAŁEGO RYNKU SPOT USDC
+# DYNAMICZNY SKANER CAŁEGO RYNKU USDC
 # ==============================================================================
 def get_dynamic_usdc_targets(all_tickers):
     valid_candidates = []
@@ -425,7 +425,7 @@ def get_dynamic_usdc_targets(all_tickers):
     return [c["symbol"] for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
 
 # ==============================================================================
-# STRATEGIA ŁOWCY BONUSÓW Z DYNAMICZNYM SKANEREM
+# STRATEGIA ŁOWCY BONUSÓW Z RANKINGIEM SIŁY
 # ==============================================================================
 def run_bonus_hunter_strategy():
     global active_positions
@@ -463,9 +463,7 @@ def run_bonus_hunter_strategy():
             p = df.iloc[-3]
             p2 = df.iloc[-4]
 
-            # ------------------------------------------------------------------
-            # 1. BEZPIECZNIK ANTY-PUŁAPKA (BULL TRAP / DUMP CANDLE ANNIHILATOR)
-            # ------------------------------------------------------------------
+            # 1. BEZPIECZNIK ANTY-PUŁAPKA (DUMP CANDLE & PANIC VOLUME)
             p_red = p['close'] < p['open']
             p_drop = (p['open'] - p['close']) / p['open'] if p_red else 0.0
             p_vol_ratio = (p['volume'] / p['vol_ma20']) if (p['vol_ma20'] and p['vol_ma20'] > 0) else 1.0
@@ -491,13 +489,10 @@ def run_bonus_hunter_strategy():
             if candle_range > 0 and (upper_wick / candle_range > 0.28):
                 continue
 
-            # ------------------------------------------------------------------
-            # 2. SELEKCJA BONUSÓW: TREND RUNNER, GOLDEN BREAKOUT, SWING REVERSAL
-            # ------------------------------------------------------------------
+            # 2. SELEKCJA BONUSÓW
             is_bull_market = c['close'] > c['ema200']
             is_stacked_bull = is_bull_market and (c['close'] > c['ema50']) and (c['ema9'] > c['ema21'])
 
-            # A) BONUS 1: GOLDEN BREAKOUT (WYBICIE NOWEGO SZCZYTU 4H Z WOLUMENEM)
             high_4h = df['high'].iloc[-17:-2].max()
             is_golden_breakout = (
                 is_bull_market and
@@ -507,7 +502,6 @@ def run_bonus_hunter_strategy():
                 (c['rsi'] <= 75.0)
             )
 
-            # B) BONUS 2: TREND RUNNER (PULLBACK DO EMA 9/21 W SILNYM RAJDZIE)
             tested_ema9_or_21 = (p['low'] <= p['ema9'] * 1.003) or (c['low'] <= c['ema9'] * 1.003) or (p['low'] <= p['ema21'] * 1.003)
             dist_from_ema9 = (c['close'] - c['ema9']) / c['ema9']
             is_trend_runner = (
@@ -520,7 +514,6 @@ def run_bonus_hunter_strategy():
                 (vol_ratio >= 0.85)
             )
 
-            # C) SWING REVERSAL: DOŁEK W KONSOLIDACJI
             bb_width = c.get('bb_width', 0.0)
             recent_low_4 = df['low'].iloc[-5:-1].min()
             recent_bb_lower = df['bb_lower'].iloc[-5:-1].min()
@@ -548,9 +541,6 @@ def run_bonus_hunter_strategy():
             if not (live_holding and live_not_dumping):
                 continue
 
-            # ------------------------------------------------------------------
-            # 3. RANKING SIŁY RELATYWNEJ
-            # ------------------------------------------------------------------
             ret_1h = (c['close'] - df['close'].iloc[-5]) / df['close'].iloc[-5]
 
             if is_golden_breakout:
@@ -589,9 +579,7 @@ def run_bonus_hunter_strategy():
         current_count = len(active_positions)
         current_items = list(active_positions.items())
 
-    # ==========================================================================
-    # SCENARIUSZ 1: WOLNY SLOT W PORTFELU
-    # ==========================================================================
+    # SCENARIUSZ 1: WOLNY SLOT
     if current_count < MAX_TOTAL_POSITIONS:
         position_pct = (CAPITAL_PER_TRADE_PCT * 0.60) if is_down else CAPITAL_PER_TRADE_PCT
         target_allocation = total_equity * position_pct
@@ -629,9 +617,7 @@ def run_bonus_hunter_strategy():
                 logging.info(f"💎🚀 [ŁOWCA BONUSÓW: {cand_tag}] {cand_sym} (Impet 1h: {best_candidate['ret_1h']*100:+.2f}%) | Cena: {curr_price} | SL: {sl_fmt}")
         return
 
-    # ==========================================================================
-    # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI NA LIDERA RYNKU
-    # ==========================================================================
+    # SCENARIUSZ 2: ROTACJA ZE STAGNACYJNEJ POZYCJI
     stagnant_candidate = None
     for def_sym, def_pos in current_items:
         c_curr = safe_float(all_tickers.get(def_sym, {}).get("lastPrice"), def_pos["buy_price"])
@@ -707,11 +693,11 @@ def run_bonus_hunter_strategy():
                     logging.info(f"🎉🚀 [ROTACJA UDANA] Wskoczono w lidera {cand_sym} ({cand_tag}) po cenie {curr_price_c}!")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: ZABEZPIECZENIE OD +1.4%, TP1 NA +2.0% I WYJŚCIE PRZY UTRACIE EMA 9
+# MONITORING ZYSKÓW: DYNAMICZNY LIMIT COFNIĘCIA OD SZCZYTU (MAX RETENTION)
 # ==============================================================================
 def monitoring_worker():
     global active_positions, basket_peak_profit_usd
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z dynamicznym TP1 (+2.0%) i wczesną ochroną zysków.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z dynamicznym ścinaniem cofnięć i TP1 (+2.0%).")
     while True:
         try:
             with lock_pos:
@@ -758,7 +744,7 @@ def monitoring_worker():
                     time.sleep(2.0)
                     continue
 
-            # 2. ADAPTACYJNA ZAPADKA PROCENTOWA I ZABEZPIECZENIE PRZED COFNIĘCIEM
+            # 2. DYNAMICZNA ZAPADKA ŚCINAJĄCA COFNIĘCIA OD SZCZYTU
             to_delete = []
             for symbol, pos in items:
                 c_curr = position_prices.get(symbol, 0.0)
@@ -770,20 +756,27 @@ def monitoring_worker():
                 time_in_pos = now_ts - entry_time
                 gain_pct = (c_curr - bp) / bp
 
-                # Śledzenie lokalnego szczytu ceny
+                # Śledzenie absolutnego szczytu ceny
                 peak = max(pos.get("peak_price", bp), c_curr)
                 pos["peak_price"] = peak
                 peak_pct = (peak - bp) / bp
 
                 current_sl = pos.get("trailing_sl", bp * 0.98)
 
-                # Dynamiczna zapadka zysków:
-                if peak_pct >= 0.080:
-                    current_sl = max(current_sl, peak * (1.0 - 0.028), bp * 1.055)
-                elif peak_pct >= 0.045:
-                    current_sl = max(current_sl, peak * (1.0 - 0.020), bp * 1.028)
+                # --------------------------------------------------------------
+                # DYNAMICZNY LIMIT COFNIĘCIA (DYNAMIC GIVEBACK LIMITER):
+                # --------------------------------------------------------------
+                if peak_pct >= 0.060:
+                    # Szczyt >= +6.0%: Dopuszczamy cofnięcie max 15% wypracowanego zysku
+                    allowed_pullback = max(0.012, peak_pct * 0.15)
+                    current_sl = max(current_sl, peak * (1.0 - allowed_pullback), bp * 1.050)
+
+                elif peak_pct >= 0.035:
+                    # Szczyt +3.5% do +6.0%: Max cofnięcie 0.90% od szczytu, min podłoga +2.6%
+                    current_sl = max(current_sl, peak * (1.0 - 0.0090), bp * 1.026)
+
                 elif peak_pct >= 0.020:
-                    # TP1: Realizacja 50% pozycji przy +2.0%
+                    # Szczyt +2.0% do +3.5%: TP1 zrzuca 50% pozycji do gotówki
                     if not pos.get("tp1_executed", False):
                         full_qty = Decimal(str(pos.get("initial_qty", pos["qty"])))
                         half_qty = full_qty / Decimal("2")
@@ -800,15 +793,17 @@ def monitoring_worker():
                                 logging.info(f"💎💰 [TAKE PROFIT 1] {symbol} | Sprzedano 50% pozycji przy +{gain_pct*100:.2f}%!")
                         pos["tp1_executed"] = True
 
-                    current_sl = max(current_sl, peak * (1.0 - 0.012), bp * 1.011)
-                elif peak_pct >= 0.014:
-                    # Aktywny trailing od razu po wybiciu (+1.4%)
-                    current_sl = max(current_sl, peak * (1.0 - 0.0075), bp * 1.0065)
+                    # Max cofnięcie 0.70% od szczytu, min zablokowany zysk +1.30%
+                    current_sl = max(current_sl, peak * (1.0 - 0.0070), bp * 1.013)
+
+                elif peak_pct >= 0.012:
+                    # Szczyt +1.2% do +2.0%: Max cofnięcie 0.45% od szczytu (koniec oddawania zysku!)
+                    current_sl = max(current_sl, peak * (1.0 - 0.0045), bp * 1.0065)
 
                 pos["trailing_sl"] = current_sl
 
                 # --------------------------------------------------------------
-                # DETEKCJA ZAŁAMANIA TRENDU (EMA 9 BREAKDOWN)
+                # BEZPIECZNIK NATYCHMIASTOWEJ UTRATY IMPETU NA ŚWIECACH 15M
                 # --------------------------------------------------------------
                 trend_breakdown = False
                 is_extreme_climax = False
@@ -843,7 +838,7 @@ def monitoring_worker():
                     exit_reason = f"Utrata EMA 9 po impulsie (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
                 elif c_curr <= current_sl:
                     trigger_exit = True
-                    exit_reason = f"Dynamiczny Trailing Stop (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
+                    exit_reason = f"Dynamiczne Ścięcie Cofnięcia (Zrealizowano: {gain_pct*100:+.2f}% | Szczyt: {peak_pct*100:+.2f}%)"
                 elif time_in_pos >= STAGNATION_FORCE_EXIT_SEC and gain_pct < 0.002:
                     trigger_exit = True
                     exit_reason = f"Stagnation Exit (60m bez reakcji)"
@@ -936,7 +931,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Full Scaled Architecture")
+        self.wfile.write(b"Bybit Spot Bot Active - Dynamic Profit Harvester & Full USDC Market Scanner")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
