@@ -58,22 +58,22 @@ EXCLUDED_BASE_COINS = {
     "USDT", "EURC", "USD", "DAI", "FDUSD", "TUSD", "BUSD", "USDE", "PYUSD", "USDD"
 }
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na transakcję (max 2 pozycje)
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-MIN_24H_TURNOVER_USD = 250000.0    # Odsiew śmieci: min. 250 000 USD obrotu (koniec z monetami jak LIT!)
-USDC_MAX_SPREAD_PCT = 0.0040       # Ciasny spread max 0.40%
-MAX_SCAN_CANDIDATES = 30           
+MIN_24H_TURNOVER_USD = 250000.0    # Odsiew śmieci (min. 250k obrotu)
+USDC_MAX_SPREAD_PCT = 0.0040       
+MAX_SCAN_CANDIDATES = 35           
 
 # ==============================================================================
 # TWARDE BEZPIECZNIKI PORTFELA
 # ==============================================================================
-EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda - 5 USD = NATYCHMIASTOWY ZRZUT WSZYSTKIEGO DO USDC
+EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda - 5 USD = ZRZUT WSZYSTKIEGO
 MAX_DAILY_LOSS_USD = 20.0          # Maksymalna strata dzienna (-20 USD)
-DOLLAR_STEP_USD = 5.0              # Zapadka zysku: 5$, 10$, 15$...
-COOLDOWN_AFTER_EXIT_SEC = 5400     # BLOKADA 90 MINUT: zakaz dotykania monety po wyjściu z pozycji!
+DOLLAR_STEP_USD = 5.0              # Schodek zabezpieczania zysku: 5$, 10$...
+COOLDOWN_AFTER_EXIT_SEC = 5400     # BLOKADA 90 MINUT po wyjściu
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
@@ -90,7 +90,7 @@ lock_pos = threading.RLock()
 lock_history = threading.RLock()
 lock_state = threading.RLock()
 instrument_filters = {}
-recently_closed_coins = {}         # Symbol -> timestamp zamknięcia (ochrona przed overtradingiem)
+recently_closed_coins = {}
 
 sync_bybit_clock()
 
@@ -226,7 +226,7 @@ trade_history = load_trade_history()
 
 def record_closed_trade(symbol, strat, buy_price, sell_price, qty, reason):
     global trade_history, recently_closed_coins
-    recently_closed_coins[symbol] = time.time()  # Aktywacja 90-minutowego zakazu ponownego kupna
+    recently_closed_coins[symbol] = time.time()  # BLOKADA OVERTRADINGU (90 min)
     with lock_history:
         raw_pnl_usd = (sell_price - buy_price) * qty
         fee_est = (buy_price * qty + sell_price * qty) * 0.001
@@ -344,6 +344,7 @@ def get_market_data_no_cache(symbol, interval="15", limit=200):
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        df['ema89'] = df['close'].ewm(span=89, adjust=False).mean()
         df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
         df['rsi'] = calculate_rsi(df['close'], period=14)
         df['vol_ma20'] = df['volume'].rolling(window=20).mean()
@@ -472,10 +473,10 @@ def sync_positions_from_bybit():
                             }
             save_positions(active_positions)
     except Exception as e:
-        logging.error(f"Błąd synchronizacji: {e}")
+        logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# DYNAMICZNY SKANER PŁYNNYCH PAR USDC (TYLKO DUŻY OBRÓT)
+# DYNAMICZNY SKANER PŁYNNYCH PAR USDC
 # ==============================================================================
 def get_dynamic_usdc_targets(all_tickers):
     valid_candidates = []
@@ -489,7 +490,7 @@ def get_dynamic_usdc_targets(all_tickers):
 
         turnover_24h = safe_float(t_data.get("turnover24h", 0.0))
         if turnover_24h < MIN_24H_TURNOVER_USD:
-            continue  # Koniec ze śmieciowymi monetami poniżej 250k obrotu!
+            continue
 
         bid = safe_float(t_data.get("bid1Price"))
         ask = safe_float(t_data.get("ask1Price"))
@@ -499,16 +500,18 @@ def get_dynamic_usdc_targets(all_tickers):
         if spread > USDC_MAX_SPREAD_PCT:
             continue
 
+        price_24h_pct = safe_float(t_data.get("price24hPcnt", 0.0))
         valid_candidates.append({
             "symbol": symbol,
-            "turnover": turnover_24h
+            "turnover": turnover_24h,
+            "price24h_pct": price_24h_pct
         })
 
     valid_candidates.sort(key=lambda x: x["turnover"], reverse=True)
-    return [c["symbol"] for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
+    return [c for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
 
 # ==============================================================================
-# JEDYNY AKTYWNY SILNIK: CAPITULATION SNIPER (BEZWZGLĘDNY ZAKAZ KUPNA NA GÓRKACH)
+# STRATEGIA: SNAJPER KAPITULACJI ("V-SHAPE") + ZAOKRĄGLONE DNO ("U-SHAPE")
 # ==============================================================================
 def run_bonus_hunter_strategy():
     global active_positions, recently_closed_coins
@@ -516,14 +519,16 @@ def run_bonus_hunter_strategy():
     if not all_tickers:
         return
 
-    # Sprawdzenie dziennego limitu straty (-20 USD)
+    # Dzienny limit straty (-20 USD)
     _, _, total_today = get_today_pnl(all_tickers)
     if total_today <= -MAX_DAILY_LOSS_USD:
         return
 
     total_equity, free_usdc = get_balances()
     now_ts = time.time()
-    scanned_coins = get_dynamic_usdc_targets(all_tickers)
+    scanned_coins_data = get_dynamic_usdc_targets(all_tickers)
+    scanned_coins = [c["symbol"] for c in scanned_coins_data]
+    coin_pct_map = {c["symbol"]: c["price24h_pct"] for c in scanned_coins_data}
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -540,7 +545,7 @@ def run_bonus_hunter_strategy():
             if symbol in active_positions:
                 continue
 
-        # BLOKADA 90 MINUT DLA MONET JUŻ ZAMKNIĘTYCH (KONIEC Z MIELENIEM LIT!)
+        # Blokada ponownego wejścia (90 min)
         last_closed = recently_closed_coins.get(symbol, 0)
         if (now_ts - last_closed) < COOLDOWN_AFTER_EXIT_SEC:
             continue
@@ -550,37 +555,26 @@ def run_bonus_hunter_strategy():
             continue
 
         try:
-            c_now = df.iloc[-1]   # Świeca bieżąca (na żywo)
-            c = df.iloc[-2]       # Poprzednia świeca (zamknięta)
+            c_now = df.iloc[-1]   
+            c = df.iloc[-2]       
             curr_price = c_now['close']
+            price_change_24h = coin_pct_map.get(symbol, 0.0)
 
             # ==================================================================
-            # ŻELAZNA BARIERA ANTY-SZCZYTOWA (ELIMINACJA WEJŚĆ TYPU LIT, NEAR, PEPE)
+            # ŻELAZNA BARIERA ANTY-SZCZYTOWA: CAŁKOWITY ZAKAZ KUPNA NA GÓRKACH
             # ==================================================================
-            # 1. Bezwzględny zakaz kupowania nad średnimi (EMA 9, EMA 21, EMA 50)
-            if curr_price >= c_now['ema9'] or curr_price >= c_now['ema21'] or curr_price >= c_now['ema50']:
+            if curr_price >= c_now['ema9'] * 1.002 or curr_price >= c_now['ema21'] * 1.002 or curr_price >= c_now['ema50']:
                 continue
 
-            # 2. Bezwzględny zakaz kupowania w górnej połowie wstęgi Bollingera
             if curr_price >= c_now['bb_mid']:
                 continue
 
-            # 3. Wskaźnik RSI MUSI być skrajnie wyprzedany (< 38.0). Zero zakupów przy RSI 45-75!
-            if c_now['rsi'] >= 38.0:
-                continue
-
-            # 4. Zakaz gonienia zielonej świecy w locie
             if c_now['close'] >= (c_now['open'] * 1.004):
                 continue
 
-            # 5. Zakaz kupowania monet, które rosły w ciągu ostatniej godziny
-            if curr_price >= df['close'].iloc[-5]:
-                continue
-
             # ==================================================================
-            # JEDYNY DOPUSZCZALNY WARUNEK: CZERWONY ZRZUT KAPITULACYJNY Z ABSORPCJĄ
+            # TRYB 1: CAPITULATION SNIPER (SZYBKIE ODBICIE "V-SHAPE")
             # ==================================================================
-            # Świeca c MUSI być dużą CZERWONĄ świecą spadkową (min. 1.8% spadku)
             c_is_red = c['close'] < c['open']
             c_drop_pct = (c['open'] - c['close']) / c['open'] if c_is_red else 0.0
             vol_ratio = (c['volume'] / c['vol_ma20']) if (c['vol_ma20'] and c['vol_ma20'] > 0) else 1.0
@@ -592,16 +586,42 @@ def run_bonus_hunter_strategy():
                 (c['low'] <= c['bb_lower'] * 1.002)
             )
 
-            # Kurs uderzył w dno i dopiero zaczyna lekko zawracać (+0.40% do +0.90% od dna knota)
             rebound_from_low = (curr_price - c['low']) / c['low'] if c['low'] > 0 else 0.0
             is_valid_bottom_rebound = (0.0040 <= rebound_from_low <= 0.0110)
 
-            if not (is_panic_dump and is_valid_bottom_rebound):
+            is_capitulation = is_panic_dump and is_valid_bottom_rebound and (c_now['rsi'] <= 38.0)
+
+            # ==================================================================
+            # TRYB 2: U-SHAPE BOTTOM (ZAOKRĄGLONE DNO, JAK NA PEPE)
+            # ==================================================================
+            # 1. Moneta po solidnych, głębokich spadkach z całej doby
+            is_dumped_24h = (price_change_24h <= -0.05)
+            
+            # 2. Kurs głęboko pod długoterminową EMA 89
+            deep_under_ema89 = (curr_price <= c_now['ema89'] * 0.985)
+            
+            # 3. EMA 9 właśnie przecina EMA 21 od dołu w górę
+            ema_crossover = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
+            
+            # 4. Spokojne wejście blisko przecięcia, RSI schłodzone ale odbijające
+            safe_crossover_entry = (curr_price <= c_now['ema9'] * 1.002) and (38.0 <= c_now['rsi'] <= 55.0)
+
+            is_ushape_bottom = is_dumped_24h and deep_under_ema89 and ema_crossover and safe_crossover_entry
+
+            if not (is_capitulation or is_ushape_bottom):
                 continue
 
-            score = 500.0 + (rebound_from_low * 1000.0) + (vol_ratio * 10.0)
+            if is_capitulation:
+                tag = "CAPITULATION_SNIPER"
+                score = 500.0 + (rebound_from_low * 1000.0) + (vol_ratio * 10.0)
+                swing_low = c['low']
+            else:
+                tag = "U_SHAPE_BOTTOM"
+                score = 400.0 + ((60.0 - c_now['rsi']) * 5.0)
+                swing_low = df['low'].iloc[-8:-1].min()
+
             candidates.append({
-                "symbol": symbol, "score": score, "swing_low": c['low'], "curr_price": curr_price
+                "symbol": symbol, "score": score, "tag": tag, "swing_low": swing_low, "curr_price": curr_price
             })
 
         except Exception as e:
@@ -614,6 +634,7 @@ def run_bonus_hunter_strategy():
     best = candidates[0]
 
     cand_sym = best["symbol"]
+    cand_tag = best["tag"]
     curr_price = best["curr_price"]
     swing_low = best["swing_low"]
 
@@ -625,7 +646,6 @@ def run_bonus_hunter_strategy():
         if free_usdc < (target_allocation * 0.98):
             return
 
-        # Bardzo ciasny Stop Loss pod dnem knota zrzutu
         calculated_sl = swing_low * 0.996
         hard_sl_cap = curr_price * 0.988
         initial_sl = max(calculated_sl, hard_sl_cap)
@@ -637,7 +657,7 @@ def run_bonus_hunter_strategy():
             if q_str:
                 with lock_pos:
                     active_positions[cand_sym] = {
-                        "strategy": "CAPITULATION_SNIPER",
+                        "strategy": cand_tag,
                         "buy_price": curr_price,
                         "peak_price": curr_price,
                         "qty": q_str,
@@ -649,14 +669,14 @@ def run_bonus_hunter_strategy():
                         "tp1_executed": False
                     }
                     save_positions(active_positions)
-                logging.info(f"🎯🔥 [ZŁAPANO DOŁEK PANIKI] {cand_sym} | Kupiono po zrzucie na cenie: {curr_price} | SL pod knotem: {initial_sl:.4f}")
+                logging.info(f"🎯🔥 [ZAKUP: {cand_tag}] {cand_sym} | Cena w dołku: {curr_price} | Ciasny SL: {initial_sl:.4f}")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: TP1 (+5$) + BREAK-EVEN + MASTER EQUITY LOCK
+# MONITORING ZYSKÓW, TRAILINGU I BEZPIECZNIKÓW PORTFELA
 # ==============================================================================
 def monitoring_worker():
     global active_positions, portfolio_state
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z twardą obroną salda portfela i realizacją TP1.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring z obroną portfela i TP1.")
     while True:
         try:
             with lock_pos:
@@ -700,7 +720,7 @@ def monitoring_worker():
                 continue
 
             # ------------------------------------------------------------------
-            # 3. PROWADZENIE OTWARTEJ POZYCJI
+            # 3. PROWADZENIE OTWARTEJ POZYCJI (TP1 + BE + TRAILING)
             # ------------------------------------------------------------------
             to_delete = []
             for symbol, pos in items:
@@ -726,43 +746,63 @@ def monitoring_worker():
                 pos["peak_pnl_usd"] = peak_pnl
 
                 # --------------------------------------------------------------
-                # KROK 1: TP1 PRZY ZYSKU +5$ LUB +1.8% -> ZRZUT 50% I BEZPIECZNE BREAK-EVEN
+                # KROK A: ZDECYDOWANE TP1 (ZRZUT 50% POZYCJI PRZY ZYSKU 5$ LUB +1.8%)
                 # --------------------------------------------------------------
                 if (net_pnl_usd >= DOLLAR_STEP_USD or gain_pct >= 0.018) and not pos.get("tp1_executed", False):
                     half_qty = qty_f / 2.0
                     step, minq = get_symbol_lot_filter(symbol)
                     half_qty_str = format_qty_with_step(half_qty, step, minq)
 
-                    if half_qty_str and force_exit_coin_to_usdc(symbol, safe_float(half_qty_str), "TP1 (+50% zysku do gotówki)"):
+                    if half_qty_str and force_exit_coin_to_usdc(symbol, safe_float(half_qty_str), "TP1 (+50% pozycji zamknięte w zysku)"):
                         pos["tp1_executed"] = True
                         remaining_qty = format_qty_with_step(qty_f - safe_float(half_qty_str), step, minq)
                         pos["qty"] = remaining_qty or half_qty_str
-                        # SL na Break-Even (+0.4% na pokrycie opłat) -> ZERO RYZYKA DALSZEJ STRATY!
+                        # SL na Break-Even (+0.4% na pokrycie opłat) -> ZERO RYZYKA DALSZEJ STRATY
                         pos["trailing_sl"] = bp * 1.004
-                        logging.info(f"💎💰 [TP1 ZREALIZOWANE] {symbol} | Połowa pozycji zamknięta w zysku! SL na Break-Even (+0.4%).")
+                        logging.info(f"💎💰 [TP1 ZREALIZOWANE] {symbol} | Zabezpieczono 50% zysku! SL przesunięty na Break-Even (+0.4%).")
                         save_positions(active_positions)
 
-                # Prowadzenie Stop Lossa
+                # Rejestracja schodka wielokrotności 5 USD
+                if net_pnl_usd >= DOLLAR_STEP_USD:
+                    current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
+                    if current_multiple > pos.get("locked_dollar_floor", 0.0):
+                        pos["locked_dollar_floor"] = current_multiple
+                        logging.info(f"🔒💰 [SCHODEK 5$] {symbol} | Zysk: +{net_pnl_usd:.2f}$! Zablokowano próg: +{current_multiple:.2f}$!")
+
+                locked_floor = pos.get("locked_dollar_floor", 0.0)
                 current_sl = pos.get("trailing_sl", bp * 0.988)
 
                 if gain_pct >= 0.025:
                     current_sl = max(current_sl, peak_p * (1.0 - 0.0085))
                 elif gain_pct >= 0.012:
                     current_sl = max(current_sl, bp * 1.004)
-
+                
                 pos["trailing_sl"] = current_sl
 
                 trigger_exit = False
                 exit_reason = ""
+                price_drop_from_peak = (peak_p - c_curr) / peak_p if peak_p > 0 else 0.0
 
-                # Wyjście po uderzeniu w Stop Loss
-                if c_curr <= current_sl:
+                # 1. Obrona schodka 5 USD
+                if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.20):
                     trigger_exit = True
-                    exit_reason = f"SL / Trailing Exit (Wynik: {gain_pct*100:+.2f}%)"
-                # Wyjście ze stagnacji (tylko jeśli po 25 min nie ma nawet +0.3%)
+                    exit_reason = f"Obrona schodka 5$ (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
+
+                # 2. Błyskawiczne cięcie przy pierwszym cofnięciu (0.35%) ze szczytu
+                elif (peak_p - bp) / bp >= 0.0070 or peak_pnl >= 1.8:
+                    if price_drop_from_peak >= 0.0035:
+                        trigger_exit = True
+                        exit_reason = f"Peak Cut (-{price_drop_from_peak*100:.2f}% ze szczytu | Zysk: +{net_pnl_usd:.2f}$)"
+
+                # 3. Stop Loss
+                elif c_curr <= current_sl:
+                    trigger_exit = True
+                    exit_reason = f"Stop Loss / Trailing (Wynik: {gain_pct*100:+.2f}%)"
+
+                # 4. Cięcie stagnacji po 25m (jeśli nie wyciągnięto TP1)
                 elif time_in_pos >= 1500 and gain_pct < 0.0030 and not pos.get("tp1_executed", False):
                     trigger_exit = True
-                    exit_reason = f"Stagnation Exit (25m bez ruchu, PnL: {gain_pct*100:+.2f}%)"
+                    exit_reason = f"Stagnation Exit (25m bez dynamiki, PnL: {gain_pct*100:+.2f}%)"
 
                 if trigger_exit:
                     if force_exit_coin_to_usdc(symbol, None, exit_reason):
@@ -822,7 +862,7 @@ def bot_loop():
                     pnl_usd = (curr - p["buy_price"]) * safe_float(p.get("qty", 0.0))
                     tp_status = " [TP1 ZABEZPIECZONE]" if p.get("tp1_executed", False) else ""
                     min_elapsed = int((now - p.get("entry_time", now)) / 60)
-                    logging.info(f"📈 [{s}] Zysk: {pnl_usd:+.2f}$ ({pnl_pct:+.2f}%){tp_status} | Czas: {min_elapsed}m | SL: {p.get('trailing_sl', 0):.4f}")
+                    logging.info(f"📈 [{s}] ({p.get('strategy')}) Zysk: {pnl_usd:+.2f}$ ({pnl_pct:+.2f}%){tp_status} | Czas: {min_elapsed}m | SL: {p.get('trailing_sl', 0):.4f}")
                 logging.info("--------------------------------------------------------------------------------")
                 last_print = now
 
@@ -845,7 +885,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Strict Capitulation Sniper Only")
+        self.wfile.write(b"Bybit Spot Bot Active - Strict Sniper (V-Shape + U-Shape)")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
