@@ -58,22 +58,22 @@ EXCLUDED_BASE_COINS = {
     "USDT", "EURC", "USD", "DAI", "FDUSD", "TUSD", "BUSD", "USDE", "PYUSD", "USDD"
 }
 
-CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję
+CAPITAL_PER_TRADE_PCT = 0.45       # 45% salda na pozycję (max 2 pozycje)
 MAX_TOTAL_POSITIONS = 2            
 STANDARD_MIN_ORDER_VALUE = 15.0    
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-MIN_24H_TURNOVER_USD = 250000.0    # Odsiew śmieci (min. 250k obrotu)
+MIN_24H_TURNOVER_USD = 200000.0    # Zaktualizowany próg płynności: min. 200 000 USD obrotu 24h
 USDC_MAX_SPREAD_PCT = 0.0040       
 MAX_SCAN_CANDIDATES = 35           
 
 # ==============================================================================
 # TWARDE BEZPIECZNIKI PORTFELA
 # ==============================================================================
-EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda - 5 USD = ZRZUT WSZYSTKIEGO
+EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda - 5 USD = NATYCHMIASTOWY ZRZUT WSZYSTKIEGO
 MAX_DAILY_LOSS_USD = 20.0          # Maksymalna strata dzienna (-20 USD)
 DOLLAR_STEP_USD = 5.0              # Schodek zabezpieczania zysku: 5$, 10$...
-COOLDOWN_AFTER_EXIT_SEC = 5400     # BLOKADA 90 MINUT po wyjściu
+COOLDOWN_AFTER_EXIT_SEC = 5400     # BLOKADA 90 MINUT po wyjściu z pozycji
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
@@ -476,7 +476,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# DYNAMICZNY SKANER PŁYNNYCH PAR USDC
+# DYNAMICZNY SKANER PŁYNNYCH PAR USDC (>= 200 000 USD)
 # ==============================================================================
 def get_dynamic_usdc_targets(all_tickers):
     valid_candidates = []
@@ -500,18 +500,16 @@ def get_dynamic_usdc_targets(all_tickers):
         if spread > USDC_MAX_SPREAD_PCT:
             continue
 
-        price_24h_pct = safe_float(t_data.get("price24hPcnt", 0.0))
         valid_candidates.append({
             "symbol": symbol,
-            "turnover": turnover_24h,
-            "price24h_pct": price_24h_pct
+            "turnover": turnover_24h
         })
 
     valid_candidates.sort(key=lambda x: x["turnover"], reverse=True)
-    return [c for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
+    return [c["symbol"] for c in valid_candidates[:MAX_SCAN_CANDIDATES]]
 
 # ==============================================================================
-# STRATEGIA: SNAJPER KAPITULACJI ("V-SHAPE") + ZAOKRĄGLONE DNO ("U-SHAPE")
+# STRATEGIA: SNAJPER KAPITULACJI ("V-SHAPE") + ZAOKRĄGLONE DNO ("U-SHAPE" 6H)
 # ==============================================================================
 def run_bonus_hunter_strategy():
     global active_positions, recently_closed_coins
@@ -526,9 +524,7 @@ def run_bonus_hunter_strategy():
 
     total_equity, free_usdc = get_balances()
     now_ts = time.time()
-    scanned_coins_data = get_dynamic_usdc_targets(all_tickers)
-    scanned_coins = [c["symbol"] for c in scanned_coins_data]
-    coin_pct_map = {c["symbol"]: c["price24h_pct"] for c in scanned_coins_data}
+    scanned_coins = get_dynamic_usdc_targets(all_tickers)
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -558,17 +554,15 @@ def run_bonus_hunter_strategy():
             c_now = df.iloc[-1]   
             c = df.iloc[-2]       
             curr_price = c_now['close']
-            price_change_24h = coin_pct_map.get(symbol, 0.0)
 
             # ==================================================================
             # ŻELAZNA BARIERA ANTY-SZCZYTOWA: CAŁKOWITY ZAKAZ KUPNA NA GÓRKACH
             # ==================================================================
-            if curr_price >= c_now['ema9'] * 1.002 or curr_price >= c_now['ema21'] * 1.002 or curr_price >= c_now['ema50']:
+            # 1. Zakaz kupna nad EMA 9 i nad EMA 50
+            if curr_price > c_now['ema9'] * 1.002 or curr_price >= c_now['ema50']:
                 continue
 
-            if curr_price >= c_now['bb_mid']:
-                continue
-
+            # 2. Zakaz gonienia zielonej świecy w locie (> +0.4% na bieżącej świecy)
             if c_now['close'] >= (c_now['open'] * 1.004):
                 continue
 
@@ -589,24 +583,38 @@ def run_bonus_hunter_strategy():
             rebound_from_low = (curr_price - c['low']) / c['low'] if c['low'] > 0 else 0.0
             is_valid_bottom_rebound = (0.0040 <= rebound_from_low <= 0.0110)
 
-            is_capitulation = is_panic_dump and is_valid_bottom_rebound and (c_now['rsi'] <= 38.0)
+            is_capitulation = (
+                is_panic_dump and 
+                is_valid_bottom_rebound and 
+                (curr_price < c_now['ema21']) and
+                (curr_price < c_now['bb_mid']) and
+                (c_now['rsi'] <= 38.0)
+            )
 
             # ==================================================================
-            # TRYB 2: U-SHAPE BOTTOM (ZAOKRĄGLONE DNO, JAK NA PEPE)
+            # TRYB 2: U-SHAPE BOTTOM (ZAOKRĄGLONE DNO PO SPADKU 6H >= 3.5%)
             # ==================================================================
-            # 1. Moneta po solidnych, głębokich spadkach z całej doby
-            is_dumped_24h = (price_change_24h <= -0.05)
+            # 1. Lokalny spadek z ostatnich 6 godzin (24 świece 15M) minimum 3.5%
+            high_6h = df['high'].iloc[-26:-1].max()
+            low_recent_base = df['low'].iloc[-10:-1].min()
+            local_drop_6h = (high_6h - low_recent_base) / high_6h if high_6h > 0 else 0.0
+            has_local_6h_drop = (local_drop_6h >= 0.035)
             
-            # 2. Kurs głęboko pod długoterminową EMA 89
+            # 2. Kurs nadal wyraźnie poniżej długoterminowej EMA 89
             deep_under_ema89 = (curr_price <= c_now['ema89'] * 0.985)
             
-            # 3. EMA 9 właśnie przecina EMA 21 od dołu w górę
+            # 3. Złote przecięcie na dnie: EMA 9 przecina EMA 21 od dołu w górę
             ema_crossover = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
             
-            # 4. Spokojne wejście blisko przecięcia, RSI schłodzone ale odbijające
-            safe_crossover_entry = (curr_price <= c_now['ema9'] * 1.002) and (38.0 <= c_now['rsi'] <= 55.0)
+            # 4. Wejście bezpośrednio przy przecięciu średnich (zero gonienia ceny w górę!)
+            safe_crossover_entry = (
+                (curr_price <= c_now['ema9'] * 1.002) and
+                (curr_price <= c_now['ema21'] * 1.004) and
+                (curr_price <= low_recent_base * 1.025) and
+                (38.0 <= c_now['rsi'] <= 55.0)
+            )
 
-            is_ushape_bottom = is_dumped_24h and deep_under_ema89 and ema_crossover and safe_crossover_entry
+            is_ushape_bottom = has_local_6h_drop and deep_under_ema89 and ema_crossover and safe_crossover_entry
 
             if not (is_capitulation or is_ushape_bottom):
                 continue
@@ -617,8 +625,8 @@ def run_bonus_hunter_strategy():
                 swing_low = c['low']
             else:
                 tag = "U_SHAPE_BOTTOM"
-                score = 400.0 + ((60.0 - c_now['rsi']) * 5.0)
-                swing_low = df['low'].iloc[-8:-1].min()
+                score = 400.0 + (local_drop_6h * 1000.0) + ((60.0 - c_now['rsi']) * 3.0)
+                swing_low = low_recent_base
 
             candidates.append({
                 "symbol": symbol, "score": score, "tag": tag, "swing_low": swing_low, "curr_price": curr_price
@@ -753,13 +761,13 @@ def monitoring_worker():
                     step, minq = get_symbol_lot_filter(symbol)
                     half_qty_str = format_qty_with_step(half_qty, step, minq)
 
-                    if half_qty_str and force_exit_coin_to_usdc(symbol, safe_float(half_qty_str), "TP1 (+50% pozycji zamknięte w zysku)"):
+                    if half_qty_str and force_exit_coin_to_usdc(symbol, safe_float(half_qty_str), "TP1 (+50% zysku do gotówki)"):
                         pos["tp1_executed"] = True
                         remaining_qty = format_qty_with_step(qty_f - safe_float(half_qty_str), step, minq)
                         pos["qty"] = remaining_qty or half_qty_str
                         # SL na Break-Even (+0.4% na pokrycie opłat) -> ZERO RYZYKA DALSZEJ STRATY
                         pos["trailing_sl"] = bp * 1.004
-                        logging.info(f"💎💰 [TP1 ZREALIZOWANE] {symbol} | Zabezpieczono 50% zysku! SL przesunięty na Break-Even (+0.4%).")
+                        logging.info(f"💎💰 [TP1 ZREALIZOWANE] {symbol} | Połowa pozycji zamknięta w zysku! SL na Break-Even (+0.4%).")
                         save_positions(active_positions)
 
                 # Rejestracja schodka wielokrotności 5 USD
@@ -885,7 +893,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - Strict Sniper (V-Shape + U-Shape)")
+        self.wfile.write(b"Bybit Spot Bot Active - Strict Sniper (V-Shape + 6H U-Shape)")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
