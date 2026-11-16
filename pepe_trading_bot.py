@@ -493,17 +493,18 @@ def run_pepe_sniper_strategy():
     try:
         c_now = df.iloc[-1]   # Bieżąca świeca 15M
         c = df.iloc[-2]       # Poprzednia zamknięta świeca 15M
+        p = df.iloc[-3]       # Świeca sprzed 30 min
         curr_price = c_now['close']
 
         # ======================================================================
         # ŻELAZNA BARIERA ANTY-SZCZYTOWA: ZAKAZ KUPOWANIA NA GÓRKACH PEPE
         # ======================================================================
-        # 1. Zakaz kupna nad EMA 9 i nad EMA 50
-        if curr_price > c_now['ema9'] * 1.002 or curr_price >= c_now['ema50']:
+        # 1. Zakaz kupna nad EMA 50 i powyżej bufora 0.9% nad EMA 9
+        if curr_price > c_now['ema9'] * 1.009 or curr_price >= c_now['ema50']:
             return
 
-        # 2. Zakaz gonienia zielonej świecy w locie (> +0.4% od otwarcia)
-        if c_now['close'] >= (c_now['open'] * 1.004):
+        # 2. Zakaz gonienia silnie rozpędzonej zielonej świecy (> +0.8% od otwarcia)
+        if c_now['close'] >= (c_now['open'] * 1.008):
             return
 
         # ======================================================================
@@ -526,27 +527,32 @@ def run_pepe_sniper_strategy():
         is_capitulation = (
             is_panic_dump and 
             is_valid_bottom_rebound and 
+            (curr_price <= c_now['ema9'] * 1.002) and
+            (c_now['close'] < (c_now['open'] * 1.004)) and
             (curr_price < c_now['ema21']) and
             (curr_price < c_now['bb_mid']) and
             (c_now['rsi'] <= 38.0)
         )
 
         # ======================================================================
-        # TRYB 2: U-SHAPE BOTTOM (ZAOKRĄGLONE DNO PO SPADKU 6H >= 3.5%)
+        # TRYB 2: U-SHAPE BOTTOM (ZAOKRĄGLONE DNO PO SPADKU 6H >= 2.5%)
         # ======================================================================
         high_6h = df['high'].iloc[-26:-1].max()
         low_recent_base = df['low'].iloc[-10:-1].min()
         local_drop_6h = (high_6h - low_recent_base) / high_6h if high_6h > 0 else 0.0
-        has_local_6h_drop = (local_drop_6h >= 0.035)
+        has_local_6h_drop = (local_drop_6h >= 0.025)
         
-        deep_under_ema89 = (curr_price <= c_now['ema89'] * 0.985)
-        ema_crossover = (c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])
+        deep_under_ema89 = (curr_price <= c_now['ema89'] * 0.993)
+        ema_crossover = (
+            ((c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])) or
+            ((p['ema9'] <= p['ema21']) and (c['ema9'] > c['ema21']))
+        )
         
         safe_crossover_entry = (
-            (curr_price <= c_now['ema9'] * 1.002) and
-            (curr_price <= c_now['ema21'] * 1.004) and
-            (curr_price <= low_recent_base * 1.025) and
-            (38.0 <= c_now['rsi'] <= 55.0)
+            (curr_price <= c_now['ema9'] * 1.009) and
+            (curr_price <= c_now['ema21'] * 1.011) and
+            (curr_price <= low_recent_base * 1.030) and
+            (38.0 <= c_now['rsi'] <= 56.0)
         )
 
         is_ushape_bottom = has_local_6h_drop and deep_under_ema89 and ema_crossover and safe_crossover_entry
@@ -615,7 +621,7 @@ def run_pepe_sniper_strategy():
 # ==============================================================================
 def monitoring_worker():
     global active_positions, portfolio_state
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring maksymalizacji zysku na PEPE/USDC.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring maksymalizacji zysku i ochrony spadków na PEPE/USDC.")
     last_kline_check = 0.0
     cached_climax_spike = False
 
@@ -711,19 +717,15 @@ def monitoring_worker():
             current_sl = pos.get("trailing_sl", bp * 0.988)
 
             # ------------------------------------------------------------------
-            # KROK B: DYNAMICZNY TRAILING POD MAX ZYSK NA PEPE (BEZ PRZEDWCZESNEGO CIĘCIA)
+            # KROK B: DYNAMICZNY TRAILING POD MAX ZYSK NA PEPE
             # ------------------------------------------------------------------
             if gain_pct >= 0.060:
-                # Przy rajdzie +6% i więcej: ciasny trailing 0.60% od szczytu
                 current_sl = max(current_sl, peak_p * (1.0 - 0.0060))
             elif gain_pct >= 0.035:
-                # Przy rajdzie +3.5% do +6%: trailing 0.80% od szczytu
                 current_sl = max(current_sl, peak_p * (1.0 - 0.0080))
             elif gain_pct >= 0.020:
-                # Po TP1 (+2.0% do +3.5%): bufor 1.00% od szczytu, żeby nie wybiło na szumie PEPE
                 current_sl = max(current_sl, peak_p * (1.0 - 0.0100))
             elif gain_pct >= 0.012:
-                # Zabezpieczenie Break-Even (+0.35%) przed osiągnięciem TP1
                 current_sl = max(current_sl, bp * 1.0035)
 
             pos["trailing_sl"] = current_sl
@@ -746,7 +748,7 @@ def monitoring_worker():
                 trigger_exit = True
                 exit_reason = f"Climax Spike Top Exit (Górna wstęga + RSI >= 74 | Zysk: {gain_pct*100:+.2f}%)"
 
-            # 2. Obrona schodka 5 USD (tylko gdy zysk przekroczył 5$ i cofnął poniżej podłogi)
+            # 2. Obrona schodka 5 USD
             elif locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.25):
                 trigger_exit = True
                 exit_reason = f"Obrona schodka 5$ (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
@@ -756,7 +758,7 @@ def monitoring_worker():
                 trigger_exit = True
                 exit_reason = f"Trailing / SL Exit (Wynik: {gain_pct*100:+.2f}%)"
 
-            # 4. Cięcie stagnacji po 30 minutach (tylko jeśli nie było ruchu powyżej +0.35%)
+            # 4. Cięcie stagnacji po 30 minutach
             elif time_in_pos >= 1800 and gain_pct < 0.0035 and not pos.get("tp1_executed", False):
                 trigger_exit = True
                 exit_reason = f"Stagnation Exit (30m bez wybicia, PnL: {gain_pct*100:+.2f}%)"
