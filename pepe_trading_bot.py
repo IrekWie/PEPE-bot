@@ -44,7 +44,7 @@ def sync_bybit_clock():
     return False
 
 # ==============================================================================
-# KONFIGURACJA GŁÓWNA: TYLKO PEPE/USDC (MAX KAPITAŁ)
+# KONFIGURACJA GŁÓWNA: PEPE/USDC SINE-WAVE SNIPER (MAX KAPITAŁ)
 # ==============================================================================
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "TUTAJ_TWÓJ_KEY").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "TUTAJ_TWÓJ_SECRET").strip()
@@ -55,21 +55,21 @@ TARGET_SYMBOL = "PEPEUSDC"
 TARGET_BASE_COIN = "PEPE"
 QUOTE_COIN = "USDC"
 
-CAPITAL_ALLOCATION_PCT = 0.99      # 99% dostępnego USDC (max kapitał z 1% buforem na zaokrąglenia)
-MAX_TOTAL_POSITIONS = 1            # 1 pełna pozycja na PEPE/USDC
+CAPITAL_ALLOCATION_PCT = 0.99      # 99% dostępnego USDC (1% rezerwy na zaokrąglenia giełdy)
+MAX_TOTAL_POSITIONS = 1            
 MIN_EXCHANGE_NOTIONAL = 5.2        
 
-MIN_24H_TURNOVER_USD = 150000.0    # Filtr ochrony przed martwym rynkiem
-USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny dopuszczalny spread 0.50%
+MIN_24H_TURNOVER_USD = 30000.0     # Próg płynności dla spokojniejszego rynku PEPE/USDC
+USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny spread 0.50%
 
 # ==============================================================================
-# ZARZĄDZANIE ZYSKIEM I TWARDE BEZPIECZNIKI PORTFELA
+# ZARZĄDZANIE ZYSKIEM I TWARDE BEZPIECZNIKI
 # ==============================================================================
 EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda - 5 USD = NATYCHMIASTOWY ZRZUT DO USDC
 MAX_DAILY_LOSS_USD = 20.0          # Maksymalna dzienna strata (-20 USD)
 DOLLAR_STEP_USD = 5.0              # Schodek zabezpieczania zysku co 5 USD
-TP1_GAIN_PCT = 0.018               # TP1: realizacja 50% pozycji przy +1.8% zysku
-COOLDOWN_AFTER_EXIT_SEC = 2700     # 45 minut przerwy po zamknięciu pozycji
+TP1_GAIN_PCT = 0.015               # TP1: sprzedaż tylko 50% przy +1.5% (reszta rośnie dalej)
+COOLDOWN_AFTER_EXIT_SEC = 900      # 15 minut przerwy po zamknięciu fali
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
 POSITIONS_FILE = "active_spot_positions.json"
@@ -99,7 +99,7 @@ for name, url in endpoints:
         res = s.get_wallet_balance(accountType="UNIFIED")
         if res.get("retCode") == 0:
             session = s
-            logging.info(f"✅ POŁĄCZONO Z BYBIT: {name} | Tryb: SNIPER PEPE/USDC (MAX KAPITAŁ)")
+            logging.info(f"✅ POŁĄCZONO Z BYBIT: {name} | Tryb: PEPE/USDC SINE-WAVE RUNNER")
             break
     except Exception:
         pass
@@ -455,7 +455,7 @@ def sync_positions_from_bybit():
         logging.error(f"Błąd synchronizacji Bybit: {e}")
 
 # ==============================================================================
-# STRATEGIA ZAKUPU NA DOŁKACH TYLKO DLA PEPE/USDC (MAX KAPITAŁ)
+# STRATEGIA SINUSOIDALNA + SNAJPER DOŁKÓW DLA PEPE/USDC
 # ==============================================================================
 def run_pepe_sniper_strategy():
     global active_positions, last_exit_timestamp
@@ -476,7 +476,6 @@ def run_pepe_sniper_strategy():
     if total_today <= -MAX_DAILY_LOSS_USD:
         return
 
-    # Kontrola płynności i spreadu na PEPE/USDC
     turnover_24h = safe_float(ticker.get("turnover24h", 0.0))
     if turnover_24h < MIN_24H_TURNOVER_USD:
         return
@@ -491,24 +490,37 @@ def run_pepe_sniper_strategy():
         return
 
     try:
-        c_now = df.iloc[-1]   # Bieżąca świeca 15M
+        c_now = df.iloc[-1]   # Świeca bieżąca 15M
         c = df.iloc[-2]       # Poprzednia zamknięta świeca 15M
-        p = df.iloc[-3]       # Świeca sprzed 30 min
         curr_price = c_now['close']
 
         # ======================================================================
-        # ŻELAZNA BARIERA ANTY-SZCZYTOWA: ZAKAZ KUPOWANIA NA GÓRKACH PEPE
+        # ŻELAZNA BARIERA ANTY-SZCZYTOWA (NIGDY NIE KUPUJ GÓRKI SINUSOIDY)
         # ======================================================================
-        # 1. Zakaz kupna nad EMA 50 i powyżej bufora 0.9% nad EMA 9
-        if curr_price > c_now['ema9'] * 1.009 or curr_price >= c_now['ema50']:
+        if curr_price >= c_now['bb_mid']:
             return
 
-        # 2. Zakaz gonienia silnie rozpędzonej zielonej świecy (> +0.8% od otwarcia)
-        if c_now['close'] >= (c_now['open'] * 1.008):
+        if c_now['rsi'] >= 46.0:
+            return
+
+        if c_now['close'] >= (c_now['open'] * 1.007):
             return
 
         # ======================================================================
-        # TRYB 1: CAPITULATION SNIPER (SZYBKIE ODBICIE "V-SHAPE" PO PANICE)
+        # TRYB 1: SINE_WAVE_BOTTOM (DOŁEK SINUSOIDY / ODBICIE OD DOLNEJ BANDY)
+        # ======================================================================
+        recent_3 = df.iloc[-3:]
+        touched_lower_bb = (recent_3['low'] <= recent_3['bb_lower'] * 1.003).any()
+        rsi_dipped = (recent_3['rsi'].min() <= 41.0)
+        recent_trough = recent_3['low'].min()
+
+        rebound_from_trough = (curr_price - recent_trough) / recent_trough if recent_trough > 0 else 0.0
+        is_curling_up = (0.0025 <= rebound_from_trough <= 0.0110) and (curr_price > c_now['low'])
+
+        is_sine_wave_bottom = (touched_lower_bb or rsi_dipped) and is_curling_up
+
+        # ======================================================================
+        # TRYB 2: CAPITULATION_SNIPER (GŁĘBOKI ZRZUT KAPITULACYJNY "V-SHAPE")
         # ======================================================================
         c_is_red = c['close'] < c['open']
         c_drop_pct = (c['open'] - c['close']) / c['open'] if c_is_red else 0.0
@@ -520,52 +532,18 @@ def run_pepe_sniper_strategy():
             (vol_ratio >= 1.8) and 
             (c['low'] <= c['bb_lower'] * 1.002)
         )
-
         rebound_from_low = (curr_price - c['low']) / c['low'] if c['low'] > 0 else 0.0
-        is_valid_bottom_rebound = (0.0040 <= rebound_from_low <= 0.0110)
+        is_capitulation = is_panic_dump and (0.0040 <= rebound_from_low <= 0.0110) and (c_now['rsi'] <= 38.0)
 
-        is_capitulation = (
-            is_panic_dump and 
-            is_valid_bottom_rebound and 
-            (curr_price <= c_now['ema9'] * 1.002) and
-            (c_now['close'] < (c_now['open'] * 1.004)) and
-            (curr_price < c_now['ema21']) and
-            (curr_price < c_now['bb_mid']) and
-            (c_now['rsi'] <= 38.0)
-        )
-
-        # ======================================================================
-        # TRYB 2: U-SHAPE BOTTOM (ZAOKRĄGLONE DNO PO SPADKU 6H >= 2.5%)
-        # ======================================================================
-        high_6h = df['high'].iloc[-26:-1].max()
-        low_recent_base = df['low'].iloc[-10:-1].min()
-        local_drop_6h = (high_6h - low_recent_base) / high_6h if high_6h > 0 else 0.0
-        has_local_6h_drop = (local_drop_6h >= 0.025)
-        
-        deep_under_ema89 = (curr_price <= c_now['ema89'] * 0.993)
-        ema_crossover = (
-            ((c['ema9'] <= c['ema21']) and (c_now['ema9'] > c_now['ema21'])) or
-            ((p['ema9'] <= p['ema21']) and (c['ema9'] > c['ema21']))
-        )
-        
-        safe_crossover_entry = (
-            (curr_price <= c_now['ema9'] * 1.009) and
-            (curr_price <= c_now['ema21'] * 1.011) and
-            (curr_price <= low_recent_base * 1.030) and
-            (38.0 <= c_now['rsi'] <= 56.0)
-        )
-
-        is_ushape_bottom = has_local_6h_drop and deep_under_ema89 and ema_crossover and safe_crossover_entry
-
-        if not (is_capitulation or is_ushape_bottom):
+        if not (is_sine_wave_bottom or is_capitulation):
             return
 
         if is_capitulation:
             tag = "CAPITULATION_SNIPER"
             swing_low = c['low']
         else:
-            tag = "U_SHAPE_BOTTOM"
-            swing_low = low_recent_base
+            tag = "SINE_WAVE_BOTTOM"
+            swing_low = recent_trough
 
         # ======================================================================
         # EGZEKUCJA ZAKUPU ZA MAKSYMALNĄ DOSTĘPNĄ KWOTĘ USDC (99%)
@@ -609,7 +587,7 @@ def run_pepe_sniper_strategy():
                         "tp1_executed": False
                     }
                     save_positions(active_positions)
-                logging.info(f"🎯🔥 [ALL-IN ZAKUP PEPE: {tag}] Kwota: {target_allocation:.2f}$ | Cena wejścia: {curr_price:.8f} | SL pod dnem: {initial_sl:.8f}")
+                logging.info(f"🎯🔥 [ZAKUP NA DOŁKU FALI: {tag}] Kwota: {target_allocation:.2f}$ | Cena: {curr_price:.8f} | SL pod dnem: {initial_sl:.8f}")
         else:
             logging.error(f"❌ Błąd kupna PEPEUSDC: {res.get('retMsg')}")
 
@@ -617,13 +595,11 @@ def run_pepe_sniper_strategy():
         logging.error(f"Błąd analizy PEPEUSDC: {e}")
 
 # ==============================================================================
-# MONITORING ZYSKÓW: MAX PROFIT RUNNER + TP1 + BREAK-EVEN + OBRONA SALDA
+# MONITORING: PRZY WZROŚCIE TRZYMAMY RESZTĘ, PRZY SPADKU SPRZEDAJEMY DO USDC
 # ==============================================================================
 def monitoring_worker():
     global active_positions, portfolio_state
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring maksymalizacji zysku i ochrony spadków na PEPE/USDC.")
-    last_kline_check = 0.0
-    cached_climax_spike = False
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring: 50% TP1 na wzroście, 50% jedzie dalej | Sprzedaż przy spadku.")
 
     while True:
         try:
@@ -669,7 +645,7 @@ def monitoring_worker():
                 continue
 
             # ------------------------------------------------------------------
-            # 3. PROWADZENIE POZYCJI PEPE PO MAKSYMALNY ZYSK
+            # 3. PROWADZENIE POZYCJI: CZĘŚCIOWY ZYSK NA WZROŚCIE, SPRZEDAŻ NA SPADKU
             # ------------------------------------------------------------------
             bp = pos["buy_price"]
             qty_f = safe_float(pos.get("qty", 0.0))
@@ -688,25 +664,25 @@ def monitoring_worker():
             pos["peak_pnl_usd"] = peak_pnl
 
             # ------------------------------------------------------------------
-            # KROK A: TP1 PRZY +1.8% (ZRZUT 50% W ZYSKU + SL NA BREAK-EVEN +0.4%)
+            # KROK A: TP1 PRZY +1.5% -> SPRZEDAJEMY TYLKO 50%, RESZTA ROŚNIE DALEJ
             # ------------------------------------------------------------------
             if gain_pct >= TP1_GAIN_PCT and not pos.get("tp1_executed", False):
                 half_qty = qty_f / 2.0
                 step, minq = get_symbol_lot_filter(TARGET_SYMBOL)
                 half_qty_str = format_qty_with_step(half_qty, step, minq)
 
-                if half_qty_str and force_exit_pepe_to_usdc(safe_float(half_qty_str), "TP1 (+50% PEPE sprzedane w zysku)"):
+                if half_qty_str and force_exit_pepe_to_usdc(safe_float(half_qty_str), "TP1 (50% PEPE sprzedane w zysku, 50% rośnie dalej)"):
                     sold_qty_f = safe_float(half_qty_str)
                     record_closed_trade(TARGET_SYMBOL, pos.get("strategy"), bp, c_curr, sold_qty_f, "TP1 (50% zysku zrealizowane)", set_cooldown=False)
                     pos["tp1_executed"] = True
                     remaining_qty = format_qty_with_step(qty_f - sold_qty_f, step, minq)
                     pos["qty"] = remaining_qty or half_qty_str
-                    pos["trailing_sl"] = bp * 1.004  # Break-Even (+0.4% pokrywa prowizje)
-                    logging.info(f"💎💰 [TP1 ZREALIZOWANE] PEPE | Połowa pozycji w USDC! SL na Break-Even ({pos['trailing_sl']:.8f}). Reszta jedzie po max zysk!")
+                    pos["trailing_sl"] = bp * 1.0035  # Break-Even (+0.35% pokrywa prowizje)
+                    logging.info(f"💎💰 [TP1 ZREALIZOWANE] PEPE | 50% w USDC! SL na Break-Even ({pos['trailing_sl']:.8f}). Reszta jedzie dalej bez górnego sufitu!")
                     save_positions(active_positions)
                     qty_f = safe_float(pos["qty"])
 
-            # Rejestracja schodka wielokrotności 5 USD (dla dużej pozycji PEPE)
+            # Rejestracja schodka wielokrotności 5 USD
             if net_pnl_usd >= DOLLAR_STEP_USD:
                 current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
                 if current_multiple > pos.get("locked_dollar_floor", 0.0):
@@ -717,51 +693,36 @@ def monitoring_worker():
             current_sl = pos.get("trailing_sl", bp * 0.988)
 
             # ------------------------------------------------------------------
-            # KROK B: DYNAMICZNY TRAILING POD MAX ZYSK NA PEPE
+            # KROK B: TRAILING STOP PODĄŻA ZA WZROSTEM (SPRZEDAJE DOPIERO GDY SPADA)
             # ------------------------------------------------------------------
-            if gain_pct >= 0.060:
+            if gain_pct >= 0.050:
                 current_sl = max(current_sl, peak_p * (1.0 - 0.0060))
-            elif gain_pct >= 0.035:
+            elif gain_pct >= 0.030:
                 current_sl = max(current_sl, peak_p * (1.0 - 0.0080))
-            elif gain_pct >= 0.020:
+            elif gain_pct >= 0.018:
                 current_sl = max(current_sl, peak_p * (1.0 - 0.0100))
-            elif gain_pct >= 0.012:
-                current_sl = max(current_sl, bp * 1.0035)
+            elif gain_pct >= 0.010:
+                current_sl = max(current_sl, bp * 1.0030)
 
             pos["trailing_sl"] = current_sl
-
-            # Sprawdzanie świecy 15M co 5 sekund pod kątem Climax Spike (szczyt na górnej wstędze)
-            if (now_ts - last_kline_check) >= 5.0:
-                last_kline_check = now_ts
-                df15 = get_market_data_no_cache(TARGET_SYMBOL, interval="15", limit=25)
-                if df15 is not None and len(df15) >= 2:
-                    c15 = df15.iloc[-1]
-                    cached_climax_spike = (c_curr >= c15['bb_upper'] * 1.002) and (c15['rsi'] >= 74.0) and (gain_pct >= 0.030)
-                else:
-                    cached_climax_spike = False
 
             trigger_exit = False
             exit_reason = ""
 
-            # 1. Wyjście na parabolicznej górce (Climax Spike)
-            if cached_climax_spike:
+            # 1. Spadek zysku poniżej zablokowanego schodka 5 USD
+            if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.25):
                 trigger_exit = True
-                exit_reason = f"Climax Spike Top Exit (Górna wstęga + RSI >= 74 | Zysk: {gain_pct*100:+.2f}%)"
+                exit_reason = f"Obrona schodka 5$ przy spadku (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
 
-            # 2. Obrona schodka 5 USD
-            elif locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.25):
-                trigger_exit = True
-                exit_reason = f"Obrona schodka 5$ (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
-
-            # 3. Uderzenie w Trailing SL / Stop Loss pod dnem
+            # 2. Spadek ceny poniżej Trailing Stop / Break-Even / Stop Loss pod dnem
             elif c_curr <= current_sl:
                 trigger_exit = True
-                exit_reason = f"Trailing / SL Exit (Wynik: {gain_pct*100:+.2f}%)"
+                exit_reason = f"Sprzedaż na spadku / Trailing SL (Wynik: {gain_pct*100:+.2f}%)"
 
-            # 4. Cięcie stagnacji po 30 minutach
+            # 3. Cięcie stagnacji po 30 minutach (gdy brak ruchu powyżej +0.35%)
             elif time_in_pos >= 1800 and gain_pct < 0.0035 and not pos.get("tp1_executed", False):
                 trigger_exit = True
-                exit_reason = f"Stagnation Exit (30m bez wybicia, PnL: {gain_pct*100:+.2f}%)"
+                exit_reason = f"Stagnation Exit (30m bez odbicia, PnL: {gain_pct*100:+.2f}%)"
 
             if trigger_exit:
                 if force_exit_pepe_to_usdc(None, exit_reason):
@@ -810,7 +771,7 @@ def bot_loop():
                 stop_floor_eq = max(0.0, peak_eq - EQUITY_DROP_LIMIT_USD)
 
                 logging.info("--------------------------------------------------------------------------------")
-                logging.info(f"🐸 [PEPE SNIPER] Cena PEPE: {curr_p:.8f} | Saldo: {total_eq:.2f}$ | Szczyt: {peak_eq:.2f}$ (Obrona: {stop_floor_eq:.2f}$) | Wolne USDC: {free_usdc:.2f}$")
+                logging.info(f"🐸 [PEPE SINE-WAVE] Cena PEPE: {curr_p:.8f} | Saldo: {total_eq:.2f}$ | Szczyt: {peak_eq:.2f}$ (Obrona: {stop_floor_eq:.2f}$) | Wolne USDC: {free_usdc:.2f}$")
                 logging.info(f"📅 [BILANS DNIA] Dzisiaj: {total_day_pnl:+.2f}$ | Status: {status_circuit}")
                 if pos and curr_p > 0:
                     pnl_pct = ((curr_p - pos["buy_price"]) / pos["buy_price"]) * 100
@@ -840,7 +801,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - PEPE/USDC Max Capital Bottom Sniper")
+        self.wfile.write(b"Bybit Spot Bot Active - PEPE/USDC Sine-Wave Runner")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
