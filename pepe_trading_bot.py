@@ -63,12 +63,12 @@ MIN_24H_TURNOVER_USD = 30000.0     # Próg płynności dla spokojniejszego rynku
 USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny spread 0.50%
 
 # ==============================================================================
-# ZARZĄDZANIE ZYSKIEM I TWARDE BEZPIECZNIKI
+# ZARZĄDZANIE ZYSKIEM I BEZPIECZNIKI SKALOWANE POD ~710 USDC
 # ==============================================================================
-EQUITY_DROP_LIMIT_USD = 5.0        # Szczyt salda - 5 USD = NATYCHMIASTOWY ZRZUT DO USDC
+EQUITY_DROP_LIMIT_USD = 10.0       # Szczyt salda - 10 USD (~1.4% pozycji) = ZRZUT DO USDC (brak cięcia na zwykłym knocie)
 MAX_DAILY_LOSS_USD = 20.0          # Maksymalna dzienna strata (-20 USD)
-DOLLAR_STEP_USD = 5.0              # Schodek zabezpieczania zysku co 5 USD
-TP1_GAIN_PCT = 0.015               # TP1: sprzedaż tylko 50% przy +1.5% (reszta rośnie dalej)
+DOLLAR_STEP_USD = 10.0             # Schodek zabezpieczania zysku co 10 USD (aktywny po TP1)
+TP1_GAIN_PCT = 0.015               # TP1: sprzedaż 50% przy +1.5% + przesunięcie SL na Break-Even (+0.35%)
 COOLDOWN_AFTER_EXIT_SEC = 900      # 15 minut przerwy po zamknięciu fali
 
 APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://bybit-bot-i1lw.onrender.com")
@@ -599,7 +599,7 @@ def run_pepe_sniper_strategy():
 # ==============================================================================
 def monitoring_worker():
     global active_positions, portfolio_state
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring: 50% TP1 na wzroście, 50% jedzie dalej | Sprzedaż przy spadku.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring: bufor 10$, 50% TP1 przy +1.5%, 50% jedzie dalej.")
 
     while True:
         try:
@@ -612,7 +612,7 @@ def monitoring_worker():
             total_eq, free_usdc = get_balances()
 
             # ------------------------------------------------------------------
-            # 1. NADRZĘDNA BLOKADA SALDA PORTFELA (SZCZYT - 5$ = ZRZUT DO USDC)
+            # 1. NADRZĘDNA BLOKADA SALDA PORTFELA (SZCZYT - 10$ = ZRZUT DO USDC)
             # ------------------------------------------------------------------
             if total_eq > 0:
                 current_peak = portfolio_state.get("peak_total_equity", 0.0)
@@ -625,7 +625,7 @@ def monitoring_worker():
 
                 if pos is not None and current_peak > 0:
                     if total_eq <= (current_peak - EQUITY_DROP_LIMIT_USD):
-                        emergency_close_all_portfolio(f"Master Equity Drop (-5$ ze szczytu {current_peak:.2f}$)")
+                        emergency_close_all_portfolio(f"Master Equity Drop (-{EQUITY_DROP_LIMIT_USD:.0f}$ ze szczytu {current_peak:.2f}$)")
                         portfolio_state["peak_total_equity"] = total_eq
                         save_portfolio_state(portfolio_state)
                         time.sleep(2.0)
@@ -682,12 +682,12 @@ def monitoring_worker():
                     save_positions(active_positions)
                     qty_f = safe_float(pos["qty"])
 
-            # Rejestracja schodka wielokrotności 5 USD
-            if net_pnl_usd >= DOLLAR_STEP_USD:
+            # Rejestracja schodka wielokrotności 10 USD (aktywna dopiero po TP1, by nie ucinać 1. fali)
+            if pos.get("tp1_executed", False) and net_pnl_usd >= DOLLAR_STEP_USD:
                 current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
                 if current_multiple > pos.get("locked_dollar_floor", 0.0):
                     pos["locked_dollar_floor"] = current_multiple
-                    logging.info(f"🔒💰 [SCHODEK 5$] PEPE | Zysk: +{net_pnl_usd:.2f}$! Zablokowano podłogę: +{current_multiple:.2f}$!")
+                    logging.info(f"🔒💰 [SCHODEK 10$] PEPE | Zysk pozostałej połowy: +{net_pnl_usd:.2f}$! Zablokowano podłogę: +{current_multiple:.2f}$!")
 
             locked_floor = pos.get("locked_dollar_floor", 0.0)
             current_sl = pos.get("trailing_sl", bp * 0.988)
@@ -696,23 +696,21 @@ def monitoring_worker():
             # KROK B: TRAILING STOP PODĄŻA ZA WZROSTEM (SPRZEDAJE DOPIERO GDY SPADA)
             # ------------------------------------------------------------------
             if gain_pct >= 0.050:
-                current_sl = max(current_sl, peak_p * (1.0 - 0.0060))
+                current_sl = max(current_sl, peak_p * (1.0 - 0.0065))
             elif gain_pct >= 0.030:
-                current_sl = max(current_sl, peak_p * (1.0 - 0.0080))
+                current_sl = max(current_sl, peak_p * (1.0 - 0.0085))
             elif gain_pct >= 0.018:
-                current_sl = max(current_sl, peak_p * (1.0 - 0.0100))
-            elif gain_pct >= 0.010:
-                current_sl = max(current_sl, bp * 1.0030)
+                current_sl = max(current_sl, peak_p * (1.0 - 0.0105))
 
             pos["trailing_sl"] = current_sl
 
             trigger_exit = False
             exit_reason = ""
 
-            # 1. Spadek zysku poniżej zablokowanego schodka 5 USD
-            if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.25):
+            # 1. Spadek zysku poniżej zablokowanego schodka 10 USD (po TP1)
+            if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.35):
                 trigger_exit = True
-                exit_reason = f"Obrona schodka 5$ przy spadku (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
+                exit_reason = f"Obrona schodka 10$ przy spadku (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
 
             # 2. Spadek ceny poniżej Trailing Stop / Break-Even / Stop Loss pod dnem
             elif c_curr <= current_sl:
