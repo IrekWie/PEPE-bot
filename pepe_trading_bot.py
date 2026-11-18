@@ -67,7 +67,7 @@ USDC_MAX_SPREAD_PCT = 0.0050       # Maksymalny spread 0.50%
 # ==============================================================================
 EQUITY_DROP_LIMIT_USD = 10.0       # Szczyt salda - 10 USD = NATYCHMIASTOWY ZRZUT DO USDC
 MAX_DAILY_LOSS_USD = 20.0          # Maksymalna dzienna strata (-20 USD)
-DOLLAR_STEP_USD = 10.0             # Schodek zabezpieczania zysku co 10 USD (aktywny po TP1)
+DOLLAR_STEP_USD = 15.0             # Schodek zabezpieczania zysku co 15 USD (aktywny po TP1, dopasowany do trailingu od +3%)
 TP1_GAIN_PCT = 0.015               # TP1: sprzedaż 50% przy +1.5% + SL na Break-Even (+0.35%)
 COOLDOWN_AFTER_EXIT_SEC = 900      # 15 minut przerwy po zamknięciu pozycji
 
@@ -99,7 +99,7 @@ for name, url in endpoints:
         res = s.get_wallet_balance(accountType="UNIFIED")
         if res.get("retCode") == 0:
             session = s
-            logging.info(f"✅ POŁĄCZONO Z BYBIT: {name} | Tryb: PEPE/USDC CONFIRMED REVERSAL RUNNER (BEZ CIĘCIA BEZRUCHU)")
+            logging.info(f"✅ POŁĄCZONO Z BYBIT: {name} | Tryb: PEPE/USDC CONFIRMED REVERSAL RUNNER (TRAILING +3.0%)")
             break
     except Exception:
         pass
@@ -604,11 +604,11 @@ def run_pepe_sniper_strategy():
         logging.error(f"Błąd analizy PEPEUSDC: {e}")
 
 # ==============================================================================
-# MONITORING: 50% TP1 NA WZROŚCIE, 50% JEDZIE DALEJ | SPRZEDAŻ TYLKO PRZY SPADKU
+# MONITORING: 50% TP1 PRZY +1.5% (BE +0.35% DO +3.0%), TRAILING OD +3.0%
 # ==============================================================================
 def monitoring_worker():
     global active_positions, portfolio_state
-    logging.info("🚀 [SYSTEM] Uruchomiono monitoring: 50% TP1 przy +1.5%, 50% jedzie dalej | Bez cięcia bezruchu.")
+    logging.info("🚀 [SYSTEM] Uruchomiono monitoring: TP1 przy +1.5% (BE +0.35% do +3.0%), Trailing od +3.0% (1.20%).")
 
     while True:
         try:
@@ -670,7 +670,7 @@ def monitoring_worker():
             pos["peak_pnl_usd"] = peak_pnl
 
             # ------------------------------------------------------------------
-            # KROK A: TP1 PRZY +1.5% -> SPRZEDAJEMY TYLKO 50%, RESZTA ROŚNIE DALEJ
+            # KROK A: TP1 PRZY +1.5% -> SPRZEDAJEMY TYLKO 50%, SL NA BREAK-EVEN (+0.35%)
             # ------------------------------------------------------------------
             if gain_pct >= TP1_GAIN_PCT and not pos.get("tp1_executed", False):
                 half_qty = qty_f / 2.0
@@ -683,40 +683,38 @@ def monitoring_worker():
                     pos["tp1_executed"] = True
                     remaining_qty = format_qty_with_step(qty_f - sold_qty_f, step, minq)
                     pos["qty"] = remaining_qty or half_qty_str
-                    pos["trailing_sl"] = bp * 1.0035  # Break-Even (+0.35% pokrywa prowizje)
-                    logging.info(f"💎💰 [TP1 ZREALIZOWANE] PEPE | 50% w USDC! SL na Break-Even ({pos['trailing_sl']:.8f}). Reszta jedzie dalej!")
+                    pos["trailing_sl"] = bp * 1.0035  # Break-Even (+0.35%) utrzymywany aż do +3.0%
+                    logging.info(f"💎💰 [TP1 ZREALIZOWANE] PEPE | 50% w USDC! SL na Break-Even ({pos['trailing_sl']:.8f}) do +3.0%. Reszta jedzie dalej!")
                     save_positions(active_positions)
                     qty_f = safe_float(pos["qty"])
 
-            # Rejestracja schodka wielokrotności 10 USD (aktywna po TP1)
+            # Rejestracja schodka wielokrotności 15 USD (aktywna po TP1)
             if pos.get("tp1_executed", False) and net_pnl_usd >= DOLLAR_STEP_USD:
                 current_multiple = (net_pnl_usd // DOLLAR_STEP_USD) * DOLLAR_STEP_USD
                 if current_multiple > pos.get("locked_dollar_floor", 0.0):
                     pos["locked_dollar_floor"] = current_multiple
-                    logging.info(f"🔒💰 [SCHODEK 10$] PEPE | Zysk pozostałej połowy: +{net_pnl_usd:.2f}$! Zablokowano podłogę: +{current_multiple:.2f}$!")
+                    logging.info(f"🔒💰 [SCHODEK {DOLLAR_STEP_USD:.0f}$] PEPE | Zysk pozostałej połowy: +{net_pnl_usd:.2f}$! Zablokowano podłogę: +{current_multiple:.2f}$!")
 
             locked_floor = pos.get("locked_dollar_floor", 0.0)
             current_sl = pos.get("trailing_sl", bp * 0.986)
 
             # ------------------------------------------------------------------
-            # KROK B: TRAILING STOP PODĄŻA ZA WZROSTEM (SPRZEDAJE DOPIERO GDY SPADA)
+            # KROK B: TRAILING STOP OD +3.0% (DO +3.0% TRZYMAMY BREAK-EVEN +0.35%)
             # ------------------------------------------------------------------
             if gain_pct >= 0.050:
-                current_sl = max(current_sl, peak_p * (1.0 - 0.0065))
+                current_sl = max(current_sl, peak_p * (1.0 - 0.0070))
             elif gain_pct >= 0.030:
-                current_sl = max(current_sl, peak_p * (1.0 - 0.0085))
-            elif gain_pct >= 0.018:
-                current_sl = max(current_sl, peak_p * (1.0 - 0.0105))
+                current_sl = max(current_sl, peak_p * (1.0 - 0.0120))
 
             pos["trailing_sl"] = current_sl
 
             trigger_exit = False
             exit_reason = ""
 
-            # 1. Spadek zysku poniżej zablokowanego schodka 10 USD (po TP1)
+            # 1. Spadek zysku poniżej zablokowanego schodka dolarowego (po TP1)
             if locked_floor >= DOLLAR_STEP_USD and net_pnl_usd < (locked_floor - 0.35):
                 trigger_exit = True
-                exit_reason = f"Obrona schodka 10$ przy spadku (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
+                exit_reason = f"Obrona schodka {DOLLAR_STEP_USD:.0f}$ przy spadku (Zysk: +{net_pnl_usd:.2f}$ | Próg: +{locked_floor:.2f}$)"
 
             # 2. Spadek ceny poniżej Trailing Stop / Break-Even / Stop Loss pod dnem
             elif c_curr <= current_sl:
@@ -800,7 +798,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bybit Spot Bot Active - PEPE/USDC Confirmed Reversal Runner (No Stagnation Exit)")
+        self.wfile.write(b"Bybit Spot Bot Active - PEPE/USDC Confirmed Reversal Runner (Trailing +3.0%)")
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
